@@ -10,6 +10,40 @@ let
       description = "mock upstream systemd-vaultd";
     };
   };
+  packageValid = evalModules {
+    modules = [
+      {
+        options.assertions = pkgs.lib.mkOption {
+          type = pkgs.lib.types.listOf pkgs.lib.types.anything;
+          default = [ ];
+        };
+      }
+      mockUpstream
+      module
+      {
+        cluster.vault.runtime = {
+          enable = true;
+          runtimePackage = pkgs.writeShellScriptBin "arbor-openbao-provider" "exit 0";
+          nodeIdentityPath = "/var/lib/arbor/node-identity";
+          providers.local = {
+            address = "http://127.0.0.1:8200";
+            authMethod = "external";
+            tokenFile = "/run/credentials/arbor-vault-token";
+          };
+          requirements.db = {
+            provider = "local";
+            path = "kv/data/arbor/db";
+            field = "url";
+            credentialName = "db-url";
+          };
+          bindings.api = {
+            requirement = "db";
+            service = "api";
+          };
+        };
+      }
+    ];
+  };
   valid = evalModules {
     modules = [
       {
@@ -141,6 +175,7 @@ assert
   valid.config.systemd.services.arbor-vault-runtime-api.requires
   == [ "arbor-vault-runtime-api-init.service" ];
 assert failed != [ ];
+assert packageValid.config.cluster.vault.runtime.runtimePackage != null;
 assert builtins.any (assertion: !assertion.assertion) invalidIdentifier.config.assertions;
 assert builtins.any (assertion: !assertion.assertion) invalidTokenPath.config.assertions;
 pkgs.emptyFile

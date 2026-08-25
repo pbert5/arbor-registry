@@ -53,6 +53,9 @@ let
       isUnsafeString value
     else if builtins.isList value then
       lib.any hasUnsafeValue value
+    # Do not recurse into derivation metadata: it may be self-referential.
+    else if builtins.isAttrs value && (value.type or null) == "derivation" then
+      false
     else if builtins.isAttrs value then
       lib.any (name: hasUnsafeValue value.${name}) (lib.attrNames value)
     else

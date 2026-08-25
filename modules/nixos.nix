@@ -41,6 +41,9 @@ let
       || lib.hasPrefix "-----BEGIN" value
     else if builtins.isList value then
       lib.any hasUnsafeValue value
+    # Derivations are valid package options, not public values to scan.
+    else if builtins.isAttrs value && (value.type or null) == "derivation" then
+      false
     else if builtins.isAttrs value then
       lib.any (name: hasUnsafeName name || hasUnsafeValue value.${name}) (lib.attrNames value)
     else
