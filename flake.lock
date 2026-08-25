@@ -18,7 +18,50 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "systemd-vaultd": "systemd-vaultd"
+      }
+    },
+    "systemd-vaultd": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "treefmt-nix": "treefmt-nix"
+      },
+      "locked": {
+        "lastModified": 1787083709,
+        "narHash": "sha256-0f93RzgvTCjvmRRcgBPkr7ND87+yg3kKxuql2tD9AeE=",
+        "owner": "numtide",
+        "repo": "systemd-vaultd",
+        "rev": "0460f262d28903f05192d8a9768782fb34fe8384",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "systemd-vaultd",
+        "type": "github"
+      }
+    },
+    "treefmt-nix": {
+      "inputs": {
+        "nixpkgs": [
+          "systemd-vaultd",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1786901030,
+        "narHash": "sha256-WSFCsDSE5ffgD2MqzkM2CYjeFiKhRF/dJUN8uedb6YE=",
+        "owner": "numtide",
+        "repo": "treefmt-nix",
+        "rev": "27b3b12a8e6375f28ebe122f07d230ca5459bbfa",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "treefmt-nix",
+        "type": "github"
       }
     }
   },

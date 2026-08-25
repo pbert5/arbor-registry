@@ -1,0 +1,24 @@
+{
+  "name": "arbor-registryd",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Optional OrbitDB/Helia transport daemon for arbor-registry",
+  "type": "module",
+  "bin": { "arbor-registryd": "registryd.mjs" },
+  "scripts": { "start": "node registryd.mjs", "test": "node --test test/*.test.mjs" },
+  "dependencies": {
+    "@chainsafe/libp2p-gossipsub": "^11.0.0",
+    "@chainsafe/libp2p-noise": "^14.0.0",
+    "@chainsafe/libp2p-yamux": "^6.0.1",
+    "@helia/block-brokers": "1.0.0",
+    "@helia/core": "0.0.0",
+    "@libp2p/crypto": "^4.0.0",
+    "@libp2p/identify": "^1.0.1",
+    "@libp2p/peer-id-factory": "^4.0.0",
+    "@libp2p/tcp": "^9.0.2",
+    "@orbitdb/core": "4.0.0",
+    "blockstore-level": "^2.0.0",
+    "datastore-level": "^11.0.0",
+    "libp2p": "^1.0.3"
+  }
+}
