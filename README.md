@@ -97,6 +97,23 @@ the provider watcher and retries consumer refresh after failures, but the VM
 does not yet exercise a long-lived rotation/restart failure. Production auth
 remains external.
 
+## OrbitDB transport realm
+
+For independent daemons to join one registry, each daemon receives the same
+public `ARBOR_REGISTRY_REALM_ID` and `ARBOR_REGISTRY_PROTOCOL_EPOCH` (the latter
+defaults to `1`). The realm ID is a per-registry bootstrap discriminator, not a
+node identity or authority role. In realm mode the daemon derives a stable
+stream name and uses a deterministic raw-write access controller, so peers with
+different identities open the same OrbitDB address. The resolved realm, epoch,
+database addresses, listen addresses, and connected peer IDs are available from
+the authenticated `status` socket operation.
+
+The daemon persists `{ realmId, protocolEpoch, databaseAddresses }` in
+`transport-bootstrap.json` below its state directory and refuses a conflicting
+configured realm. OrbitDB raw writes are intentionally not Arbor authorization:
+records remain subject to Arbor signature, compatibility, issuer, and
+relationship validation before they enter accepted or materialized state.
+
 Recovery authorization is deliberately stricter than ordinary envelope
 validation. Every approval must identify a trusted approver, role, and
 approver-key generation, and all approvals must target the lost generation

@@ -84,6 +84,52 @@ test('separate daemon processes preserve the typed append/list transport', async
   }
 })
 
+test('legacy name-only opens bind the manifest to each creator identity', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-manifest-'))
+  const first = new TransportDaemon({ stateDir: path.join(root, 'a') })
+  const second = new TransportDaemon({ stateDir: path.join(root, 'b') })
+  try {
+    await first.start(); await second.start()
+    assert.notEqual(first.addresses.registry, second.addresses.registry)
+    assert.notDeepEqual(first.databases.get('registry').access.write, ['*'])
+    assert.notDeepEqual(second.databases.get('registry').access.write, ['*'])
+    assert.notEqual(first.databases.get('registry').access.address, second.databases.get('registry').access.address)
+  } finally {
+    await second.stop(); await first.stop()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('independent realm-scoped opens share an address and raw writers are not creator-bound', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-realm-'))
+  const first = new TransportDaemon({ stateDir: path.join(root, 'a'), realmId: 'acceptance-realm', protocolEpoch: 1 })
+  const second = new TransportDaemon({ stateDir: path.join(root, 'b'), realmId: 'acceptance-realm', protocolEpoch: 1 })
+  try {
+    await first.start(); await second.start()
+    assert.equal(first.addresses.registry, second.addresses.registry)
+    assert.deepEqual(first.databases.get('registry').access.write, ['*'])
+    assert.deepEqual(second.databases.get('registry').access.write, ['*'])
+    assert.equal((await first.append('registry', { recordId: 'realm-a', recordVersion: 1 })).duplicate, false)
+    assert.equal((await second.append('registry', { recordId: 'realm-b', recordVersion: 1 })).duplicate, false)
+    assert.equal(JSON.parse(await fs.readFile(path.join(root, 'b', 'transport-bootstrap.json'), 'utf8')).databaseAddresses.registry, second.addresses.registry)
+  } finally {
+    await second.stop(); await first.stop()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('realm bootstrap persists and conflicting configuration fails closed', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-realm-persist-'))
+  const first = new TransportDaemon({ stateDir: root, realmId: 'persisted-realm', protocolEpoch: 1 })
+  await first.start(); const address = first.addresses.registry; await first.stop()
+  const restarted = new TransportDaemon({ stateDir: root, realmId: 'persisted-realm', protocolEpoch: 1 })
+  await restarted.start()
+  assert.equal(restarted.addresses.registry, address)
+  await restarted.stop()
+  await assert.rejects(() => new TransportDaemon({ stateDir: root, realmId: 'different-realm', protocolEpoch: 1 }).start(), /conflicts with configured realm/)
+  await fs.rm(root, { recursive: true, force: true })
+})
+
 test('two daemons replicate an OrbitDB event over a bootstrapped libp2p peer', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-peers-'))
   const portA = await freeTcpPort()
@@ -107,36 +153,39 @@ test('two daemons replicate an OrbitDB event over a bootstrapped libp2p peer', a
         ARBOR_REGISTRY_STATE_DIR: stateA,
         ARBOR_REGISTRY_SOCKET: socketA,
         ARBOR_REGISTRY_LISTEN: `/ip4/127.0.0.1/tcp/${portA}`,
+        ARBOR_REGISTRY_REALM_ID: 'transport-test-realm',
       },
       stdio: ['ignore', 'ignore', 'pipe'],
     })
     await waitForStatus(socketA)
     const firstStatus = await request(socketA, { operation: 'status' })
-    const databaseAddresses = JSON.stringify(firstStatus.databaseAddresses)
     second = spawn(process.execPath, [daemon], {
       env: {
         ...base,
         ARBOR_REGISTRY_STATE_DIR: stateB,
         ARBOR_REGISTRY_SOCKET: socketB,
         ARBOR_REGISTRY_LISTEN: `/ip4/127.0.0.1/tcp/${portB}`,
-        ARBOR_REGISTRY_DATABASE_ADDRESSES: databaseAddresses,
+        ARBOR_REGISTRY_REALM_ID: 'transport-test-realm',
         ARBOR_REGISTRY_BOOTSTRAP_PEERS: `/ip4/127.0.0.1/tcp/${portA}/p2p/${firstStatus.peerId}`,
       },
       stdio: ['ignore', 'ignore', 'pipe'],
     })
     await waitForStatus(socketB)
     const event = { recordId: 'replicated-node', recordVersion: 1, payload: { source: 'peer-a' } }
-    const appended = await request(socketA, { operation: 'append', stream: 'registry', event })
-    assert.equal(appended.ok, true)
+    const secondEvent = { recordId: 'replicated-node-b', recordVersion: 1, payload: { source: 'peer-b' } }
+    assert.equal((await request(socketA, { operation: 'append', stream: 'registry', event })).ok, true)
 
     let page
     for (let attempt = 0; attempt < 100; attempt++) {
       page = await request(socketB, { operation: 'list', stream: 'registry', cursor: 'v1:0', limit: 10 })
-      if (page.ok && page.records.some(item => JSON.stringify(item.event) === JSON.stringify(event))) break
+      if (page.ok && page.records.some(item => item.event.recordId === event.recordId)) break
       await new Promise(resolve => setTimeout(resolve, 100))
     }
     assert.equal(page.ok, true)
-    assert.deepEqual(page.records.map(item => item.event), [event])
+    assert.equal(page.records.some(item => item.event.recordId === event.recordId), true, JSON.stringify({ page, a: await request(socketA, { operation: 'status' }), b: await request(socketB, { operation: 'status' }) }))
+    assert.equal((await request(socketB, { operation: 'append', stream: 'registry', event: secondEvent })).ok, true)
+    const firstPage = await waitForRecords(socketA, ['replicated-node-b'])
+    assert.equal(firstPage.some(item => item.recordId === 'replicated-node'), true)
   } finally {
     await stop(second)
     await stop(first)

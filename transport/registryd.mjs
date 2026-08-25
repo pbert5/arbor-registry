@@ -5,7 +5,7 @@ import process from 'node:process'
 import { createHash, randomUUID } from 'node:crypto'
 import { Helia } from '@helia/core'
 import { bitswap } from '@helia/block-brokers'
-import { createOrbitDB } from '@orbitdb/core'
+import { createOrbitDB, IPFSAccessController } from '@orbitdb/core'
 import { createLibp2p } from 'libp2p'
 import { gossipsub } from '@chainsafe/libp2p-gossipsub'
 import { noise } from '@chainsafe/libp2p-noise'
@@ -82,12 +82,16 @@ function orbitdbLibp2p(libp2p) {
 }
 
 export class TransportDaemon {
-  constructor({ stateDir, streams = ['registry'], databaseAddresses = {}, listen = [], bootstrapPeers = [] }) {
+  constructor({ stateDir, streams = ['registry'], databaseAddresses = {}, listen = [], bootstrapPeers = [], realmId = null, protocolEpoch = 1 }) {
     if (!stateDir) throw new Error('stateDir is required')
     this.stateDir = stateDir
     this.streams = [...new Set(streams)].filter(Boolean)
     if (!this.streams.length) throw new Error('at least one stream is required')
     this.addresses = { ...databaseAddresses }
+    if (realmId != null && (typeof realmId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(realmId))) throw new Error('realmId must be a stable public identifier')
+    if (!Number.isSafeInteger(protocolEpoch) || protocolEpoch < 1) throw new Error('protocolEpoch must be a positive integer')
+    this.realmId = realmId
+    this.protocolEpoch = protocolEpoch
     this.listen = listen
     if (!Array.isArray(bootstrapPeers)) throw new Error('bootstrapPeers must be an array')
     this.bootstrapPeers = bootstrapPeers.map(peer => {
@@ -100,10 +104,23 @@ export class TransportDaemon {
     this.indexQueue = Promise.resolve()
     this.lockPath = path.join(this.stateDir, 'transport-index.lock')
     this.quarantinePath = path.join(this.stateDir, 'transport-quarantine.jsonl')
+    this.bootstrapStatePath = path.join(this.stateDir, 'transport-bootstrap.json')
   }
 
   async start() {
     await fs.mkdir(this.stateDir, { recursive: true, mode: 0o700 })
+    if (this.realmId) {
+      try {
+        const persisted = JSON.parse(await fs.readFile(this.bootstrapStatePath, 'utf8'))
+        if (persisted.realmId !== this.realmId || persisted.protocolEpoch !== this.protocolEpoch) throw new Error('persisted transport realm conflicts with configured realm')
+        for (const [stream, address] of Object.entries(persisted.databaseAddresses ?? {})) {
+          if (this.addresses[stream] && this.addresses[stream] !== address) throw new Error(`persisted database address conflicts for stream ${stream}`)
+          this.addresses[stream] = address
+        }
+      } catch (cause) {
+        if (cause.code !== 'ENOENT') throw cause
+      }
+    }
     await assertPrivatePath(this.stateDir, { directory: true })
     this.quarantineMarkers = new Set()
     try {
@@ -150,8 +167,12 @@ export class TransportDaemon {
 
   async open(stream) {
     if (this.databases.has(stream)) return this.databases.get(stream)
-    const database = await this.orbitdb.open(this.addresses[stream] ?? `arbor-registry-${stream}`, { type: 'events' })
+    const options = { type: 'events' }
+    const name = this.realmId == null ? `arbor-registry-${stream}` : `arbor-registry-${this.realmId}-v${this.protocolEpoch}-${stream}`
+    if (this.realmId != null) options.AccessController = IPFSAccessController({ write: ['*'] })
+    const database = await this.orbitdb.open(this.addresses[stream] ?? name, options)
     this.addresses[stream] = String(database.address); this.databases.set(stream, database)
+    if (this.realmId) await fs.writeFile(this.bootstrapStatePath, `${JSON.stringify({ realmId: this.realmId, protocolEpoch: this.protocolEpoch, databaseAddresses: this.addresses })}\n`, { mode: 0o600 })
     return database
   }
 
@@ -368,7 +389,15 @@ export class TransportDaemon {
   async handle(request) {
     try {
       if (request.operation === 'health') return reply(true, { status: 'ok' })
-      if (request.operation === 'status') return reply(true, { peerId: this.libp2p.peerId.toString(), databaseAddresses: this.addresses })
+      if (request.operation === 'status') return reply(true, {
+        peerId: this.libp2p.peerId.toString(),
+        realmId: this.realmId,
+        protocolEpoch: this.protocolEpoch,
+        databaseAddresses: this.addresses,
+        listenMultiaddrs: this.libp2p.getMultiaddrs().map(String),
+        connectedPeers: this.libp2p.getConnections().map(connection => connection.remotePeer.toString()),
+        bootstrapPeers: this.bootstrapPeers.map(String),
+      })
       if (request.operation === 'append') return reply(true, await this.append(request.stream, request.event))
       if (request.operation === 'list') return reply(true, await this.list(request.stream, request.cursor ?? 'v2:begin', request.limit ?? 100))
       return reply(false, { code: 'unsupported_operation' })
@@ -423,7 +452,8 @@ async function main() {
   const socketPath = process.env.ARBOR_REGISTRY_SOCKET ?? '/run/arbor-registryd/registry.sock'
   const streams = (process.env.ARBOR_REGISTRY_STREAMS ?? 'registry').split(',').filter(Boolean)
   const addresses = process.env.ARBOR_REGISTRY_DATABASE_ADDRESSES ? JSON.parse(process.env.ARBOR_REGISTRY_DATABASE_ADDRESSES) : {}
-  const daemon = new TransportDaemon({ stateDir, streams, databaseAddresses: addresses, listen: (process.env.ARBOR_REGISTRY_LISTEN ?? '').split(',').filter(Boolean), bootstrapPeers: (process.env.ARBOR_REGISTRY_BOOTSTRAP_PEERS ?? '').split(',').filter(Boolean) })
+  const protocolEpoch = process.env.ARBOR_REGISTRY_PROTOCOL_EPOCH == null ? 1 : Number(process.env.ARBOR_REGISTRY_PROTOCOL_EPOCH)
+  const daemon = new TransportDaemon({ stateDir, streams, databaseAddresses: addresses, listen: (process.env.ARBOR_REGISTRY_LISTEN ?? '').split(',').filter(Boolean), bootstrapPeers: (process.env.ARBOR_REGISTRY_BOOTSTRAP_PEERS ?? '').split(',').filter(Boolean), realmId: process.env.ARBOR_REGISTRY_REALM_ID || null, protocolEpoch })
   const token = process.env.ARBOR_REGISTRY_SOCKET_TOKEN
   if (!token) throw new Error('ARBOR_REGISTRY_SOCKET_TOKEN is required')
   await daemon.start()
