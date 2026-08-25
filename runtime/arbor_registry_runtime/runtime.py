@@ -21,7 +21,10 @@ from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
 
-SCHEMAS = frozenset({"node-identity", "relationship", "capability", "service", "endpoint"})
+SCHEMAS = frozenset({
+    "node-identity", "identity-generation", "relationship", "capability", "service", "endpoint",
+    "enrollment", "revocation", "recovery-authorization", "receipt",
+})
 ProviderCursor: TypeAlias = int | str
 
 
@@ -61,6 +64,238 @@ class RuntimeKey:
 
     def sign(self, unsigned: dict[str, Any]) -> str:
         return _b64(self.signing_key.sign(canonical_json(unsigned)).signature)
+
+
+def make_enrollment_request(
+    identity_key: RuntimeKey,
+    node_id: str,
+    *,
+    platform: str,
+    requested_parent: str | None = None,
+    nonce: str | None = None,
+) -> dict[str, Any]:
+    """Create a self-signed enrollment request using runtime-held identity.
+
+    The request is not authority.  It only proves possession of the proposed
+    node key; an existing authority must approve it before a node-identity
+    record can enter accepted state.
+    """
+    if not isinstance(node_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", node_id):
+        raise ValueError("node_id is invalid")
+    if not isinstance(platform, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", platform):
+        raise ValueError("platform is invalid")
+    if requested_parent is not None and not isinstance(requested_parent, str):
+        raise ValueError("requested_parent is invalid")
+    if nonce is None:
+        nonce = _b64(os.urandom(24))
+    if not isinstance(nonce, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", nonce):
+        raise ValueError("nonce is invalid")
+    unsigned = {
+        "kind": "arbor-enrollment-request",
+        "version": 1,
+        "nodeId": node_id,
+        "generation": 1,
+        "platform": platform,
+        "publicKey": identity_key.public_key,
+        "requestedParent": requested_parent,
+        "nonce": nonce,
+        "subject": identity_key.issuer,
+    }
+    return {**unsigned, "signature": identity_key.sign(unsigned)}
+
+
+def approve_enrollment(
+    request: dict[str, Any],
+    authority_key: RuntimeKey,
+    *,
+    authority_root: str | None = None,
+    relationship_scope: str = "dependent",
+) -> dict[str, Any]:
+    """Turn a valid self-signed request into an authority-signed identity record."""
+    if not isinstance(request, dict) or request.get("kind") != "arbor-enrollment-request" or request.get("version") != 1:
+        raise ValueError("invalid enrollment request")
+    required = ("nodeId", "generation", "platform", "publicKey", "nonce", "signature")
+    if any(field not in request for field in required):
+        raise ValueError("incomplete enrollment request")
+    try:
+        VerifyKey(_unb64(request["publicKey"])).verify(
+            canonical_json({key: value for key, value in request.items() if key != "signature"}),
+            _unb64(request["signature"]),
+        )
+    except (ValueError, TypeError, binascii.Error, BadSignatureError) as error:
+        raise ValueError("enrollment request signature is invalid") from error
+    if not isinstance(request["nodeId"], str) or not isinstance(request["platform"], str):
+        raise ValueError("enrollment request fields are invalid")
+    if relationship_scope not in {"dependent", "independent"}:
+        raise ValueError("relationship scope is invalid")
+    payload = {
+        "identity": request["nodeId"],
+        "publicKey": request["publicKey"],
+        "platform": request["platform"],
+        "requestedParent": request.get("requestedParent"),
+        "relationshipScope": relationship_scope,
+        "enrollmentRequestDigest": _digest(request),
+        "approvedBy": authority_key.issuer,
+        "authorityRoot": authority_root or authority_key.issuer,
+    }
+    unsigned = {
+        "protocolEpoch": 1,
+        "wireVersion": 1,
+        "schemaVersion": 1,
+        "recordVersion": 1,
+        "recordId": request["nodeId"],
+        "generation": 1,
+        "predecessor": None,
+        "issuer": authority_key.issuer,
+        "schema": "node-identity",
+        "payload": payload,
+    }
+    return {**unsigned, "signature": authority_key.sign(unsigned)}
+
+
+def make_lifecycle_record(
+    issuer_key: RuntimeKey,
+    schema: str,
+    record_id: str,
+    payload: dict[str, Any],
+    *,
+    generation: int = 1,
+    predecessor: str | None = None,
+    record_version: int = 1,
+) -> dict[str, Any]:
+    """Create a signed record in one of the accepted lifecycle families."""
+    if schema not in {"enrollment", "identity-generation", "revocation", "recovery-authorization", "receipt"}:
+        raise ValueError("schema is not a lifecycle family")
+    if not isinstance(record_id, str) or not record_id or not isinstance(payload, dict):
+        raise ValueError("record id and payload are required")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise ValueError("generation must be a positive integer")
+    unsigned = {
+        "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1, "recordVersion": record_version,
+        "recordId": record_id, "generation": generation, "predecessor": predecessor,
+        "issuer": issuer_key.issuer, "schema": schema, "payload": payload,
+    }
+    return {**unsigned, "signature": issuer_key.sign(unsigned)}
+
+
+def make_recovery_approval(
+    approver_key: RuntimeKey,
+    identity: str,
+    lost_generation: int,
+    *,
+    role: str,
+    approver_generation: int,
+    operation: str = "recovery",
+    decision: str = "approve",
+) -> dict[str, Any]:
+    """Create the signed, generation-bound approval used by recovery."""
+    if (not isinstance(identity, str) or not identity or isinstance(lost_generation, bool)
+            or not isinstance(lost_generation, int) or lost_generation < 1
+            or role not in {"operator", "parent", "peer"}
+            or isinstance(approver_generation, bool) or not isinstance(approver_generation, int)
+            or approver_generation < 1 or operation != "recovery"
+            or decision != "approve"):
+        raise ValueError("invalid recovery approval")
+    unsigned = {
+        "approver": approver_key.issuer,
+        "role": role,
+        "subject": identity,
+        "generation": lost_generation,
+        "operation": operation,
+        "approverGeneration": approver_generation,
+        "decision": decision,
+    }
+    return {**unsigned, "issuer": approver_key.issuer, "signature": approver_key.sign(unsigned)}
+
+
+def make_recovery_authorization(
+    authority_key: RuntimeKey,
+    identity: str,
+    lost_generation: int,
+    new_public_key: str,
+    approvals: list[dict[str, Any]],
+    *,
+    provenance: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build an authority-signed recovery authorization transaction."""
+    if not isinstance(new_public_key, str) or not isinstance(approvals, list) or not approvals:
+        raise ValueError("recovery authorization is incomplete")
+    payload = {
+        "identity": identity,
+        "lostGeneration": lost_generation,
+        "newGeneration": lost_generation + 1,
+        "newPublicKey": new_public_key,
+        "approvals": approvals,
+        "provenance": provenance or [],
+    }
+    unsigned = {
+        "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1, "recordVersion": 1,
+        "recordId": f"{identity}:recovery:{lost_generation}", "generation": 1,
+        "predecessor": None, "issuer": authority_key.issuer,
+        "schema": "recovery-authorization", "payload": payload,
+    }
+    return {**unsigned, "signature": authority_key.sign(unsigned)}
+
+
+def make_identity_generation(
+    authority_key: RuntimeKey,
+    identity: str,
+    generation: int,
+    public_key: str,
+    *,
+    predecessor: str | None = None,
+    recovery_authorization: dict[str, Any] | None = None,
+    provenance: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Create an authority-approved active identity generation record."""
+    if not isinstance(identity, str) or not identity or generation < 1 or not isinstance(public_key, str):
+        raise ValueError("identity generation is invalid")
+    authorization_digest = _digest(recovery_authorization) if recovery_authorization is not None else None
+    payload = {
+        "identity": identity, "generation": generation, "publicKey": public_key,
+        "status": "active", "recoveryAuthorizationDigest": authorization_digest,
+        "provenance": provenance if provenance is not None else (
+            recovery_authorization.get("payload", {}).get("provenance", [])
+            if recovery_authorization is not None else []
+        ),
+    }
+    return make_lifecycle_record(
+        authority_key, "identity-generation", identity, payload,
+        generation=generation, predecessor=predecessor, record_version=generation,
+    )
+
+
+def make_revocation(
+    authority_key: RuntimeKey,
+    identity: str,
+    generation: int,
+    reason: str,
+    *,
+    provenance: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Create an authority-signed revocation for one identity generation."""
+    if not isinstance(identity, str) or generation < 1 or not isinstance(reason, str) or not reason:
+        raise ValueError("revocation is invalid")
+    return make_lifecycle_record(
+        authority_key, "revocation", f"{identity}:revocation:{generation}",
+        {"identity": identity, "generation": generation, "reason": reason, "provenance": provenance or []},
+    )
+
+
+def make_receipt(
+    authority_key: RuntimeKey,
+    subject: str,
+    digest: str,
+    *,
+    provenance: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Create a signed receipt anchoring a lifecycle transaction."""
+    if not isinstance(subject, str) or not subject or not isinstance(digest, str) or not digest:
+        raise ValueError("receipt is invalid")
+    return make_lifecycle_record(
+        authority_key, "receipt", f"receipt:{subject}:{digest}",
+        {"subject": subject, "digest": digest, "provenance": provenance or []},
+    )
 
 
 def generate_keypair(
@@ -347,7 +582,60 @@ class Runtime:
             verify.verify(unsigned, _unb64(record["signature"]))
         except (KeyError, ValueError, TypeError, binascii.Error, BadSignatureError):
             return "quarantined", "invalid-signature"
+        payload = record["payload"]
+        if record["schema"] == "enrollment":
+            if (not isinstance(payload.get("identity"), str) or not isinstance(payload.get("publicKey"), str)
+                    or not isinstance(payload.get("requestDigest"), str)
+                    or payload.get("approvedBy") != record["issuer"]):
+                return "quarantined", "unapproved-enrollment"
+        if record["schema"] == "identity-generation":
+            if (not isinstance(payload.get("identity"), str) or not isinstance(payload.get("publicKey"), str)
+                    or payload.get("generation") != record["generation"]
+                    or payload.get("status", "active") not in {"active", "deprecated"}):
+                return "quarantined", "malformed-identity-generation"
+        if record["schema"] == "revocation":
+            if (not isinstance(payload.get("identity"), str) or not isinstance(payload.get("generation"), int)
+                    or payload["generation"] < 1 or not isinstance(payload.get("reason"), str)
+                    or not payload["reason"]):
+                return "quarantined", "malformed-revocation"
+        if record["schema"] == "recovery-authorization":
+            if self._recovery_approval_reason(payload) is not None:
+                return "quarantined", self._recovery_approval_reason(payload)
+        if record["schema"] == "receipt":
+            if not isinstance(payload.get("subject"), str) or not isinstance(payload.get("digest"), str):
+                return "quarantined", "malformed-receipt"
         return "accepted", None
+
+    def _recovery_approval_reason(self, payload: dict[str, Any]) -> str | None:
+        identity = payload.get("identity")
+        lost = payload.get("lostGeneration")
+        new = payload.get("newGeneration")
+        approvals = payload.get("approvals")
+        if (not isinstance(identity, str) or not isinstance(lost, int) or isinstance(lost, bool) or lost < 1
+                or new != lost + 1 or not isinstance(payload.get("newPublicKey"), str)
+                or not isinstance(approvals, list) or not approvals
+                or not isinstance(payload.get("provenance", []), list)):
+            return "malformed-recovery-authorization"
+        for approval in approvals:
+            if not isinstance(approval, dict) or any(key not in approval for key in (
+                    "approver", "role", "subject", "generation", "operation", "approverGeneration", "decision", "signature")):
+                return "invalid-recovery-approval"
+            if approval.get("subject") != identity or approval.get("generation") != lost:
+                return "unbound-recovery-approval"
+            if (approval["subject"] != identity or approval["generation"] != lost
+                    or approval["operation"] != "recovery" or approval["decision"] != "approve"
+                    or approval["role"] not in {"operator", "parent", "peer"}
+                    or not isinstance(approval["approverGeneration"], int)
+                    or approval["approverGeneration"] < 1
+                    or approval.get("approver") != approval.get("issuer")):
+                return "unbound-recovery-approval"
+            try:
+                key = VerifyKey(_unb64(self.public_keys[approval["approver"]]))
+                unsigned = {key: value for key, value in approval.items() if key not in {"signature", "issuer"}}
+                key.verify(canonical_json(unsigned), _unb64(approval["signature"]))
+            except (KeyError, ValueError, TypeError, binascii.Error, BadSignatureError):
+                return "invalid-recovery-approval-signature"
+        return None
 
     def ingest(self, records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         outcomes = []
@@ -401,16 +689,81 @@ class Runtime:
             if status == "accepted":
                 valid.append((rowid, record_key, record))
         for entries in by_key.values():
-            if len({canonical_json(item[2]) for item in entries}) > 1:
+            valid_entries = [item for item in entries if reasons[item[0]] is None]
+            if len({canonical_json(item[2]) for item in valid_entries}) > 1:
                 for rowid, _, _ in entries:
-                    reasons[rowid] = "conflicting-record-key"
+                    if reasons[rowid] is None:
+                        reasons[rowid] = "conflicting-record-key"
         candidates = [entry for entry in valid if reasons[entry[0]] is None]
+        # Lifecycle records form a small, signed state machine layered over
+        # ordinary lineage.  A revocation is authoritative for every record
+        # carrying the same identity/generation, including materialization.
+        revocations = {
+            (record["payload"]["identity"], record["payload"]["generation"])
+            for _, _, record in candidates
+            if record["schema"] == "revocation"
+            and isinstance(record.get("payload"), dict)
+            and isinstance(record["payload"].get("identity"), str)
+            and isinstance(record["payload"].get("generation"), int)
+        }
+        authorizations = {
+            (record["payload"]["identity"], record["payload"]["newGeneration"]): record
+            for _, _, record in candidates
+            if record["schema"] == "recovery-authorization"
+            and isinstance(record.get("payload"), dict)
+            and isinstance(record["payload"].get("identity"), str)
+            and isinstance(record["payload"].get("newGeneration"), int)
+        }
+        active_generations = {
+            record["payload"]["identity"]: max(record["payload"]["generation"] for _, _, record in candidates
+                if record["schema"] == "identity-generation"
+                and isinstance(record.get("payload"), dict)
+                and isinstance(record["payload"].get("identity"), str)
+                and isinstance(record["payload"].get("generation"), int)
+                and record["payload"].get("status", "active") == "active")
+            for identity in {record["payload"].get("identity") for _, _, record in candidates
+                if record["schema"] == "identity-generation" and isinstance(record.get("payload"), dict)
+                and isinstance(record["payload"].get("identity"), str)}
+            for record in [next(record for _, _, record in candidates
+                if record["schema"] == "identity-generation"
+                and record["payload"].get("identity") == identity
+                and record["payload"].get("generation") == max(item["payload"]["generation"] for _, _, item in candidates
+                    if item["schema"] == "identity-generation" and item.get("payload", {}).get("identity") == identity))]
+        }
+        for rowid, _, record in candidates:
+            payload = record.get("payload", {})
+            identity = payload.get("identity") if isinstance(payload, dict) else None
+            generation = payload.get("generation") if isinstance(payload, dict) else None
+            if (identity, generation) in revocations and record["schema"] != "revocation":
+                reasons[rowid] = "revoked-generation"
+            if record["schema"] == "identity-generation":
+                if payload.get("status", "active") != "active":
+                    reasons[rowid] = "inactive-generation"
+                if (identity, generation) in revocations:
+                    reasons[rowid] = "revoked-generation"
+            if record["schema"] == "node-identity" and isinstance(payload, dict):
+                if payload.get("identityGeneration") is not None and (
+                        identity, payload.get("identityGeneration")) in revocations:
+                    reasons[rowid] = "revoked-generation"
+            record_generation = payload.get("identityGeneration") if record["schema"] == "node-identity" else generation
+            if isinstance(identity, str) and isinstance(record_generation, int) and identity in active_generations:
+                if (reasons[rowid] is None and record_generation < active_generations[identity]
+                        and record["schema"] not in {"revocation", "recovery-authorization"}):
+                    reasons[rowid] = "stale-generation"
+            if record["schema"] == "identity-generation" and generation > 1:
+                authorization = authorizations.get((identity, generation))
+                if authorization is None or authorization["payload"].get("lostGeneration") != generation - 1:
+                    reasons[rowid] = "missing-recovery-authorization"
+                else:
+                    payload_digest = payload.get("recoveryAuthorizationDigest")
+                    if payload_digest != _digest(authorization):
+                        reasons[rowid] = "recovery-provenance-mismatch"
         by_id: dict[str, list[dict[str, Any]]] = {}
         for _, _, record in candidates:
             by_id.setdefault(record["recordId"], []).append(record)
         max_generation = {record_id: max(item["generation"] for item in items) for record_id, items in by_id.items()}
         for rowid, _, record in candidates:
-            if record["generation"] < max_generation[record["recordId"]]:
+            if reasons[rowid] is None and record["generation"] < max_generation[record["recordId"]]:
                 reasons[rowid] = "anti-rollback"
         successors: dict[str, set[tuple[str, int]]] = {}
         for _, _, record in candidates:
@@ -422,10 +775,17 @@ class Runtime:
         # Historical predecessors remain usable for continuity even when they
         # are no longer current state (anti-rollback). They are not exposed as
         # accepted records or projected state below.
-        available = {(record["recordId"], record["generation"]) for rowid, _, record in candidates
-                     if reasons[rowid] not in {"conflicting-record-key", "forked-lineage"}}
+        available = {
+            alias
+            for rowid, _, record in candidates
+            if reasons[rowid] not in {"conflicting-record-key", "forked-lineage"}
+            for alias in ((record["recordId"], record["generation"]),
+                          (f"{record['recordId']}:{record['generation']}", record["generation"]))
+        }
         for rowid, _, record in candidates:
             if reasons[rowid] is not None:
+                continue
+            if record["schema"] in {"enrollment", "revocation", "recovery-authorization", "receipt"}:
                 continue
             predecessor = record["predecessor"]
             if not ((record["generation"] == 1 and predecessor is None)
@@ -437,7 +797,7 @@ class Runtime:
                 self.db.execute("UPDATE records SET status = ?, reason = ? WHERE rowid = ?", (status, reasons[rowid], rowid))
 
     def _materialize(self) -> None:
-        accepted = self.db.execute("SELECT record_key, record_id, generation, predecessor, status, reason, envelope FROM records WHERE status = 'accepted' OR reason = 'anti-rollback' ORDER BY generation, record_key").fetchall()
+        accepted = self.db.execute("SELECT record_key, record_id, generation, predecessor, status, reason, envelope FROM records WHERE status = 'accepted' OR reason IN ('anti-rollback', 'revoked-generation') ORDER BY generation, record_key").fetchall()
         available: dict[str, dict[str, Any]] = {}
         available_ids: set[str] = set()
         accepted_keys = {record_key for record_key, _, _, _, status, _, _ in accepted if status == "accepted"}
@@ -446,9 +806,12 @@ class Runtime:
                 record = json.loads(raw)
                 available[_key(record)] = record
                 available_ids.add(record["recordId"])
+                available_ids.add(f"{record['recordId']}:{record['generation']}")
         latest: dict[str, tuple[int, dict[str, Any]]] = {}
         for record in available.values():
             if _key(record) not in accepted_keys:
+                continue
+            if record["schema"] in {"enrollment", "revocation", "recovery-authorization", "receipt"}:
                 continue
             current = latest.get(record["recordId"])
             if current is None or record["generation"] >= current[0]:

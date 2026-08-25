@@ -47,8 +47,8 @@ let
   api = evaluated.config.systemd.services.api;
 in
 assert evaluated.config.systemd.services.systemd-vaultd != { };
-assert api.after == [ "arbor-vault-runtime-api.service" ];
-assert api.wants == [ "arbor-vault-runtime-api.service" ];
+assert api.after == [ "arbor-vault-runtime-api-init.service" ];
+assert api.wants == [ "arbor-vault-runtime-api-init.service" ];
 assert api.serviceConfig.LoadCredential == [ "db-url:/run/arbor-vaultd/credentials/api" ];
 assert !(builtins.hasAttr "Environment" api.serviceConfig);
 assert !(builtins.hasAttr "EnvironmentFile" api.serviceConfig);

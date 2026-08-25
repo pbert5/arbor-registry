@@ -337,20 +337,26 @@ let
             supportedSchemas
             supportedFeatures
             signers
-            authorizedIssuers
             record
             ;
+          authorizedIssuers = null;
         }
       ) raw;
       envelopeAccepted = map (result: result.record) (filter (result: result.accepted) envelopeResults);
       historyResults = validateHistory envelopeAccepted;
-      accepted = map (result: result.record) (filter (result: result.accepted) historyResults);
+      historyAccepted = map (result: result.record) (filter (result: result.accepted) historyResults);
       rejectedHistory = filter (result: !result.accepted) historyResults;
+      authority = authorityBoundary {
+        records = historyAccepted;
+        inherit authorizedIssuers;
+      };
+      accepted = authority.accepted;
       quarantined =
         (map (result: result.record // { quarantine = result.quarantine; }) (
           filter (result: !result.accepted) envelopeResults
         ))
-        ++ (map (result: result.record // { quarantine = result.quarantine; }) rejectedHistory);
+        ++ (map (result: result.record // { quarantine = result.quarantine; }) rejectedHistory)
+        ++ authority.quarantined;
       graph = validateGraph { relationships = relationshipRecords accepted; };
       cycleRecords = filter (
         record:
@@ -581,6 +587,103 @@ let
     {
       inherit violations;
       valid = violations == [ ];
+    };
+
+  authorityBoundary =
+    {
+      records,
+      authorizedIssuers,
+    }:
+    let
+      relationshipPayloadOK =
+        record:
+        isAttrs record.payload
+        && isString (get "from" null record.payload)
+        && isString (get "to" null record.payload)
+        && (record.schema == "peer-relationship" || isString (get "kind" null record.payload));
+      capabilityPayloadOK =
+        record:
+        isAttrs record.payload
+        && isString (get "subject" null record.payload)
+        && isString (get "authorityRoot" null record.payload)
+        && isList (get "capabilities" [ ] record.payload)
+        && lib.all isString (get "capabilities" [ ] record.payload);
+      rootOf = record: get "authorityRoot" (get "issuer" null record) record.payload;
+      issuerHasPath =
+        accepted: record: root:
+        record.issuer == root
+        || lib.any (
+          edge:
+          edgeActive edge
+          && edgeKind edge == "parent"
+          && edge.to == record.issuer
+          && get "authorityRoot" root edge == root
+        ) (relationshipRecords accepted);
+      grantsFor =
+        accepted: subject: root:
+        filter (
+          record: record.schema == "capability" && record.payload.subject == subject && rootOf record == root
+        ) accepted;
+      capabilitiesFor =
+        accepted: subject: root:
+        unique (
+          concatLists (map (record: get "capabilities" [ ] record.payload) (grantsFor accepted subject root))
+        );
+      authorityOK =
+        accepted: record:
+        if record.schema == "relationship" || record.schema == "peer-relationship" then
+          let
+            root = rootOf record;
+          in
+          relationshipPayloadOK record
+          && isString record.issuer
+          && isString root
+          && (authorizedIssuers == null || elem root authorizedIssuers)
+          && issuerHasPath accepted record root
+        else if record.schema == "capability" then
+          let
+            root = rootOf record;
+            requested = get "capabilities" [ ] record.payload;
+            inherited = capabilitiesFor accepted record.issuer root;
+          in
+          capabilityPayloadOK record
+          && isString record.issuer
+          && (authorizedIssuers == null || elem root authorizedIssuers)
+          && issuerHasPath accepted record root
+          && (record.issuer == root || lib.all (capability: elem capability inherited) requested)
+        else
+          authorizedIssuers == null || elem record.issuer authorizedIssuers;
+      resolve =
+        accepted: pending:
+        let
+          admitted = filter (authorityOK accepted) pending;
+          nextPending = filter (record: !elem record.recordId (map (item: item.recordId) admitted)) pending;
+        in
+        if admitted == [ ] then
+          {
+            inherit accepted;
+            rejected = pending;
+          }
+        else
+          resolve (accepted ++ admitted) nextPending;
+      result = resolve [ ] records;
+    in
+    {
+      accepted = result.accepted;
+      quarantined = map (
+        record:
+        record
+        // {
+          quarantine = reason (
+            if record.schema == "capability" then
+              "unauthorized-capability"
+            else if record.schema == "relationship" || record.schema == "peer-relationship" then
+              "unauthorized-relationship"
+            else
+              "unauthorized-issuer"
+          ) "signed assertion is not authorized by accepted provenance";
+        }
+      ) result.rejected;
     };
 
   makeTransport =

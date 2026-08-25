@@ -49,6 +49,18 @@ let
         autonomy = "dependent";
       };
     };
+  signedCapability =
+    signer: issuer: subject: authorityRoot: capabilities:
+    registry.makeEnvelope signer {
+      recordId = "capability:${issuer}:${subject}";
+      generation = 1;
+      inherit issuer subject;
+      schema = "capability";
+      payload = {
+        id = "capability:${issuer}:${subject}";
+        inherit subject authorityRoot capabilities;
+      };
+    };
   peerRelationship =
     id: from: to: scope:
     record {
@@ -253,6 +265,43 @@ let
         ];
       }
     ];
+  };
+  signedCapabilityRoot = signedCapability signer "root" "child-node" "root" [ "observe" ];
+  signedCapabilityAmplification = signedCapability childSigner "child" "grandchild" "root" [
+    "admin"
+  ];
+  signedCapabilityOtherRoot = signedCapability signer "root" "other-root-node" "other-root" [
+    "observe"
+  ];
+  signedUnauthorizedRelationship = registry.makeEnvelope childSigner {
+    recordId = "relationship:unauthorized-root";
+    generation = 1;
+    issuer = "child";
+    subject = "grandchild";
+    schema = "relationship";
+    payload = {
+      relationshipId = "unauthorized-root";
+      from = "child";
+      to = "grandchild";
+      kind = "parent";
+      status = "active";
+      scope = [ "observe" ];
+      autonomy = "dependent";
+      authorityRoot = "other-root";
+    };
+  };
+  signedAuthorityChecked = registry.reconcile {
+    raw = [
+      signedCapabilityAmplification
+      signedCapabilityOtherRoot
+      signedCapabilityRoot
+      signedUnauthorizedRelationship
+    ];
+    signers = {
+      root = signer;
+      child = childSigner;
+    };
+    authorizedIssuers = [ "root" ];
   };
   graph = registry.validateGraph { relationships = registry.relationshipRecords checked.accepted; };
   peer = peerRelationship "peer-root-child" "root-node" "peer-node" [ "observe" ];
@@ -508,6 +557,13 @@ assert
 assert length (registry.validateGraph { relationships = multipleParents; }).multipleParents == 1;
 assert compatibility.quarantine.code == "unsupported-required-feature";
 assert !capability.valid;
+assert signedAuthorityChecked.accepted == [ signedCapabilityRoot ];
+assert
+  (map (entry: entry.quarantine.code) signedAuthorityChecked.quarantined) == [
+    "unauthorized-capability"
+    "unauthorized-capability"
+    "unauthorized-relationship"
+  ];
 assert
   transport.fetch == [
     (identity "a")

@@ -9,6 +9,16 @@ from pathlib import Path
 from nacl.signing import SigningKey
 
 from arbor_registry_runtime import FileProvider, OrbitDBProvider, Provider, Runtime, RuntimeKey, canonical_json, generate_keypair
+from arbor_registry_runtime.runtime import (
+    approve_enrollment,
+    make_identity_generation,
+    make_lifecycle_record,
+    make_recovery_approval,
+    make_recovery_authorization,
+    make_revocation,
+    make_receipt,
+    make_enrollment_request,
+)
 from arbor_registry_runtime.runtime import _key
 from arbor_registry_runtime.openbao_provider import _json_value
 
@@ -232,6 +242,85 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("rollback:2", accepted_keys)
         self.assertNotIn("rollback:1", accepted_keys)
         self.assertIn("anti-rollback", {item["reason"] for item in self.runtime.quarantine()})
+
+    def test_enrollment_is_authority_approved_and_lifecycle_families_are_accepted(self):
+        node_key = RuntimeKey("node", SigningKey.generate())
+        request = make_enrollment_request(node_key, "node", platform="linux", nonce="abcdefghijklmnop")
+        identity = approve_enrollment(request, self.key)
+        self.assertEqual(self.runtime.ingest([identity])[0]["status"], "accepted")
+        records = [
+            make_lifecycle_record(self.key, "enrollment", "enrollment:node", {
+                "identity": "node", "publicKey": node_key.public_key,
+                "requestDigest": "request", "approvedBy": "root",
+            }),
+            make_revocation(self.key, "other", 1, "retired"),
+            make_receipt(self.key, "node", "digest"),
+        ]
+        self.assertEqual([item["status"] for item in self.runtime.ingest(records)], ["accepted"] * 3)
+
+    def test_active_generation_and_revocation_gate_validation_and_projection(self):
+        generation_one = make_identity_generation(self.key, "node", 1, "old-key")
+        generation_two = make_identity_generation(
+            self.key, "other", 2, "new-key", predecessor="other:1",
+            recovery_authorization={"authorization": "approved"},
+        )
+        generation_two["payload"]["recoveryAuthorizationDigest"] = "not-the-digest"
+        generation_two["signature"] = self.key.sign({key: value for key, value in generation_two.items() if key != "signature"})
+        self.assertEqual(self.runtime.ingest([generation_one])[0]["status"], "accepted")
+        self.assertEqual(self.runtime.ingest([generation_two])[0]["reason"], "missing-recovery-authorization")
+
+        authorization = make_recovery_authorization(
+            self.key, "node", 1, "new-key",
+            [make_recovery_approval(self.key, "node", 1, role="operator", approver_generation=1)],
+        )
+        generation_two = make_identity_generation(
+            self.key, "node", 2, "new-key", predecessor="node:1", recovery_authorization=authorization,
+        )
+        self.assertEqual(self.runtime.ingest([authorization, generation_two])[1]["status"], "accepted")
+        event = self.envelope("event", payload={"identity": "node", "identityGeneration": 1})
+        self.assertEqual(self.runtime.ingest([event])[0]["reason"], "stale-generation")
+        revoked = make_revocation(self.key, "node", 2, "compromised")
+        self.runtime.ingest([revoked])
+        self.assertNotIn("node:2", {record["recordId"] for record in self.runtime.accepted()})
+
+    def test_recovery_approvals_are_signed_and_bound_to_lost_generation(self):
+        approval = make_recovery_approval(self.key, "node", 1, role="operator", approver_generation=1)
+        authorization = make_recovery_authorization(self.key, "node", 1, "new-key", [approval])
+        self.assertEqual(self.runtime.ingest([authorization])[0]["status"], "accepted")
+        tampered = dict(approval, subject="other")
+        bad = make_recovery_authorization(self.key, "other", 1, "new-key", [tampered])
+        self.assertEqual(self.runtime.ingest([bad])[0]["reason"], "invalid-recovery-approval-signature")
+
+    def test_lifecycle_families_require_shapes_and_recovery_provenance(self):
+        identity = make_identity_generation(self.key, "node", 1, self.key.public_key)
+        approval = make_recovery_approval(
+            self.key, "node", 1, role="operator", approver_generation=1,
+        )
+        authorization = make_recovery_authorization(
+            self.key, "node", 1, self.key.public_key, [approval],
+            provenance=[{"source": "operator", "reason": "lost-key"}],
+        )
+        revoked = make_revocation(self.key, "node", 1, "lost-key")
+        replacement = make_identity_generation(
+            self.key, "node", 2, self.key.public_key, predecessor="node:1",
+            recovery_authorization=authorization,
+        )
+        outcomes = self.runtime.ingest([identity, authorization, revoked, replacement])
+        self.assertEqual([outcome["status"] for outcome in outcomes],
+                         ["quarantined", "accepted", "accepted", "accepted"])
+        self.assertEqual(outcomes[0]["reason"], "revoked-generation")
+        self.assertEqual(self.runtime.projection()["node"]["generation"], 2)
+        self.assertEqual(self.runtime.projection()["node"]["payload"]["provenance"],
+                         [{"source": "operator", "reason": "lost-key"}])
+
+    def test_revoked_generation_cannot_materialize_or_be_rebound_without_signed_approval(self):
+        identity = make_identity_generation(self.key, "node", 1, self.key.public_key)
+        revoked = make_revocation(self.key, "node", 1, "compromised")
+        forged = make_identity_generation(self.key, "node", 2, self.key.public_key, predecessor="node:1")
+        outcomes = self.runtime.ingest([identity, revoked, forged])
+        self.assertEqual(outcomes[-1]["reason"], "missing-recovery-authorization")
+        self.assertEqual(self.runtime.projection(), {})
+        self.assertIn("revoked-generation", {item["reason"] for item in self.runtime.quarantine()})
 
 
 class OpenBaoProviderTests(unittest.TestCase):

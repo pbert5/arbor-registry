@@ -50,7 +50,7 @@ let
     else
       cfg.runtimeCommand;
   providerArgs =
-    provider: requirement: bindingName: service:
+    provider: requirement: bindingName: service: watch:
     [
       runtimeExecutable
       "--path"
@@ -79,7 +79,7 @@ let
       "--token-file"
       provider.tokenFile
     ]
-    ++ [
+    ++ lib.optionals watch [
       "--watch"
       "--interval"
       (toString cfg.refreshInterval)
@@ -91,7 +91,7 @@ let
   services = lib.mapAttrs' (
     name: binding:
     let
-      fetcher = "arbor-vault-runtime-${name}";
+      fetcher = "arbor-vault-runtime-${name}-init";
     in
     lib.nameValuePair binding.service {
       after = [ "${fetcher}.service" ];
@@ -101,6 +101,28 @@ let
         LoadCredential = [ "${bindingCredential name binding}:${credentialSource name}" ];
         Restart = "on-failure";
         RestartSec = "5s";
+      };
+    }
+  ) cfg.bindings;
+  initServices = lib.mapAttrs' (
+    name: binding:
+    let
+      requirement = requirements.${binding.requirement};
+      provider = cfg.providers.${requirement.provider};
+      init = "arbor-vault-runtime-${name}-init";
+    in
+    lib.nameValuePair init {
+      description = "Initial OpenBao credential fetch (${name})";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "systemd-vaultd.service" ];
+      wants = [ "systemd-vaultd.service" ];
+      before = [ "${binding.service}.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = lib.escapeShellArgs (providerArgs provider requirement name binding.service false);
+        RuntimeDirectory = "arbor-vaultd";
+        RuntimeDirectoryMode = "0700";
       };
     }
   ) cfg.bindings;
@@ -114,11 +136,15 @@ let
     lib.nameValuePair fetcher {
       description = "Runtime OpenBao credential fetch (${name})";
       wantedBy = [ "multi-user.target" ];
-      after = [ "systemd-vaultd.service" ];
+      after = [
+        "systemd-vaultd.service"
+        "${fetcher}-init.service"
+      ];
       wants = [ "systemd-vaultd.service" ];
+      requires = [ "${fetcher}-init.service" ];
       serviceConfig = {
         Type = "simple";
-        ExecStart = lib.escapeShellArgs (providerArgs provider requirement name binding.service);
+        ExecStart = lib.escapeShellArgs (providerArgs provider requirement name binding.service true);
         Restart = "on-failure";
         RestartSec = "5s";
         RuntimeDirectory = "arbor-vaultd";
@@ -339,6 +365,6 @@ in
       }
     ];
 
-    systemd.services = services // fetcherServices;
+    systemd.services = services // initServices // fetcherServices;
   };
 }

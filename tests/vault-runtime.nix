@@ -133,9 +133,13 @@ in
 assert valid.config.systemd.services.systemd-vaultd != { };
 assert api.LoadCredential == [ "db-url:/run/arbor-vaultd/credentials/api" ];
 assert api.Restart == "on-failure";
-assert valid.config.systemd.services.api.after == [ "arbor-vault-runtime-api.service" ];
+assert valid.config.systemd.services.api.after == [ "arbor-vault-runtime-api-init.service" ];
+assert valid.config.systemd.services.arbor-vault-runtime-api-init.serviceConfig.Type == "oneshot";
 assert valid.config.systemd.services.arbor-vault-runtime-api.serviceConfig.Type == "simple";
 assert valid.config.systemd.services.arbor-vault-runtime-api.wants == [ "systemd-vaultd.service" ];
+assert
+  valid.config.systemd.services.arbor-vault-runtime-api.requires
+  == [ "arbor-vault-runtime-api-init.service" ];
 assert failed != [ ];
 assert builtins.any (assertion: !assertion.assertion) invalidIdentifier.config.assertions;
 assert builtins.any (assertion: !assertion.assertion) invalidTokenPath.config.assertions;
