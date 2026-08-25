@@ -112,6 +112,14 @@
             systemd-vaultd.nixosModules.vaultAgent
           ];
         };
+        vault-provider-vm = import ./tests/vault-provider-vm.nix {
+          module = vaultRuntimeModule;
+          pkgs = import nixpkgs { inherit system; };
+          upstreamModules = [
+            systemd-vaultd.nixosModules.systemdVaultd
+            systemd-vaultd.nixosModules.vaultAgent
+          ];
+        };
         openbao-runtime =
           let
             pkgs = import nixpkgs { inherit system; };
