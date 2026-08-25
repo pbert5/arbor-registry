@@ -88,8 +88,14 @@ namespace. Token contents are never Nix option values, command-line arguments,
 or store inputs. The executable does not start OpenBao in production: live
 integration uses an externally managed endpoint or injected adapter command.
 The package check also starts an isolated OpenBao dev server and verifies HTTP
-delivery, permissions, readiness, and a second rotation read; production auth
-and systemd-vaultd behavior remain external.
+delivery, permissions, readiness, and a second rotation read. Set
+`useUpstreamVaultd = true` and `useProviderBridge = true` to group provider
+files into the pinned upstream `/run/systemd-vaultd/secrets/<service>.service.json`
+contract; `vault-provider-bridge-vm` proves the initial OpenBao → provider →
+bridge → vaultd socket path with multiple credentials. Bridge rotation keeps
+the provider watcher and retries consumer refresh after failures, but the VM
+does not yet exercise a long-lived rotation/restart failure. Production auth
+remains external.
 
 Recovery authorization is deliberately stricter than ordinary envelope
 validation. Every approval must identify a trusted approver, role, and
