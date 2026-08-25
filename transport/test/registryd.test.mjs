@@ -256,6 +256,101 @@ test('three persisted daemons replay missed events after restart and reconnect',
   }
 })
 
+test('diagnose first creator loss against a persisted consumer cursor', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-late-event-'))
+  const ports = await Promise.all([freeTcpPort(), freeTcpPort(), freeTcpPort()])
+  const states = ports.map((_, index) => path.join(root, String.fromCharCode(97 + index)))
+  const sockets = ports.map((_, index) => path.join(root, `${String.fromCharCode(97 + index)}.sock`))
+  const base = { ...process.env, ARBOR_REGISTRY_SOCKET_TOKEN: 'test-token' }
+  const children = []
+  const start = async index => {
+    const firstStatus = index === 0 ? null : await request(sockets[0], { operation: 'status' })
+    const secondStatus = index === 2 ? await request(sockets[1], { operation: 'status' }) : null
+    const child = spawn(process.execPath, [daemon], {
+      env: {
+        ...base,
+        ARBOR_REGISTRY_STATE_DIR: states[index],
+        ARBOR_REGISTRY_SOCKET: sockets[index],
+        ARBOR_REGISTRY_LISTEN: `/ip4/127.0.0.1/tcp/${ports[index]}`,
+        ARBOR_REGISTRY_REALM_ID: 'late-event-diagnostic',
+        ...(index === 0 ? {} : {
+          ARBOR_REGISTRY_DATABASE_ADDRESSES: JSON.stringify(firstStatus.databaseAddresses),
+          ARBOR_REGISTRY_BOOTSTRAP_PEERS: [
+            `/ip4/127.0.0.1/tcp/${ports[0]}/p2p/${firstStatus.peerId}`,
+            ...(secondStatus ? [`/ip4/127.0.0.1/tcp/${ports[1]}/p2p/${secondStatus.peerId}`] : []),
+          ].join(','),
+        }),
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    children[index] = child
+    await waitForStatus(sockets[index])
+    return request(sockets[index], { operation: 'status' })
+  }
+  const stop = async index => {
+    const child = children[index]
+    if (!child || child.exitCode !== null) return
+    child.kill('SIGTERM')
+    await new Promise(resolve => child.once('exit', resolve))
+  }
+  try {
+    const statusA = await start(0)
+    const statusB = await start(1)
+    const statusC = await start(2)
+    assert.equal(new Set([statusA.peerId, statusB.peerId, statusC.peerId]).size, 3)
+    assert.equal(statusA.databaseAddresses.registry, statusB.databaseAddresses.registry)
+    assert.equal(statusA.databaseAddresses.registry, statusC.databaseAddresses.registry)
+
+    const eventA = { recordId: 'late-event-a1', recordVersion: 1, payload: { source: 'a' } }
+    const eventB = { recordId: 'late-event-b1', recordVersion: 1, payload: { source: 'b' } }
+    assert.equal((await request(sockets[0], { operation: 'append', stream: 'registry', event: eventA })).ok, true)
+    await waitForRecords(sockets[1], ['late-event-a1'])
+    await waitForRecords(sockets[2], ['late-event-a1'])
+    const saved = await request(sockets[2], { operation: 'list', stream: 'registry', cursor: 'v2:begin', limit: 20 })
+    assert.equal(saved.ok, true)
+    assert.equal(saved.records.some(item => item.event.recordId === 'late-event-a1'), true)
+
+    await stop(0)
+    const afterLossB = await request(sockets[1], { operation: 'status' })
+    const afterLossC = await request(sockets[2], { operation: 'status' })
+    assert.equal((await request(sockets[1], { operation: 'append', stream: 'registry', event: eventB })).ok, true)
+    let full
+    let fromSavedCursor
+    for (let attempt = 0; attempt < 100; attempt++) {
+      full = await request(sockets[2], { operation: 'list', stream: 'registry', cursor: 'v2:begin', limit: 20 })
+      fromSavedCursor = await request(sockets[2], { operation: 'list', stream: 'registry', cursor: saved.nextCursor, limit: 20 })
+      if (full.ok && full.records.some(item => item.event.recordId === 'late-event-b1')) break
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    console.log(JSON.stringify({
+      lateEventDiagnostic: true,
+      directBtoC: afterLossB.connectedPeers.includes(afterLossC.peerId) || afterLossC.connectedPeers.includes(afterLossB.peerId),
+      afterLossB: afterLossB.connectedPeers,
+      afterLossC: afterLossC.connectedPeers,
+      databaseAddress: statusC.databaseAddresses.registry,
+      savedCursor: saved.nextCursor,
+      fullRecords: full.records.map(item => item.event.recordId),
+      savedCursorRecords: fromSavedCursor.ok ? fromSavedCursor.records.map(item => item.event.recordId) : fromSavedCursor,
+    }))
+    assert.equal(full.ok, true)
+    assert.equal(afterLossB.connectedPeers.includes(afterLossC.peerId) || afterLossC.connectedPeers.includes(afterLossB.peerId), true)
+    assert.equal(full.records.some(item => item.event.recordId === 'late-event-b1'), true)
+    assert.equal(fromSavedCursor.ok, true)
+    assert.equal(fromSavedCursor.records.some(item => item.event.recordId === 'late-event-b1'), true)
+    const eventC = { recordId: 'late-event-c1', recordVersion: 1, payload: { source: 'c' } }
+    assert.equal((await request(sockets[2], { operation: 'append', stream: 'registry', event: eventC })).ok, true)
+    await waitForRecords(sockets[1], ['late-event-c1'])
+    const restartedA = await start(0)
+    const replayedA = await waitForRecords(sockets[0], ['late-event-b1', 'late-event-c1'])
+    assert.equal(restartedA.databaseAddresses.registry, statusA.databaseAddresses.registry)
+    assert.equal(replayedA.some(event => event.recordId === 'late-event-b1'), true)
+    assert.equal(replayedA.some(event => event.recordId === 'late-event-c1'), true)
+  } finally {
+    await stop(2); await stop(1); await stop(0)
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
 test('socket authorization fails closed and protects existing non-socket paths', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-'))
   const socketPath = path.join(root, 'registry.sock')
@@ -361,5 +456,27 @@ test('malformed replicated entries are quarantined and skipped', async () => {
     await daemon.withIndexLock(async () => { await daemon.refreshIndex('registry') })
     assert.deepEqual(daemon.index.streams.registry.map(item => item.hash), ['good'])
     assert.match(await fs.readFile(path.join(root, 'transport-quarantine.jsonl'), 'utf8'), /malformed-replicated-entry/)
+  } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+test('late CRDT-order insertion remains visible after a saved cursor', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-late-index-'))
+  const daemon = new TransportDaemon({ stateDir: root })
+  daemon.index.streams.registry = [{ key: 'key-a', hash: 'hash-a', order: '0:a' }]
+  daemon.open = async () => ({
+    iterator: async function * () {
+      yield { hash: 'hash-b', value: { id: 'b' }, clock: { time: 1, id: 'b' } }
+      yield { hash: 'hash-a', value: { id: 'a' }, clock: { time: 2, id: 'a' } }
+    },
+    get: async hash => ({ id: hash }),
+  })
+  try {
+    await daemon.withIndexLock(async () => {
+      await daemon.refreshIndex('registry')
+      await daemon.saveIndex()
+    })
+    assert.deepEqual(daemon.index.streams.registry.map(item => item.hash), ['hash-a', 'hash-b'])
+    const page = await daemon.list('registry', 'v2-after:hash-a', 10)
+    assert.deepEqual(page.records.map(item => item.hash), ['hash-b'])
   } finally { await fs.rm(root, { recursive: true, force: true }) }
 })
