@@ -16,14 +16,32 @@ raw transport -> envelope validation -> accepted history -> materialized state
 
 `makeTransport` is a deterministic in-process fixture for tests and snapshots.
 It is only an append/fetch fixture. The runtime adapter uses Ed25519 signatures
-and an append-only local provider, but deliberately does not bundle OrbitDB,
-Helia, OpenBao, or a central manager. Network transports and secret delivery
-remain external integrations.
+and an append-only local provider. `OrbitDBProvider` is an optional,
+runtime-only Unix-socket adapter for the reference registry daemon's bounded
+`append`/`list` contract; it does not import OrbitDB or Helia, and Nix
+evaluation never opens the socket. Event translation belongs in its explicit
+`encode`/`decode` hooks; validation, enrollment authority, receipts, and
+reconciliation remain outside the transport seam.
 
 Record families are enumerated by `familyNames`. Relationships support active,
 suspended, severed, and standby states; standby edges are retained but are not
 included in active parent traversal. Multiple parents are valid. Parent cycles
 are reported by `validateGraph`; peer relationships are not parent cycles.
+
+The runtime Provider seam is intentionally raw and transport-only:
+
+```text
+append(record) -> durable zero-based cursor
+fetch(cursor, limit) -> ordered (cursor, record) page
+```
+
+An implementation must preserve exact-record replay idempotence, keep cursors
+monotonic, and bound each page. It must not validate authority or materialize
+state; `Runtime` performs signature, compatibility, lineage, quarantine, and
+reconciliation checks after transport ingestion. `FileProvider` remains the
+local integer-cursor contract; `OrbitDBProvider` exposes the daemon's opaque
+hash/`v1:<sequence>` cursors through the same runtime-only seam. It is not
+required by Nix evaluation.
 
 The library is exposed as both `registry` and `lib` from the flake. Run:
 

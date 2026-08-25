@@ -9,16 +9,19 @@ import json
 import os
 import sqlite3
 import fcntl
+import socket
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, TypeAlias
 
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
 
 SCHEMAS = frozenset({"node-identity", "relationship", "capability", "service", "endpoint"})
+ProviderCursor: TypeAlias = int | str
 
 
 def canonical_json(value: Any) -> bytes:
@@ -71,11 +74,26 @@ def generate_keypair(key_dir: Path, issuer: str) -> RuntimeKey:
 
 
 class Provider(ABC):
-    @abstractmethod
-    def append(self, record: dict[str, Any]) -> int: ...
+    """Append-only raw transport contract used by :class:`Runtime`.
+
+    Providers are deliberately transport-only.  ``append`` must durably
+    retain the exact record and may return its zero-based cursor.  Repeating
+    the same record must return the original cursor; a different record with
+    the same logical key remains a transport entry for the runtime to
+    quarantine.  ``fetch`` returns ``(cursor, record)`` pairs in strictly
+    increasing cursor order and must enforce its own bounded page size.
+
+    Validation, authority, reconciliation, and materialization stay in
+    ``Runtime`` so an external provider cannot grant trust by accepting a
+    record.  A network adapter can implement this contract later without
+    becoming part of Nix evaluation.
+    """
 
     @abstractmethod
-    def fetch(self, cursor: int = 0, limit: int = 100) -> list[tuple[int, dict[str, Any]]]: ...
+    def append(self, record: dict[str, Any]) -> ProviderCursor: ...
+
+    @abstractmethod
+    def fetch(self, cursor: ProviderCursor = 0, limit: int = 100) -> list[tuple[ProviderCursor, dict[str, Any]]]: ...
 
 
 class FileProvider(Provider):
@@ -122,6 +140,88 @@ class FileProvider(Provider):
             for offset, line in enumerate(stream):
                 if offset >= cursor and len(result) < limit:
                     result.append((offset, json.loads(line)))
+        return result
+
+
+class OrbitDBProvider(Provider):
+    """Runtime-only adapter for the reference registryd Unix-socket contract.
+
+    OrbitDB/Helia remain transport concerns. Validation, authority, receipts,
+    and reconciliation stay in ``Runtime`` or the external controller.
+    """
+
+    def __init__(self, socket_path: Path, stream: str, *, token: str | None = None,
+                 timeout: float = 30.0,
+                 encode: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+                 decode: Callable[[dict[str, Any]], dict[str, Any]] | None = None):
+        if not isinstance(stream, str) or not stream or len(stream) > 64:
+            raise ValueError("stream must be a non-empty string of at most 64 characters")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        self.socket_path = Path(socket_path)
+        self.stream = stream
+        self.token = token
+        self.timeout = timeout
+        self.encode = encode or (lambda record: record)
+        self.decode = decode or (lambda record: record)
+
+    def _request(self, request: dict[str, Any]) -> dict[str, Any]:
+        request = dict(request)
+        if self.token is not None:
+            request["token"] = self.token
+        payload = (json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        deadline = time.monotonic() + self.timeout
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(self.timeout)
+            connection.connect(str(self.socket_path))
+            connection.sendall(payload)
+            response = bytearray()
+            while not response.endswith(b"\n"):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("OrbitDB provider request timed out")
+                connection.settimeout(remaining)
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                response.extend(chunk)
+                if len(response) > 1024 * 1024:
+                    raise ValueError("OrbitDB provider response exceeds 1 MiB")
+        try:
+            value = json.loads(response.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("OrbitDB provider returned malformed JSON") from error
+        if not isinstance(value, dict) or value.get("ok") is not True:
+            error = value.get("error") if isinstance(value, dict) else None
+            code = error.get("code") if isinstance(error, dict) else "transport_error"
+            raise RuntimeError(f"OrbitDB provider request failed: {code}")
+        return value
+
+    def append(self, record: dict[str, Any]) -> ProviderCursor:
+        response = self._request({"operation": "append", "stream": self.stream, "event": self.encode(record)})
+        result = response.get("hash")
+        if not isinstance(result, str) or not result:
+            raise ValueError("OrbitDB provider append response has no hash")
+        return result
+
+    def fetch(self, cursor: ProviderCursor = 0, limit: int = 100) -> list[tuple[ProviderCursor, dict[str, Any]]]:
+        if isinstance(cursor, int):
+            if cursor < 0:
+                raise ValueError("cursor must be non-negative")
+            cursor = f"v1:{cursor}"
+        elif not isinstance(cursor, str):
+            raise ValueError("cursor must be an integer or opaque string")
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        response = self._request({"operation": "list", "stream": self.stream, "limit": limit, "cursor": cursor})
+        records = response.get("records")
+        if not isinstance(records, list):
+            raise ValueError("OrbitDB provider list response has no records")
+        result = []
+        for item in records:
+            if not isinstance(item, dict) or not isinstance(item.get("hash"), str) or not isinstance(item.get("event"), dict):
+                raise ValueError("OrbitDB provider list response contains a malformed record")
+            result.append((item["hash"], self.decode(item["event"])))
         return result
 
 

@@ -35,6 +35,7 @@ let
     "node-identity"
     "identity-generation"
     "relationship"
+    "peer-relationship"
     "capability"
     "machine-facts"
     "hardware-snapshot"
@@ -275,7 +276,10 @@ let
       byFamily = family: filter (record: record.schema == family) accepted;
       ordered = values: lib.sortOn (value: toJSON value) values;
       identities = map (record: record.payload) (byFamily "node-identity");
-      relationships = map (record: record.payload) (byFamily "relationship");
+      relationships = map (record: record.payload) (
+        (byFamily "relationship") ++ (byFamily "peer-relationship")
+      );
+      peerRelationships = map (record: record.payload) (byFamily "peer-relationship");
       latest =
         records:
         map (
@@ -289,7 +293,7 @@ let
         ) (unique (map (x: x.recordId) records));
     in
     {
-      inherit identities relationships;
+      inherit identities relationships peerRelationships;
       records = latest accepted;
       endpoints = ordered (map (record: record.payload) (byFamily "endpoint"));
       names = ordered (
@@ -307,6 +311,7 @@ let
       provenance = map (record: {
         recordId = record.recordId;
         issuer = record.issuer;
+        schema = record.schema;
       }) accepted;
     };
 
@@ -370,7 +375,39 @@ let
     };
 
   relationshipRecords =
-    records: map (record: record.payload) (filter (record: record.schema == "relationship") records);
+    records:
+    map
+      (
+        record:
+        record.payload
+        // (
+          if record.schema == "peer-relationship" then
+            {
+              kind = "peer";
+            }
+          else
+            { }
+        )
+      )
+      (filter (record: record.schema == "relationship" || record.schema == "peer-relationship") records);
+  peerRelationshipRecords =
+    records:
+    map (record: record.payload // { kind = "peer"; }) (
+      filter (
+        record:
+        record.schema == "peer-relationship"
+        || (record.schema == "relationship" && get "kind" null record.payload == "peer")
+      ) records
+    );
+  peerEdges =
+    relationships:
+    filter (
+      edge:
+      edgeActive edge
+      && (edgeKind edge == "peer" || get "peer" false edge)
+      && isString (get "from" null edge)
+      && isString (get "to" null edge)
+    ) relationships;
   edgeActive = edge: get "status" "active" edge == "active";
   edgeKind = edge: get "kind" null edge;
   edgesBetween =
@@ -428,23 +465,38 @@ let
       relationships,
       from,
       selector,
+      scope ? null,
     }:
     let
-      graph = parentGraph relationships;
+      inScope =
+        edge: scope == null || !isList (get "scope" [ ] edge) || elem scope (get "scope" [ ] edge);
+      scopedRelationships = filter inScope relationships;
+      graph = parentGraph scopedRelationships;
       parent = reachable graph [ from ];
       reverse = foldl' (
         out: edge: out // { "${edge.to}" = (out.${edge.to} or [ ]) ++ [ edge.from ]; }
-      ) { } (parentEdges relationships);
+      ) { } (parentEdges scopedRelationships);
+      peers = peerEdges scopedRelationships;
       peer = unique (
         concatLists (
           map (
             edge:
-            optional (edgeActive edge && edgeKind edge == "peer" && (edge.from == from || edge.to == from)) (
-              if edge.from == from then edge.to else edge.from
-            )
-          ) relationships
+            optional (edge.from == from || edge.to == from) (if edge.from == from then edge.to else edge.from)
+          ) peers
         )
       );
+      cohort =
+        let
+          peerGraph = foldl' (
+            out: edge:
+            out
+            // {
+              "${edge.from}" = (out.${edge.from} or [ ]) ++ [ edge.to ];
+              "${edge.to}" = (out.${edge.to} or [ ]) ++ [ edge.from ];
+            }
+          ) { } peers;
+        in
+        unique ([ from ] ++ reachable peerGraph [ from ]);
     in
     if selector == "local" then
       [ from ]
@@ -458,6 +510,8 @@ let
       reachable reverse [ from ]
     else if selector == "peers" then
       peer
+    else if selector == "cohort" || selector == "peer-cohort" then
+      cohort
     else if selector == "accessible" then
       unique ([ from ] ++ parent ++ peer)
     else
@@ -475,6 +529,30 @@ let
     {
       inherit cycles multipleParents;
       valid = cycles == [ ];
+      peerCohorts =
+        let
+          peerGraph = foldl' (
+            out: edge:
+            out
+            // {
+              "${edge.from}" = (out.${edge.from} or [ ]) ++ [ edge.to ];
+              "${edge.to}" = (out.${edge.to} or [ ]) ++ [ edge.from ];
+            }
+          ) { } (peerEdges relationships);
+          nodes = unique (
+            concatLists (
+              map (edge: [
+                edge.from
+                edge.to
+              ]) (peerEdges relationships)
+            )
+          );
+          cohorts = map (
+            node: lib.sort builtins.lessThan (unique ([ node ] ++ reachable peerGraph [ node ]))
+          ) nodes;
+          representatives = unique (map head cohorts);
+        in
+        map (representative: findFirst (cohort: head cohort == representative) [ ] cohorts) representatives;
     };
 
   validateCapabilities =
@@ -555,6 +633,8 @@ in
     makeTransport
     makeDummyProvider
     relationshipRecords
+    peerRelationshipRecords
+    peerEdges
     graphQuery
     validateGraph
     validateCapabilities

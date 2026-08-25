@@ -49,6 +49,16 @@ let
         autonomy = "dependent";
       };
     };
+  peerRelationship =
+    id: from: to: scope:
+    record {
+      schema = "peer-relationship";
+      payload = {
+        relationshipId = id;
+        inherit from to scope;
+        status = "active";
+      };
+    };
   raw = [
     (identity "root-node")
     (identity "child-node")
@@ -245,6 +255,16 @@ let
     ];
   };
   graph = registry.validateGraph { relationships = registry.relationshipRecords checked.accepted; };
+  peer = peerRelationship "peer-root-child" "root-node" "peer-node" [ "observe" ];
+  peerChecked = registry.reconcile {
+    raw = [ peer ];
+    signers.root = signer;
+  };
+  peerScoped = registry.relationshipRecords peerChecked.accepted;
+  peerSignatureRejected = registry.reconcile {
+    raw = [ (peer // { signature = "invalid"; }) ];
+    signers.root = signer;
+  };
   transport = registry.makeTransport [
     (identity "b")
     (identity "a")
@@ -345,6 +365,44 @@ assert
     }).quarantine.code
   )).value == "malformed-record";
 assert graph.valid;
+assert peerChecked.accepted == [ peer ];
+assert
+  registry.peerRelationshipRecords peerChecked.accepted == [
+    (peer.payload // { kind = "peer"; })
+  ];
+assert (builtins.elemAt peerChecked.materialized.provenance 0).schema == "peer-relationship";
+assert peerSignatureRejected.accepted == [ ];
+assert (builtins.elemAt peerSignatureRejected.quarantined 0).quarantine.code == "invalid-signature";
+assert
+  registry.graphQuery {
+    relationships = peerScoped;
+    from = "root-node";
+    selector = "peers";
+  } == [ "peer-node" ];
+assert
+  registry.graphQuery {
+    relationships = peerScoped;
+    from = "root-node";
+    selector = "peers";
+    scope = "admin";
+  } == [ ];
+assert
+  registry.graphQuery {
+    relationships = peerScoped;
+    from = "root-node";
+    selector = "peer-cohort";
+  } == [
+    "root-node"
+    "peer-node"
+  ];
+assert
+  !(elem "peer-node" (
+    registry.graphQuery {
+      relationships = peerScoped;
+      from = "root-node";
+      selector = "descendants";
+    }
+  ));
 assert elem "child-node" (
   registry.graphQuery {
     relationships = registry.relationshipRecords checked.accepted;

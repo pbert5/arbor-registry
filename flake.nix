@@ -42,6 +42,10 @@
           module = nixosModule;
           pkgs = import nixpkgs { inherit system; };
         };
+        peers = import ./tests/peers.nix {
+          inherit registry;
+          pkgs = import nixpkgs { inherit system; };
+        };
         recovery = import ./tests/recovery.nix {
           inherit registry;
           pkgs = import nixpkgs { inherit system; };
@@ -59,6 +63,10 @@
               touch $out
             '';
         vault-runtime = import ./tests/vault-runtime.nix {
+          module = vaultRuntimeModule;
+          pkgs = import nixpkgs { inherit system; };
+        };
+        vault-runtime-contract = import ./tests/vault-runtime-contract.nix {
           module = vaultRuntimeModule;
           pkgs = import nixpkgs { inherit system; };
         };
