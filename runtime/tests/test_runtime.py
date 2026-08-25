@@ -146,6 +146,30 @@ class RuntimeTests(unittest.TestCase):
         finally:
             server.shutdown(); server.server_close(); thread.join()
 
+    def test_orbitdb_provider_rejects_reordered_sequences(self):
+        import socketserver
+        import threading
+
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self):
+                self.wfile.write(json.dumps({
+                    "ok": True,
+                    "records": [
+                        {"hash": "h1", "sequence": 2, "event": {"id": 1}},
+                        {"hash": "h2", "sequence": 2, "event": {"id": 2}},
+                    ],
+                    "nextCursor": "v1:3",
+                }).encode() + b"\n")
+
+        path = Path(self.temp.name) / "ordered.sock"
+        server = socketserver.UnixStreamServer(str(path), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            with self.assertRaises(ValueError):
+                OrbitDBProvider(path, "membership").fetch(0, 2)
+        finally:
+            server.shutdown(); server.server_close(); thread.join()
+
     def test_envelope_compatibility_and_unsafe_values_are_quarantined(self):
         cases = {
             "unknown-epoch": {"protocolEpoch": 2},

@@ -6,6 +6,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -14,6 +16,47 @@ from pathlib import Path
 from typing import Any, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+
+
+_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def _validate_reference(value: str, label: str, *, path: bool = False) -> str:
+    if not isinstance(value, str) or not value or len(value) > 512 or "\x00" in value:
+        raise ValueError(f"{label} is invalid")
+    segments = value.strip("/").split("/") if path else [value]
+    if not segments or any(not _PATH_SEGMENT.fullmatch(segment) or segment in {".", ".."} for segment in segments):
+        raise ValueError(f"{label} is invalid")
+    return value
+
+
+def _validate_address(address: str) -> str:
+    try:
+        parsed = urlsplit(address)
+        hostname = parsed.hostname
+        parsed.port  # Force validation of malformed ports.
+    except ValueError as error:
+        raise ValueError("OpenBao address is invalid") from error
+    if parsed.scheme not in {"http", "https"} or not hostname or parsed.username or parsed.password:
+        raise ValueError("OpenBao address must be an http(s) URL without embedded credentials")
+    if parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
+        raise ValueError("OpenBao address must not contain a path, query, or fragment")
+    return address.rstrip("/")
+
+
+def _read_token(token_file: Path) -> str:
+    try:
+        info = token_file.lstat()
+    except OSError as error:
+        raise ValueError("OpenBao token file is unavailable") from error
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077 or token_file.is_symlink():
+        raise ValueError("OpenBao token file must be a non-symlink regular file with mode 0600")
+    token = token_file.read_text(encoding="utf-8").strip()
+    if not token or "\n" in token or "\r" in token:
+        raise ValueError("OpenBao token file is empty or malformed")
+    return token
 
 
 def _json_value(response: Any, field: str) -> str:
@@ -34,7 +77,11 @@ def _command_fetch(command: Sequence[str], request: dict[str, str]) -> str:
     result = subprocess.run(
         list(command), input=(json.dumps(request, sort_keys=True) + "\n").encode(),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-        env={**os.environ, "ARBO_RUNTIME_PROVIDER": "openbao-command"},
+        env={
+            "PATH": os.environ.get("PATH", "/run/current-system/sw/bin:/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", "/var/empty"),
+            "ARBO_RUNTIME_PROVIDER": "openbao-command",
+        },
     )
     if result.returncode:
         raise RuntimeError(f"provider command failed with exit status {result.returncode}")
@@ -45,12 +92,11 @@ def _command_fetch(command: Sequence[str], request: dict[str, str]) -> str:
     return _json_value(response, request["field"])
 
 
-def _http_fetch(address: str, token_file: Path | None, namespace: str | None,
+def _http_fetch(address: str, token_file: Path, namespace: str | None,
                 path: str, field: str, timeout: float) -> str:
-    url = address.rstrip("/") + "/v1/" + path.lstrip("/")
+    url = _validate_address(address) + "/v1/" + _validate_reference(path, "OpenBao path", path=True).lstrip("/")
     headers = {"Accept": "application/json"}
-    if token_file is not None:
-        headers["X-Vault-Token"] = token_file.read_text(encoding="utf-8").strip()
+    headers["X-Vault-Token"] = _read_token(token_file)
     if namespace:
         headers["X-Vault-Namespace"] = namespace
     try:
@@ -93,10 +139,19 @@ def run(args: argparse.Namespace) -> int:
     command = args.provider_command
     if command is None and not args.address:
         raise ValueError("one of --provider-command or --address is required")
+    _validate_reference(args.path, "OpenBao path", path=True)
+    _validate_reference(args.field, "OpenBao field")
+    if args.namespace:
+        _validate_reference(args.namespace, "OpenBao namespace", path=True)
     token_file = Path(args.token_file) if args.token_file else None
+    if command is None:
+        if args.auth_method != "external":
+            raise ValueError("HTTP OpenBao adapter only supports auth-method external; use a provider command for other methods")
+        if token_file is None:
+            raise ValueError("HTTP OpenBao adapter requires --token-file")
     previous: str | None = None
     while True:
-        request = {"path": args.path, "field": args.field}
+        request = {"path": args.path, "field": args.field, "authMethod": args.auth_method}
         if command:
             value = _command_fetch(command, request)
         else:
@@ -125,6 +180,7 @@ def main() -> int:
     parser.add_argument("--address")
     parser.add_argument("--namespace")
     parser.add_argument("--token-file")
+    parser.add_argument("--auth-method", choices=("approle", "kubernetes", "unix", "external"), default="external")
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("--provider-command", nargs="+")
     parser.add_argument("--watch", action="store_true")

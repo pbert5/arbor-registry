@@ -35,8 +35,9 @@ function validateIndex(index, streams) {
   if (!index || index.version !== 1 || !index.streams || typeof index.streams !== 'object' || Array.isArray(index.streams)) throw new Error('invalid transport index')
   for (const stream of streams) {
     const entries = index.streams[stream]
-    if (!Array.isArray(entries) || entries.some(item => !item || typeof item.key !== 'string' || typeof item.hash !== 'string')) throw new Error('invalid transport index')
+    if (!Array.isArray(entries) || entries.some(item => !item || typeof item.key !== 'string' || typeof item.hash !== 'string' || (item.order != null && typeof item.order !== 'string'))) throw new Error('invalid transport index')
     if (new Set(entries.map(item => item.key)).size !== entries.length) throw new Error('invalid transport index')
+    if (new Set(entries.map(item => item.hash)).size !== entries.length) throw new Error('invalid transport index')
   }
   return index
 }
@@ -91,6 +92,16 @@ export class TransportDaemon {
 
   async start() {
     await fs.mkdir(this.stateDir, { recursive: true, mode: 0o700 })
+    this.quarantineMarkers = new Set()
+    try {
+      const lines = (await fs.readFile(this.quarantinePath, 'utf8')).split('\n').filter(Boolean).slice(-10000)
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line)
+          if (typeof entry.reason === 'string' && typeof entry.entry === 'string') this.quarantineMarkers.add(digest({ reason: entry.reason, raw: entry.entry }))
+        } catch {}
+      }
+    } catch (cause) { if (cause.code !== 'ENOENT') throw cause }
     const indexFile = path.join(this.stateDir, 'transport-index.json')
     try { this.index = validateIndex(JSON.parse(await fs.readFile(indexFile, 'utf8')), this.streams) } catch (cause) { if (cause.code !== 'ENOENT') throw cause }
     this.privateKey = await privateKeyAt(path.join(this.stateDir, 'libp2p.key'))
@@ -100,20 +111,28 @@ export class TransportDaemon {
     this.datastore = new LevelDatastore(path.join(this.stateDir, 'helia-data')); await this.datastore.open()
     this.helia = new Helia({ libp2p: this.libp2p, blockstore: this.blockstore, datastore: this.datastore, blockBrokers: [bitswap()] })
     await this.helia.start()
-    await this.dialBootstrapPeers()
+    await this.dialBootstrapPeers(20)
+    if (this.bootstrapPeers.length) {
+      this.bootstrapTimer = setInterval(() => { this.dialBootstrapPeers(1).catch(() => {}) }, 5000)
+      this.bootstrapTimer.unref?.()
+    }
     const helia = this.helia
     const ipfs = { libp2p: orbitdbLibp2p(this.libp2p), pins: helia.pins, blockstore: { put: (cid, value, options) => helia.blockstore.put(cid, value, options), async *get(cid, options) { yield await helia.blockstore.get(cid, options) } } }
     this.orbitdb = await createOrbitDB({ ipfs, id: peerId.toString(), directory: path.join(this.stateDir, 'orbitdb') })
     for (const stream of this.streams) await this.open(stream)
-    for (const stream of this.streams) await this.withIndexLock(async () => {
-      await this.reloadIndex(); await this.refreshIndex(stream); await this.saveIndex()
+    for (const stream of this.streams) await this.withIndexLock(async assertOwned => {
+      await this.reloadIndex(); await this.refreshIndex(stream); await assertOwned(); await this.saveIndex(assertOwned)
     })
   }
 
-  async dialBootstrapPeers() {
+  async dialBootstrapPeers(attempts = 1) {
     if (!this.bootstrapPeers.length) return true
-    const results = await Promise.allSettled(this.bootstrapPeers.map(peer => this.libp2p.dial(peer)))
-    return results.some(result => result.status === 'fulfilled')
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const results = await Promise.allSettled(this.bootstrapPeers.map(peer => this.libp2p.dial(peer)))
+      if (results.some(result => result.status === 'fulfilled')) return true
+      if (attempt + 1 < attempts) await new Promise(resolve => setTimeout(resolve, 250))
+    }
+    return false
   }
 
   async open(stream) {
@@ -125,7 +144,7 @@ export class TransportDaemon {
 
   async append(stream, event) {
     const operation = this.appendQueue.then(async () => {
-      return this.withIndexLock(async () => {
+      return this.withIndexLock(async assertOwned => {
         await this.reloadIndex()
         if (!this.streams.includes(stream) || !event || typeof event !== 'object' || Array.isArray(event)) throw new Error('invalid stream or event')
         await this.refreshIndex(stream)
@@ -133,8 +152,12 @@ export class TransportDaemon {
         const existing = entries.find(item => item.key === key)
         if (existing) return { hash: existing.hash, cursor: `v1:${entries.indexOf(existing)}`, duplicate: true }
         const hash = String(await (await this.open(stream)).add(event))
-        const cursor = `v1:${entries.length}`
-        entries.push({ key, hash }); await this.saveIndex()
+        await this.refreshIndex(stream)
+        const refreshed = this.index.streams[stream] ??= []
+        let position = refreshed.findIndex(item => item.hash === hash)
+        if (position < 0) { refreshed.push({ key, hash, order: `1:${hash}` }); position = refreshed.length - 1 }
+        const cursor = `v1:${position}`
+        await assertOwned(); await this.saveIndex(assertOwned)
         return { hash, cursor, duplicate: false }
       })
     })
@@ -144,8 +167,8 @@ export class TransportDaemon {
 
   async list(stream, cursor = 'v1:0', limit = 100) {
     if (!this.streams.includes(stream) || !Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new Error('invalid list request')
-    return this.withIndexLock(async () => {
-      await this.reloadIndex(); await this.refreshIndex(stream); await this.saveIndex()
+    return this.withIndexLock(async assertOwned => {
+      await this.reloadIndex(); await this.refreshIndex(stream); await assertOwned(); await this.saveIndex(assertOwned)
       const entries = validateIndex(this.index, this.streams).streams[stream] ?? []
       let start
       const match = typeof cursor === 'string' && /^v1:(0|[1-9][0-9]*)$/.exec(cursor)
@@ -166,11 +189,13 @@ export class TransportDaemon {
     })
   }
 
-  async saveIndex() {
+  async saveIndex(assertOwned = async () => {}) {
     const write = this.indexQueue.then(async () => {
+      await assertOwned()
       const indexFile = path.join(this.stateDir, 'transport-index.json')
       const temporary = `${indexFile}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
       await fs.writeFile(temporary, `${JSON.stringify(validateIndex(this.index, this.streams))}\n`, { mode: 0o600, flag: 'wx' })
+      await assertOwned()
       await fs.rename(temporary, indexFile)
     })
     this.indexQueue = write.catch(() => {})
@@ -189,6 +214,11 @@ export class TransportDaemon {
     const ownerFile = `owner-${token}.json`
     let heartbeat
     let lost = false
+    const assertOwned = async () => {
+      if (lost) throw new Error('transport index lock lease lost')
+      const owner = JSON.parse(await fs.readFile(path.join(this.lockPath, ownerFile), 'utf8'))
+      if (owner.token !== token) throw new Error('transport index lock ownership lost')
+    }
     for (;;) {
       try {
         await fs.mkdir(this.lockPath)
@@ -222,7 +252,10 @@ export class TransportDaemon {
       }
     }
     try {
-      const result = await operation()
+      const result = await operation(assertOwned)
+      // The lock may be legitimately replaced during a long operation. All
+      // index writes are fenced by saveIndex(assertOwned); do not turn a
+      // read-only operation's successor takeover into a cleanup failure.
       if (lost) throw new Error('transport index lock lease lost')
       return result
     } finally {
@@ -259,6 +292,10 @@ export class TransportDaemon {
   async quarantineEntry(entry, reason) {
     let raw
     try { raw = JSON.stringify(entry) } catch { raw = JSON.stringify({ malformed: String(entry) }) }
+    const marker = digest({ reason, raw })
+    if (!this.quarantineMarkers) this.quarantineMarkers = new Set()
+    if (this.quarantineMarkers.has(marker) || this.quarantineMarkers.size >= 10000) return
+    this.quarantineMarkers.add(marker)
     await fs.appendFile(this.quarantinePath, `${JSON.stringify({ reason, entry: raw })}\n`, { mode: 0o600 })
   }
 
@@ -266,16 +303,25 @@ export class TransportDaemon {
     const database = await this.open(stream)
     const entries = this.index.streams[stream] ??= []
     if (typeof database.iterator !== 'function') return
-    const known = new Set(entries.map(item => item.hash))
+    const observed = []
+    const known = new Set()
     for await (const entry of database.iterator()) {
       if (!entry || typeof entry !== 'object' || typeof entry.hash !== 'string' || !entry.hash || !entry.value || typeof entry.value !== 'object' || Array.isArray(entry.value)) {
         await this.quarantineEntry(entry, 'malformed-replicated-entry'); continue
       }
       const hash = entry.hash
       if (!known.has(hash)) {
-        try { entries.push({ key: digest(entry.value), hash }); known.add(hash) } catch { await this.quarantineEntry(entry, 'malformed-replicated-entry') }
+        try {
+          const clock = entry.clock && typeof entry.clock === 'object' ? entry.clock : {}
+          const order = Number.isSafeInteger(clock.time)
+            ? `0:${String(clock.time).padStart(20, '0')}:${typeof clock.id === 'string' ? clock.id : ''}:${hash}`
+            : `1:${hash}`
+          observed.push({ key: digest(entry.value), hash, order }); known.add(hash)
+        } catch { await this.quarantineEntry(entry, 'malformed-replicated-entry') }
       }
     }
+    observed.sort((left, right) => left.order.localeCompare(right.order))
+    this.index.streams[stream] = observed
   }
   async handle(request) {
     try {
@@ -284,10 +330,10 @@ export class TransportDaemon {
       if (request.operation === 'append') return reply(true, await this.append(request.stream, request.event))
       if (request.operation === 'list') return reply(true, await this.list(request.stream, request.cursor ?? 'v1:0', request.limit ?? 100))
       return reply(false, { code: 'unsupported_operation' })
-    } catch (cause) { return reply(false, { code: 'invalid_request', message: cause.message }) }
+    } catch { return reply(false, { code: 'invalid_request' }) }
   }
 
-  async stop() { for (const db of this.databases.values()) await db.close(); await this.orbitdb?.stop(); await this.helia?.stop(); await this.datastore?.close(); await this.blockstore?.close(); await this.libp2p?.stop() }
+  async stop() { if (this.bootstrapTimer) clearInterval(this.bootstrapTimer); for (const db of this.databases.values()) await db.close(); await this.orbitdb?.stop(); await this.helia?.stop(); await this.datastore?.close(); await this.blockstore?.close(); await this.libp2p?.stop() }
 }
 
 export function startSocketServer(daemon, socketPath, authorization = {}) {

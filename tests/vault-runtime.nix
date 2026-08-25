@@ -23,10 +23,12 @@ let
       {
         cluster.vault.runtime = {
           enable = true;
+          runtimeCommand = "/run/current-system/sw/bin/arbor-openbao-provider";
           nodeIdentityPath = "/var/lib/arbor/node-identity";
           providers.local = {
-            address = "bao://local";
+            address = "http://127.0.0.1:8200";
             authMethod = "external";
+            tokenFile = "/run/credentials/arbor-vault-token";
           };
           requirements.db = {
             provider = "local";
@@ -55,8 +57,9 @@ let
       {
         cluster.vault.runtime = {
           enable = true;
+          runtimeCommand = "/run/current-system/sw/bin/arbor-openbao-provider";
           nodeIdentityPath = "/nix/store/not-runtime";
-          providers.local.address = "bao://local";
+          providers.local.address = "http://127.0.0.1:8200";
           requirements.db = {
             provider = "local";
             path = "kv/data/arbor/db";
@@ -81,7 +84,8 @@ let
       {
         cluster.vault.runtime = {
           enable = true;
-          providers.local.address = "bao://local";
+          runtimeCommand = "/run/current-system/sw/bin/arbor-openbao-provider";
+          providers.local.address = "http://127.0.0.1:8200";
           requirements.db = {
             provider = "local";
             path = "kv/data/arbor/db";
@@ -109,8 +113,9 @@ let
       {
         cluster.vault.runtime = {
           enable = true;
+          runtimeCommand = "/run/current-system/sw/bin/arbor-openbao-provider";
           providers.local = {
-            address = "bao://local";
+            address = "http://127.0.0.1:8200";
             tokenFile = "/nix/store/not-a-runtime-token";
           };
           requirements.db = {

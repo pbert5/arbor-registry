@@ -23,10 +23,12 @@ let
       {
         cluster.vault.runtime = {
           enable = true;
+          runtimeCommand = "/run/current-system/sw/bin/arbor-openbao-provider";
           nodeIdentityPath = "/var/lib/arbor/node-identity";
           providers.local = {
-            address = "bao://local";
+            address = "http://127.0.0.1:8200";
             authMethod = "external";
+            tokenFile = "/run/credentials/arbor-vault-token";
           };
           requirements.db = {
             provider = "local";

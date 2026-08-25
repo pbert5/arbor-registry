@@ -44,10 +44,15 @@ let
   credentialSource = name: "/run/arbor-vaultd/credentials/${name}";
   requirements = cfg.requirements;
   bindingCredential = name: binding: requirements.${binding.requirement}.credentialName;
+  runtimeExecutable =
+    if cfg.runtimePackage != null then
+      "${cfg.runtimePackage}/bin/arbor-openbao-provider"
+    else
+      cfg.runtimeCommand;
   providerArgs =
     provider: requirement: bindingName: service:
     [
-      cfg.runtimeCommand
+      runtimeExecutable
       "--path"
       requirement.path
       "--field"
@@ -56,6 +61,8 @@ let
       (credentialSource bindingName)
       "--ready"
       "/run/arbor-vaultd/ready/${bindingName}"
+      "--auth-method"
+      provider.authMethod
     ]
     ++ lib.optionals (provider.command != null) ([ "--provider-command" ] ++ provider.command)
     ++ lib.optionals (provider.command == null) [
@@ -87,6 +94,7 @@ let
     lib.nameValuePair binding.service {
       after = [ "${fetcher}.service" ];
       wants = [ "${fetcher}.service" ];
+      requires = [ "${fetcher}.service" ];
       serviceConfig = {
         LoadCredential = [ "${bindingCredential name binding}:${credentialSource name}" ];
         Restart = "on-failure";
@@ -221,9 +229,15 @@ in
     };
 
     runtimeCommand = mkOption {
-      type = types.str;
-      default = "/run/current-system/sw/bin/arbor-openbao-provider";
-      description = "Absolute runtime path to arbor-openbao-provider.";
+      type = types.nullOr types.str;
+      default = null;
+      description = "Absolute runtime path to arbor-openbao-provider when runtimePackage is not supplied.";
+    };
+
+    runtimePackage = mkOption {
+      type = types.nullOr types.package;
+      default = null;
+      description = "Package providing arbor-openbao-provider; preferred over runtimeCommand.";
     };
 
     refreshInterval = mkOption {
@@ -245,9 +259,33 @@ in
           let
             provider = cfg.providers.${name};
           in
-          provider.command != null || provider.address != null
+          (provider.command != null) != (provider.address != null)
+          && (provider.command != null || (provider.authMethod == "external" && provider.tokenFile != null))
+          && (provider.command == null || builtins.length provider.command > 0)
         ) (lib.attrNames cfg.providers);
-        message = "cluster.vault.runtime providers must define either command or address";
+        message = "cluster.vault.runtime providers must define exactly one command/address; HTTP requires external auth and a token file";
+      }
+      {
+        assertion = runtimeExecutable != null;
+        message = "cluster.vault.runtime requires runtimePackage or runtimeCommand";
+      }
+      {
+        assertion = lib.all (
+          name:
+          let
+            requirement = cfg.requirements.${name};
+          in
+          isSafeIdentifier requirement.credentialName
+          && builtins.match "^[A-Za-z0-9_.@:-]+(/[A-Za-z0-9_.@:-]+)*$" requirement.path != null
+          && builtins.match "^[A-Za-z0-9_.@:-]+$" requirement.field != null
+        ) (lib.attrNames cfg.requirements);
+        message = "cluster.vault.runtime requirements contain unsafe credential, path, or field identifiers";
+      }
+      {
+        assertion = lib.all (
+          name: builtins.match "^[A-Za-z0-9_.@:-]+$" cfg.bindings.${name}.service != null
+        ) (lib.attrNames cfg.bindings);
+        message = "cluster.vault.runtime service names must be systemd-safe identifiers";
       }
       {
         assertion = lib.all (
@@ -271,7 +309,13 @@ in
       }
       {
         assertion =
-          !hasUnsafeValue (builtins.removeAttrs cfg [ "providers" ])
+          !hasUnsafeValue (
+            builtins.removeAttrs cfg [
+              "providers"
+              "runtimePackage"
+              "runtimeCommand"
+            ]
+          )
           && lib.all (
             name:
             let
@@ -282,11 +326,12 @@ in
             && (provider.namespace == null || !isUnsafeString provider.namespace)
             && (
               provider.tokenFile == null
-              || (lib.hasPrefix "/" provider.tokenFile && !isUnsafeString provider.tokenFile)
+              || (
+                (lib.hasPrefix "/run/" provider.tokenFile || lib.hasPrefix "/var/lib/arbor/" provider.tokenFile)
+                && !isUnsafeString provider.tokenFile
+              )
             )
-            && lib.all (
-              value: !(lib.hasPrefix "-----BEGIN" value) && !(lib.hasPrefix "/run/secrets/" value)
-            ) commandArgs
+            && lib.all (value: !isUnsafeString value) (lib.tail commandArgs)
           ) (lib.attrNames cfg.providers);
         message = "cluster.vault.runtime contains a Nix store path or secret value";
       }

@@ -233,6 +233,8 @@ class OrbitDBProvider(Provider):
             cursor = f"v1:{cursor}"
         elif not isinstance(cursor, str):
             raise ValueError("cursor must be an integer or opaque string")
+        elif not cursor or len(cursor) > 1024:
+            raise ValueError("cursor must be a non-empty bounded string")
         if limit < 1 or limit > 500:
             raise ValueError("limit must be between 1 and 500")
         response = self._request({"operation": "list", "stream": self.stream, "limit": limit, "cursor": cursor})
@@ -240,17 +242,31 @@ class OrbitDBProvider(Provider):
         if not isinstance(records, list):
             raise ValueError("OrbitDB provider list response has no records")
         next_cursor = response.get("nextCursor")
-        if not isinstance(next_cursor, str):
+        if not isinstance(next_cursor, str) or not next_cursor or len(next_cursor) > 1024:
             raise ValueError("OrbitDB provider list response has no next cursor")
+        if next_cursor.startswith("v1:") and re.fullmatch(r"v1:(0|[1-9][0-9]*)", next_cursor) is None:
+            raise ValueError("OrbitDB provider list response has malformed next cursor")
         self.next_cursor = next_cursor
         result = []
+        previous_sequence: int | None = None
+        requested_sequence = int(cursor[3:]) if re.fullmatch(r"v1:(0|[1-9][0-9]*)", cursor) else None
         for item in records:
             if not isinstance(item, dict) or not isinstance(item.get("hash"), str) or not isinstance(item.get("event"), dict):
                 raise ValueError("OrbitDB provider list response contains a malformed record")
             cursor = item.get("sequence", item["hash"])
             if not isinstance(cursor, (int, str)) or isinstance(cursor, bool):
                 raise ValueError("OrbitDB provider list response contains a malformed cursor")
+            if isinstance(cursor, int):
+                if cursor < 0 or (requested_sequence is not None and cursor < requested_sequence):
+                    raise ValueError("OrbitDB provider list response contains an out-of-range cursor")
+                if previous_sequence is not None and cursor <= previous_sequence:
+                    raise ValueError("OrbitDB provider list response cursors are not strictly increasing")
+                previous_sequence = cursor
+            elif not cursor or len(cursor) > 1024:
+                raise ValueError("OrbitDB provider list response contains an invalid opaque cursor")
             result.append((cursor, self.decode(item["event"])))
+        if previous_sequence is not None and next_cursor.startswith("v1:") and int(next_cursor[3:]) <= previous_sequence:
+            raise ValueError("OrbitDB provider list response next cursor does not advance")
         return result
 
 

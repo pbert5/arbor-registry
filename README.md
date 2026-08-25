@@ -78,9 +78,11 @@ Set `providers.<name>.command` to an injected command reading
 response. Alternatively set `address` and an optional runtime `tokenFile`;
 the HTTP adapter performs `GET /v1/<path>` with the runtime token and optional
 namespace. Token contents are never Nix option values, command-line arguments,
-or store inputs. The executable does not start OpenBao: live integration
-requires an externally managed endpoint or injected adapter command. Tests use
-a mock command and do not claim OpenBao dev-server coverage.
+or store inputs. The executable does not start OpenBao in production: live
+integration uses an externally managed endpoint or injected adapter command.
+The package check also starts an isolated OpenBao dev server and verifies HTTP
+delivery, permissions, readiness, and a second rotation read; production auth
+and systemd-vaultd behavior remain external.
 
 Recovery authorization is deliberately stricter than ordinary envelope
 validation. Every approval must identify a trusted approver, role, and
