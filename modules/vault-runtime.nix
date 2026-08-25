@@ -21,10 +21,7 @@ let
       vault = {
         changeAction = "restart";
         template = ''{{ with secret "${requirement.path}" }}{{ index .Data.data "${requirement.field}" }}{{ end }}'';
-        secrets.${requirements.${binding.requirement}.credentialName} = {
-          path = requirement.path;
-          field = requirement.field;
-        };
+        secrets.${requirements.${binding.requirement}.credentialName} = { };
       };
     };
 

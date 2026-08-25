@@ -611,14 +611,28 @@ let
       rootOf = record: get "authorityRoot" (get "issuer" null record) record.payload;
       issuerHasPath =
         accepted: record: root:
-        record.issuer == root
-        || lib.any (
-          edge:
-          edgeActive edge
-          && edgeKind edge == "parent"
-          && edge.to == record.issuer
-          && get "authorityRoot" root edge == root
-        ) (relationshipRecords accepted);
+        let
+          edges = relationshipRecords accepted;
+          children = node: map (edge: edge.to) (filter (
+            edge:
+            edgeActive edge
+            && edgeKind edge == "parent"
+            && edge.from == node
+            && get "authorityRoot" root edge == root
+          ) edges);
+          walk = seen: frontier:
+            if elem record.issuer frontier then
+              true
+            else if frontier == [ ] then
+              false
+            else
+              let
+                next = unique (concatLists (map children frontier));
+                unseen = filter (node: !elem node (seen ++ frontier)) next;
+              in
+              walk (seen ++ frontier) unseen;
+        in
+        record.issuer == root || walk [ ] [ root ];
       grantsFor =
         accepted: subject: root:
         filter (

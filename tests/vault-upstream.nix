@@ -1,30 +1,19 @@
 {
+  nixpkgs,
   pkgs,
+  system,
   module,
   upstreamModules,
 }:
 let
-  evaluated = pkgs.lib.evalModules {
-    modules = [
-      {
-        config._module.args.pkgs = pkgs;
-        options.assertions = pkgs.lib.mkOption { type = pkgs.lib.types.listOf pkgs.lib.types.anything; default = [ ]; };
-        options.systemd.services = pkgs.lib.mkOption {
-          type = pkgs.lib.types.attrsOf (pkgs.lib.types.submodule { freeformType = pkgs.lib.types.attrsOf pkgs.lib.types.anything; });
-          default = { };
-        };
-        options.systemd.sockets = pkgs.lib.mkOption { type = pkgs.lib.types.attrsOf pkgs.lib.types.anything; default = { }; };
-        options.systemd.packages = pkgs.lib.mkOption { type = pkgs.lib.types.listOf pkgs.lib.types.package; default = [ ]; };
-        options.services.vault.agents = pkgs.lib.mkOption {
-          type = pkgs.lib.types.attrsOf (pkgs.lib.types.submodule {
-            options.settings = pkgs.lib.mkOption { type = pkgs.lib.types.attrsOf pkgs.lib.types.anything; default = { }; };
-          });
-          default = { };
-        };
-      }
-    ] ++ upstreamModules ++ [
+  evaluated = nixpkgs.lib.nixosSystem {
+    inherit system;
+    modules = upstreamModules ++ [
       module
       {
+        system.stateVersion = "25.05";
+        systemd.services.api = { };
+        services.vault.agents.default = { };
         cluster.vault.runtime = {
           enable = true;
           useUpstreamVaultd = true;
@@ -45,14 +34,15 @@ let
             service = "api";
           };
         };
-        systemd.services.api = { };
       }
     ];
   };
   api = evaluated.config.systemd.services.api;
+  templates = evaluated.config.services.vault.agents.default.settings.template;
+  rendered = builtins.concatStringsSep "\n" (map (template: template.contents or "") templates);
 in
-assert api.serviceConfig.LoadCredential == [ "db-url:/run/systemd-vaultd/sock" ];
+assert builtins.elem "db-url:/run/systemd-vaultd/sock" api.serviceConfig.LoadCredential;
 assert api.vault.changeAction == "restart";
 assert api.vault.secrets."db-url" != { };
-assert api.vault.template != "";
+assert builtins.match ".*index .Data.data.*url.*" rendered != null;
 pkgs.emptyFile

@@ -96,9 +96,21 @@
           pkgs = import nixpkgs { inherit system; };
         };
         vault-upstream = import ./tests/vault-upstream.nix {
+          inherit nixpkgs system;
+          pkgs = import nixpkgs { inherit system; };
+          module = vaultRuntimeModule;
+          upstreamModules = [
+            systemd-vaultd.nixosModules.systemdVaultd
+            systemd-vaultd.nixosModules.vaultAgent
+          ];
+        };
+        vault-upstream-vm = import ./tests/vault-upstream-vm.nix {
           module = vaultRuntimeModule;
           pkgs = import nixpkgs { inherit system; };
-          upstreamModules = [ ];
+          upstreamModules = [
+            systemd-vaultd.nixosModules.systemdVaultd
+            systemd-vaultd.nixosModules.vaultAgent
+          ];
         };
         openbao-runtime =
           let
