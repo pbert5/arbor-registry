@@ -21,7 +21,7 @@ from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
 
-SCHEMAS = frozenset({"node-identity", "relationship", "capability", "service", "endpoint"})
+SCHEMAS = frozenset({"node-identity", "relationship", "capability", "service", "endpoint", "enrollment"})
 ProviderCursor: TypeAlias = int | str
 
 
@@ -61,6 +61,93 @@ class RuntimeKey:
 
     def sign(self, unsigned: dict[str, Any]) -> str:
         return _b64(self.signing_key.sign(canonical_json(unsigned)).signature)
+
+
+def make_enrollment_request(
+    identity_key: RuntimeKey,
+    node_id: str,
+    *,
+    platform: str,
+    requested_parent: str | None = None,
+    nonce: str | None = None,
+) -> dict[str, Any]:
+    """Create a self-signed enrollment request using runtime-held identity.
+
+    The request is not authority.  It only proves possession of the proposed
+    node key; an existing authority must approve it before a node-identity
+    record can enter accepted state.
+    """
+    if not isinstance(node_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", node_id):
+        raise ValueError("node_id is invalid")
+    if not isinstance(platform, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", platform):
+        raise ValueError("platform is invalid")
+    if requested_parent is not None and not isinstance(requested_parent, str):
+        raise ValueError("requested_parent is invalid")
+    if nonce is None:
+        nonce = _b64(os.urandom(24))
+    if not isinstance(nonce, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", nonce):
+        raise ValueError("nonce is invalid")
+    unsigned = {
+        "kind": "arbor-enrollment-request",
+        "version": 1,
+        "nodeId": node_id,
+        "generation": 1,
+        "platform": platform,
+        "publicKey": identity_key.public_key,
+        "requestedParent": requested_parent,
+        "nonce": nonce,
+        "subject": identity_key.issuer,
+    }
+    return {**unsigned, "signature": identity_key.sign(unsigned)}
+
+
+def approve_enrollment(
+    request: dict[str, Any],
+    authority_key: RuntimeKey,
+    *,
+    authority_root: str | None = None,
+    relationship_scope: str = "dependent",
+) -> dict[str, Any]:
+    """Turn a valid self-signed request into an authority-signed identity record."""
+    if not isinstance(request, dict) or request.get("kind") != "arbor-enrollment-request" or request.get("version") != 1:
+        raise ValueError("invalid enrollment request")
+    required = ("nodeId", "generation", "platform", "publicKey", "nonce", "signature")
+    if any(field not in request for field in required):
+        raise ValueError("incomplete enrollment request")
+    try:
+        VerifyKey(_unb64(request["publicKey"])).verify(
+            canonical_json({key: value for key, value in request.items() if key != "signature"}),
+            _unb64(request["signature"]),
+        )
+    except (ValueError, TypeError, binascii.Error, BadSignatureError) as error:
+        raise ValueError("enrollment request signature is invalid") from error
+    if not isinstance(request["nodeId"], str) or not isinstance(request["platform"], str):
+        raise ValueError("enrollment request fields are invalid")
+    if relationship_scope not in {"dependent", "independent"}:
+        raise ValueError("relationship scope is invalid")
+    payload = {
+        "identity": request["nodeId"],
+        "publicKey": request["publicKey"],
+        "platform": request["platform"],
+        "requestedParent": request.get("requestedParent"),
+        "relationshipScope": relationship_scope,
+        "enrollmentRequestDigest": _digest(request),
+        "approvedBy": authority_key.issuer,
+        "authorityRoot": authority_root or authority_key.issuer,
+    }
+    unsigned = {
+        "protocolEpoch": 1,
+        "wireVersion": 1,
+        "schemaVersion": 1,
+        "recordVersion": 1,
+        "recordId": request["nodeId"],
+        "generation": 1,
+        "predecessor": None,
+        "issuer": authority_key.issuer,
+        "schema": "node-identity",
+        "payload": payload,
+    }
+    return {**unsigned, "signature": authority_key.sign(unsigned)}
 
 
 def generate_keypair(

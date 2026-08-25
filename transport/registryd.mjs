@@ -26,6 +26,7 @@ const LOCK_HEARTBEAT_MS = Math.floor(LOCK_LEASE_MS / 3)
 const LOCK_RETRY_TIMEOUT_MS = 30_000
 const LOCK_RETRY_MS = 10
 const SOCKET_MODE = 0o660
+const MAX_QUARANTINE_ENTRIES = 10_000
 const canonical = value => JSON.stringify(value, (_, v) => v && typeof v === 'object' && !Array.isArray(v)
   ? Object.fromEntries(Object.keys(v).sort().map(k => [k, v[k]])) : v)
 const digest = value => createHash('sha256').update(canonical(value)).digest('hex')
@@ -43,13 +44,24 @@ function validateIndex(index, streams) {
 }
 
 async function privateKeyAt(file) {
-  try { return await unmarshalPrivateKey(await fs.readFile(file)) } catch (cause) {
+  try {
+    await assertPrivatePath(file)
+    return await unmarshalPrivateKey(await fs.readFile(file))
+  } catch (cause) {
     if (cause.code !== 'ENOENT') throw cause
     const key = await generateKeyPair('Ed25519')
     await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
     await fs.writeFile(file, marshalPrivateKey(key), { mode: 0o600, flag: 'wx' })
     return key
   }
+}
+
+async function assertPrivatePath(file, { directory = false } = {}) {
+  const info = await fs.lstat(file)
+  const mode = info.mode & 0o777
+  if ((directory && !info.isDirectory()) || (!directory && !info.isFile()) || mode & 0o077) throw new Error('insecure transport state permissions')
+  if (typeof process.getuid === 'function' && info.uid !== process.getuid()) throw new Error('transport state has unexpected owner')
+  return info
 }
 
 // OrbitDB 4 expects the pre-1.x libp2p stream shape; this is the only
@@ -92,6 +104,7 @@ export class TransportDaemon {
 
   async start() {
     await fs.mkdir(this.stateDir, { recursive: true, mode: 0o700 })
+    await assertPrivatePath(this.stateDir, { directory: true })
     this.quarantineMarkers = new Set()
     try {
       const lines = (await fs.readFile(this.quarantinePath, 'utf8')).split('\n').filter(Boolean).slice(-10000)
@@ -181,11 +194,12 @@ export class TransportDaemon {
       if (!Number.isSafeInteger(start) || start > Number.MAX_SAFE_INTEGER - limit) throw new Error('invalid cursor')
       const selected = entries.slice(start, start + limit); const db = await this.open(stream)
       const records = []
+      let processed = 0
       for (const [sequence, item] of selected.entries()) {
-        try { records.push({ hash: item.hash, event: await db.get(item.hash), sequence: start + sequence }) } catch { await this.quarantineEntry(item, 'unreadable-replicated-entry') }
+        try { records.push({ hash: item.hash, event: await db.get(item.hash), sequence: start + sequence }); processed = sequence + 1 } catch { break }
       }
-      const nextCursor = `v1:${start + selected.length}`
-      return { records, nextCursor, hasMore: start + selected.length < entries.length }
+      const nextCursor = `v1:${start + processed}`
+      return { records, nextCursor, hasMore: start + processed < entries.length }
     })
   }
 
@@ -294,9 +308,17 @@ export class TransportDaemon {
     try { raw = JSON.stringify(entry) } catch { raw = JSON.stringify({ malformed: String(entry) }) }
     const marker = digest({ reason, raw })
     if (!this.quarantineMarkers) this.quarantineMarkers = new Set()
-    if (this.quarantineMarkers.has(marker) || this.quarantineMarkers.size >= 10000) return
+    if (this.quarantineMarkers.has(marker)) return
     this.quarantineMarkers.add(marker)
     await fs.appendFile(this.quarantinePath, `${JSON.stringify({ reason, entry: raw })}\n`, { mode: 0o600 })
+    const lines = (await fs.readFile(this.quarantinePath, 'utf8')).split('\n').filter(Boolean)
+    if (lines.length > MAX_QUARANTINE_ENTRIES) {
+      const retained = lines.slice(-MAX_QUARANTINE_ENTRIES)
+      const temporary = `${this.quarantinePath}.${process.pid}.${Date.now()}.tmp`
+      await fs.writeFile(temporary, `${retained.join('\n')}\n`, { mode: 0o600, flag: 'wx' })
+      await fs.rename(temporary, this.quarantinePath)
+      this.quarantineMarkers = new Set(retained.flatMap(line => { try { const value = JSON.parse(line); return typeof value.reason === 'string' && typeof value.entry === 'string' ? [digest({ reason: value.reason, raw: value.entry })] : [] } catch { return [] } }))
+    }
   }
 
   async refreshIndex(stream) {
@@ -321,7 +343,13 @@ export class TransportDaemon {
       }
     }
     observed.sort((left, right) => left.order.localeCompare(right.order))
-    this.index.streams[stream] = observed
+    const unique = []
+    const keys = new Set()
+    for (const entry of observed) {
+      if (keys.has(entry.key)) { await this.quarantineEntry(entry, 'duplicate-event-key'); continue }
+      keys.add(entry.key); unique.push(entry)
+    }
+    this.index.streams[stream] = unique
   }
   async handle(request) {
     try {
@@ -345,8 +373,28 @@ export function startSocketServer(daemon, socketPath, authorization = {}) {
     || typeof authorizePeer === 'function' && await authorizePeer(request)
   // Clients write one request and half-close their write side. Keep the read
   // side alive until the asynchronous handler has produced its response.
-  const server = net.createServer({ allowHalfOpen: true }, socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; if (buffer.length > MAX_LINE) return socket.destroy(); let end; while ((end = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, end); buffer = buffer.slice(end + 1); let request; try { request = JSON.parse(line) } catch { socket.end(JSON.stringify(reply(false, { code: 'malformed_json' })) + '\n'); continue } Promise.resolve(authorized(request)).then(ok => ok ? daemon.handle(request) : reply(false, { code: 'authentication_failed' })).then(value => socket.end(JSON.stringify(value) + '\n')).catch(() => socket.destroy()) } }); socket.on('error', () => {}) })
+  const server = net.createServer({ allowHalfOpen: true }, socket => {
+    let buffer = ''; let handled = false
+    const timer = setTimeout(() => socket.destroy(), 30_000)
+    const finish = value => { clearTimeout(timer); if (!socket.destroyed) socket.end(JSON.stringify(value) + '\n') }
+    socket.on('data', chunk => {
+      if (handled) return socket.destroy()
+      buffer += chunk
+      if (buffer.length > MAX_LINE) return socket.destroy()
+      const end = buffer.indexOf('\n')
+      if (end < 0) return
+      handled = true
+      const line = buffer.slice(0, end)
+      let request
+      try { request = JSON.parse(line) } catch { return finish(reply(false, { code: 'malformed_json' })) }
+      Promise.resolve(authorized(request)).then(ok => ok ? daemon.handle(request) : reply(false, { code: 'authentication_failed' })).then(finish).catch(() => socket.destroy())
+    })
+    socket.on('close', () => clearTimeout(timer))
+    socket.on('error', () => clearTimeout(timer))
+  })
   return fs.mkdir(path.dirname(socketPath), { recursive: true, mode: 0o750 }).then(async () => {
+    const parent = await fs.lstat(path.dirname(socketPath))
+    if (!parent.isDirectory() || parent.mode & 0o022 || (typeof process.getuid === 'function' && parent.uid !== process.getuid())) throw new Error('insecure socket parent permissions')
     try { if ((await fs.lstat(socketPath)).isSocket()) await fs.unlink(socketPath); else throw new Error('refusing to replace non-socket path') } catch (cause) { if (cause.code !== 'ENOENT') throw cause }
   }).then(() => new Promise((resolve, reject) => {
     server.once('error', reject)

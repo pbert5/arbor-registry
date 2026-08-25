@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import resource
 import stat
 import subprocess
 import sys
@@ -47,13 +48,23 @@ def _validate_address(address: str) -> str:
 
 
 def _read_token(token_file: Path) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        info = token_file.lstat()
+        fd = os.open(token_file, flags)
     except OSError as error:
         raise ValueError("OpenBao token file is unavailable") from error
-    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077 or token_file.is_symlink():
-        raise ValueError("OpenBao token file must be a non-symlink regular file with mode 0600")
-    token = token_file.read_text(encoding="utf-8").strip()
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError("OpenBao token file must be a non-symlink regular file with mode 0600")
+        raw = os.read(fd, 64 * 1024 + 1)
+        if len(raw) > 64 * 1024:
+            raise ValueError("OpenBao token file is too large")
+        token = raw.decode("utf-8").strip()
+    except UnicodeDecodeError as error:
+        raise ValueError("OpenBao token file is malformed") from error
+    finally:
+        os.close(fd)
     if not token or "\n" in token or "\r" in token:
         raise ValueError("OpenBao token file is empty or malformed")
     return token
@@ -81,20 +92,36 @@ def _json_value(response: Any, field: str) -> str:
     raise ValueError(f"provider response does not contain string field {field!r}")
 
 
-def _command_fetch(command: Sequence[str], request: dict[str, str]) -> str:
-    result = subprocess.run(
-        list(command), input=(json.dumps(request, sort_keys=True) + "\n").encode(),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-        env={
-            "PATH": os.environ.get("PATH", "/run/current-system/sw/bin:/usr/bin:/bin"),
-            "HOME": os.environ.get("HOME", "/var/empty"),
-            "ARBO_RUNTIME_PROVIDER": "openbao-command",
-        },
-    )
-    if result.returncode:
-        raise RuntimeError(f"provider command failed with exit status {result.returncode}")
+def _command_fetch(command: Sequence[str], request: dict[str, str], timeout: float) -> str:
+    def limit_output() -> None:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1024 * 1024, 1024 * 1024))
+
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        process = subprocess.Popen(
+            list(command), stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
+            env={
+                "PATH": os.environ.get("PATH", "/run/current-system/sw/bin:/usr/bin:/bin"),
+                "HOME": os.environ.get("HOME", "/var/empty"),
+                "ARBO_RUNTIME_PROVIDER": "openbao-command",
+            },
+            preexec_fn=limit_output,
+        )
+        try:
+            process.communicate(input=(json.dumps(request, sort_keys=True) + "\n").encode(), timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            process.communicate()
+            raise RuntimeError("provider command timed out") from error
+        stdout.seek(0)
+        output = stdout.read(1024 * 1024 + 1)
+        stderr.seek(0)
+        stderr.read(1024 * 1024 + 1)
+    if process.returncode:
+        raise RuntimeError(f"provider command failed with exit status {process.returncode}")
+    if len(output) > 1024 * 1024:
+        raise ValueError("provider command output is too large")
     try:
-        response = json.loads(result.stdout.decode())
+        response = json.loads(output.decode())
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("provider command returned malformed JSON") from error
     return _json_value(response, request["field"])
@@ -168,7 +195,7 @@ def run(args: argparse.Namespace) -> int:
         if args.node_identity_path:
             request["nodeIdentityPath"] = args.node_identity_path
         if command:
-            value = _command_fetch(command, request)
+            value = _command_fetch(command, request, args.timeout)
         else:
             value = _http_fetch(args.address, token_file, args.namespace, args.path, args.field, args.timeout)
         digest = hashlib.sha256(value.encode()).hexdigest()
@@ -177,7 +204,7 @@ def run(args: argparse.Namespace) -> int:
             _atomic_write(args.output, value)
             _mark_ready(args.ready, digest)
         if changed and args.restart_command:
-            result = subprocess.run(args.restart_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False)
+            result = subprocess.run(args.restart_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=args.timeout)
             if result.returncode:
                 raise RuntimeError(f"restart command failed with exit status {result.returncode}")
         previous = digest
