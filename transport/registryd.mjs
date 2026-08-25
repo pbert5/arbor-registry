@@ -360,31 +360,31 @@ export class TransportDaemon {
     const database = await this.open(stream)
     const entries = this.index.streams[stream] ??= []
     if (typeof database.iterator !== 'function') return
+    const knownHashes = new Set(entries.map(item => item.hash))
+    const knownKeys = new Set(entries.map(item => item.key))
     const observed = []
-    const known = new Set()
     for await (const entry of database.iterator()) {
       if (!entry || typeof entry !== 'object' || typeof entry.hash !== 'string' || !entry.hash || !entry.value || typeof entry.value !== 'object' || Array.isArray(entry.value)) {
         await this.quarantineEntry(entry, 'malformed-replicated-entry'); continue
       }
       const hash = entry.hash
-      if (!known.has(hash)) {
+      if (!knownHashes.has(hash)) {
         try {
           const clock = entry.clock && typeof entry.clock === 'object' ? entry.clock : {}
           const order = Number.isSafeInteger(clock.time)
             ? `0:${String(clock.time).padStart(20, '0')}:${typeof clock.id === 'string' ? clock.id : ''}:${hash}`
             : `1:${hash}`
-          observed.push({ key: digest(entry.value), hash, order }); known.add(hash)
+          const key = digest(entry.value)
+          if (knownKeys.has(key)) {
+            await this.quarantineEntry(entry, 'duplicate-event-key')
+            continue
+          }
+          observed.push({ key, hash, order }); knownHashes.add(hash); knownKeys.add(key)
         } catch { await this.quarantineEntry(entry, 'malformed-replicated-entry') }
       }
     }
     observed.sort((left, right) => left.order.localeCompare(right.order))
-    const unique = []
-    const keys = new Set()
-    for (const entry of observed) {
-      if (keys.has(entry.key)) { await this.quarantineEntry(entry, 'duplicate-event-key'); continue }
-      keys.add(entry.key); unique.push(entry)
-    }
-    this.index.streams[stream] = unique
+    entries.push(...observed)
   }
   async handle(request) {
     try {
