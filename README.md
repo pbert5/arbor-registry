@@ -59,12 +59,3 @@ The runtime checks and package can be exercised with `nix flake check` and
 and is not needed by the Python runtime or pure Nix checks. Runtime identity keys and accepted state
 are created under explicit runtime paths; they are never inputs to Nix
 evaluation and must not be committed.
-
-The optional `nixosTests.vault-runtime-openbao` test composes the pinned
-upstream `numtide/systemd-vaultd` modules with the
-`vault-runtime-systemd-vaultd` adapter. Run it explicitly with
-`nix run .#nixosTests.x86_64-linux.vault-runtime-openbao`. The VM creates
-OpenBao/AppRole material under `/run`, delivers the selected field through
-native systemd credentials, rotates it, and checks that the credential is
-absent from the consumer environment and Nix store. The pure `vault-runtime`
-checks remain provider contracts.
