@@ -113,6 +113,36 @@ test('append cursor is inclusive and stale lock leases are recovered', async () 
   } finally { await fs.rm(root, { recursive: true, force: true }) }
 })
 
+test('an old owner release cannot remove a successor lock after takeover', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-'))
+  const first = new TransportDaemon({ stateDir: root })
+  const second = new TransportDaemon({ stateDir: root })
+  let releaseFirst
+  let releaseSecond
+  let enteredSecond
+  const firstHeld = new Promise(resolve => { releaseFirst = resolve })
+  const secondHeld = new Promise(resolve => { releaseSecond = resolve })
+  const secondEntered = new Promise(resolve => { enteredSecond = resolve })
+  const firstLock = first.withIndexLock(async () => {
+    const owner = (await fs.readdir(first.lockPath)).find(file => file.startsWith('owner-'))
+    await fs.writeFile(path.join(first.lockPath, owner), JSON.stringify({ token: owner.slice(6, -5), owner: 'dead-host', pid: 999999, acquiredAt: 0, leaseAt: 0 }))
+    await firstHeld
+  })
+  try {
+    const secondLock = second.withIndexLock(async () => { enteredSecond(); await secondHeld })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    releaseFirst()
+    await secondEntered
+    const successor = (await fs.readdir(root + '/transport-index.lock')).find(file => file.startsWith('owner-'))
+    assert.ok(successor, 'successor lock should remain while its owner is active')
+    releaseSecond()
+    await Promise.all([firstLock, secondLock])
+  } finally {
+    releaseFirst(); releaseSecond()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
 test('malformed replicated entries are quarantined and skipped', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-'))
   const daemon = new TransportDaemon({ stateDir: root })

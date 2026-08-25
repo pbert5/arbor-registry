@@ -2,7 +2,7 @@ import fs from 'node:fs/promises'
 import net from 'node:net'
 import path from 'node:path'
 import process from 'node:process'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { Helia } from '@helia/core'
 import { bitswap } from '@helia/block-brokers'
 import { createOrbitDB } from '@orbitdb/core'
@@ -22,6 +22,7 @@ import os from 'node:os'
 const MAX_LINE = 1024 * 1024
 const MAX_PAGE = 500
 const LOCK_LEASE_MS = 30_000
+const LOCK_HEARTBEAT_MS = Math.floor(LOCK_LEASE_MS / 3)
 const LOCK_RETRY_TIMEOUT_MS = 30_000
 const LOCK_RETRY_MS = 10
 const SOCKET_MODE = 0o660
@@ -184,26 +185,69 @@ export class TransportDaemon {
 
   async withIndexLock(operation) {
     const deadline = Date.now() + LOCK_RETRY_TIMEOUT_MS
+    const token = randomUUID()
+    const ownerFile = `owner-${token}.json`
+    let heartbeat
+    let lost = false
     for (;;) {
       try {
         await fs.mkdir(this.lockPath)
-        await fs.writeFile(path.join(this.lockPath, 'owner.json'), JSON.stringify({ owner: os.hostname(), pid: process.pid, acquiredAt: Date.now() }), { mode: 0o600, flag: 'wx' })
+        await fs.writeFile(path.join(this.lockPath, ownerFile), JSON.stringify({ token, owner: os.hostname(), pid: process.pid, acquiredAt: Date.now(), leaseAt: Date.now() }), { mode: 0o600, flag: 'wx' })
+        heartbeat = setInterval(async () => {
+          try {
+            const file = await fs.open(path.join(this.lockPath, ownerFile), 'r+')
+            try {
+              const owner = JSON.parse(await file.readFile('utf8'))
+              if (owner.token !== token) throw new Error('transport index lock ownership lost')
+              await file.truncate(0); await file.writeFile(JSON.stringify({ ...owner, leaseAt: Date.now() }))
+            } finally { await file.close() }
+          } catch { lost = true }
+        }, LOCK_HEARTBEAT_MS)
+        heartbeat.unref?.()
         break
       } catch (cause) {
         if (cause.code !== 'EEXIST') throw cause
-        if (await this.lockIsStale()) { await fs.rm(this.lockPath, { recursive: true, force: true }); continue }
+        if (await this.lockIsStale()) {
+          const stalePath = `${this.lockPath}.stale-${randomUUID()}`
+          try {
+            await fs.rename(this.lockPath, stalePath)
+            await fs.rm(stalePath, { recursive: true, force: true })
+          } catch (takeoverError) {
+            if (takeoverError.code !== 'ENOENT' && takeoverError.code !== 'EEXIST') throw takeoverError
+          }
+          continue
+        }
         if (Date.now() >= deadline) throw new Error('transport index lock timed out')
         await new Promise(resolve => setTimeout(resolve, LOCK_RETRY_MS))
       }
     }
-    try { return await operation() } finally { await fs.rm(this.lockPath, { recursive: true, force: true }) }
+    try {
+      const result = await operation()
+      if (lost) throw new Error('transport index lock lease lost')
+      return result
+    } finally {
+      if (heartbeat) clearInterval(heartbeat)
+      // Never remove the shared lock directory: a stale takeover may have
+      // installed a successor there. The token-specific name makes this
+      // cleanup safe even if that happened during the operation.
+      await fs.rm(path.join(this.lockPath, ownerFile), { force: true })
+      await fs.rmdir(this.lockPath).catch(cause => {
+        if (cause.code !== 'ENOENT' && cause.code !== 'ENOTEMPTY') throw cause
+      })
+    }
   }
 
   async lockIsStale() {
     try {
-      const owner = JSON.parse(await fs.readFile(path.join(this.lockPath, 'owner.json'), 'utf8'))
-      const age = Date.now() - owner.acquiredAt
-      if (owner.owner !== os.hostname() || !Number.isInteger(owner.pid) || !Number.isFinite(owner.acquiredAt)) return age > LOCK_LEASE_MS
+      const files = (await fs.readdir(this.lockPath)).filter(file => file === 'owner.json' || /^owner-[0-9a-f-]+\.json$/.test(file))
+      if (files.length !== 1) {
+        const stat = await fs.stat(this.lockPath)
+        return Date.now() - stat.mtimeMs > LOCK_LEASE_MS
+      }
+      const owner = JSON.parse(await fs.readFile(path.join(this.lockPath, files[0]), 'utf8'))
+      const leaseAt = Number.isFinite(owner.leaseAt) ? owner.leaseAt : owner.acquiredAt
+      const age = Date.now() - leaseAt
+      if (owner.owner !== os.hostname() || !Number.isInteger(owner.pid) || !Number.isFinite(leaseAt)) return age > LOCK_LEASE_MS
       try { process.kill(owner.pid, 0); return age > LOCK_LEASE_MS } catch (cause) { return cause.code === 'ESRCH' || age > LOCK_LEASE_MS }
     } catch (cause) {
       if (cause.code === 'ENOENT') return false
