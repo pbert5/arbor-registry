@@ -22,11 +22,14 @@ let
     "signingkey"
     "signing-key"
     "apikey"
+    "accesskey"
     "accesstoken"
     "access-token"
     "seed"
   ];
-  hasUnsafeName = name: lib.elem (lib.toLower name) unsafeNames;
+  hasUnsafeName = name:
+    let normalized = lib.toLower (builtins.replaceStrings [ "_" ] [ "" ] name);
+    in lib.elem normalized unsafeNames;
   hasUnsafeValue =
     value:
     if builtins.isString value then

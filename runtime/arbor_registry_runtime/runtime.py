@@ -28,7 +28,7 @@ SCHEMAS = frozenset({
     "enrollment", "revocation", "recovery-authorization", "receipt",
 })
 ProviderCursor: TypeAlias = int | str
-_SECRET_KEY = re.compile(r"(?:secret|password|passphrase|token|credential|private|signingkey|apikey|accesskey|seed)", re.IGNORECASE)
+_SECRET_NAMES = {"secret", "password", "passphrase", "token", "credential", "private", "privatekey", "signingkey", "apikey", "accesskey", "accesstoken", "seed"}
 
 
 def _unsafe_value(value: Any) -> bool:
@@ -39,7 +39,10 @@ def _unsafe_value(value: Any) -> bool:
             or re.match(r"^Bearer\s+\S+$", value, re.IGNORECASE) is not None
         )
     if isinstance(value, dict):
-        return any(_SECRET_KEY.search(str(key)) is not None or _unsafe_value(item) for key, item in value.items())
+        return any(
+            re.sub(r"[-_]", "", str(key)).lower() in _SECRET_NAMES or _unsafe_value(item)
+            for key, item in value.items()
+        )
     if isinstance(value, list):
         return any(_unsafe_value(item) for item in value)
     return False
@@ -498,7 +501,7 @@ class OrbitDBProvider(Provider):
     def append(self, record: dict[str, Any]) -> ProviderCursor:
         response = self._request({"operation": "append", "stream": self.stream, "event": self.encode(record)})
         result = response.get("cursor")
-        if not isinstance(result, str) or not re.fullmatch(r"v1:(0|[1-9][0-9]*)", result):
+        if not isinstance(result, str) or not re.fullmatch(r"(?:v1:(0|[1-9][0-9]*)|v2(?:-after)?:[A-Za-z0-9._:-]{1,1024})", result):
             raise ValueError("OrbitDB provider append response has no valid cursor")
         return result
 
@@ -565,7 +568,7 @@ class Runtime:
         self.provider = provider
         self.public_keys = dict(public_keys)
         self.authority_issuers = set(authority_issuers) if authority_issuers is not None else (
-            {"root"} if "root" in self.public_keys else set(self.public_keys)
+            {"root"} if "root" in self.public_keys else set()
         )
         self.approver_roles = approver_roles or {"operator": set(self.authority_issuers), "parent": set(), "peer": set()}
         self.recovery_thresholds = recovery_thresholds or {"operator": 1, "parent": 0, "peer": 0}
