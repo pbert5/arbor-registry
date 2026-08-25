@@ -293,11 +293,13 @@ export class TransportDaemon {
 export function startSocketServer(daemon, socketPath, authorization = {}) {
   const options = typeof authorization === 'string' ? { token: authorization } : authorization ?? {}
   const { token, authorizePeer, mode = SOCKET_MODE, uid, gid } = options
-  if ((token == null || token === '') && typeof authorizePeer !== 'function') throw new Error('socket authorization is required')
+  if ((token == null || token === '') && typeof authorizePeer !== 'function') return Promise.reject(new Error('socket authorization is required'))
   if (!Number.isInteger(mode) || mode < 0 || mode > 0o777 || (uid == null) !== (gid == null) || (uid != null && (!Number.isInteger(uid) || uid < 0 || !Number.isInteger(gid) || gid < 0))) throw new Error('invalid socket ownership or mode')
   const authorized = async request => (token != null && request != null && request.token === token)
     || typeof authorizePeer === 'function' && await authorizePeer(request)
-  const server = net.createServer(socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; if (buffer.length > MAX_LINE) return socket.destroy(); let end; while ((end = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, end); buffer = buffer.slice(end + 1); let request; try { request = JSON.parse(line) } catch { socket.write(JSON.stringify(reply(false, { code: 'malformed_json' })) + '\n'); continue } Promise.resolve(authorized(request)).then(ok => ok ? daemon.handle(request) : reply(false, { code: 'authentication_failed' })).then(value => socket.write(JSON.stringify(value) + '\n')).catch(() => socket.destroy()) } }); socket.on('error', () => {}) })
+  // Clients write one request and half-close their write side. Keep the read
+  // side alive until the asynchronous handler has produced its response.
+  const server = net.createServer({ allowHalfOpen: true }, socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; if (buffer.length > MAX_LINE) return socket.destroy(); let end; while ((end = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, end); buffer = buffer.slice(end + 1); let request; try { request = JSON.parse(line) } catch { socket.end(JSON.stringify(reply(false, { code: 'malformed_json' })) + '\n'); continue } Promise.resolve(authorized(request)).then(ok => ok ? daemon.handle(request) : reply(false, { code: 'authentication_failed' })).then(value => socket.end(JSON.stringify(value) + '\n')).catch(() => socket.destroy()) } }); socket.on('error', () => {}) })
   return fs.mkdir(path.dirname(socketPath), { recursive: true, mode: 0o750 }).then(async () => {
     try { if ((await fs.lstat(socketPath)).isSocket()) await fs.unlink(socketPath); else throw new Error('refusing to replace non-socket path') } catch (cause) { if (cause.code !== 'ENOENT') throw cause }
   }).then(() => new Promise((resolve, reject) => {

@@ -80,6 +80,74 @@
           module = vaultRuntimeModule;
           pkgs = import nixpkgs { inherit system; };
         };
+        openbao-runtime =
+          let
+            pkgs = import nixpkgs { inherit system; };
+            runtime = import ./runtime/package.nix {
+              inherit (pkgs) lib python3Packages;
+            };
+          in
+          pkgs.runCommand "arbor-registry-openbao-runtime"
+            {
+              nativeBuildInputs = [
+                pkgs.bash
+                pkgs.coreutils
+                pkgs.curl
+                pkgs.openbao
+              ];
+            }
+            ''
+              set -euo pipefail
+              work=$(mktemp -d)
+              mkdir -p "$work/home"
+              export HOME="$work/home"
+              port=18273
+              ${pkgs.openbao}/bin/bao server -dev \
+                -dev-root-token-id=arbor-test-root \
+                -dev-listen-address="127.0.0.1:$port" \
+                >"$work/openbao.log" 2>&1 &
+              server_pid=$!
+              cleanup() {
+                kill "$server_pid" 2>/dev/null || true
+                wait "$server_pid" 2>/dev/null || true
+              }
+              trap cleanup EXIT
+              export BAO_ADDR="http://127.0.0.1:$port"
+              ready=false
+              for attempt in $(seq 1 100); do
+                if ${pkgs.curl}/bin/curl --fail --silent "$BAO_ADDR/v1/sys/health" >/dev/null; then ready=true; break; fi
+                sleep 0.1
+              done
+              if [ "$ready" != true ]; then cat "$work/openbao.log"; exit 1; fi
+              token_file="$work/token"
+              printf '%s\n' arbor-test-root >"$token_file"
+              chmod 600 "$token_file"
+              secret_v1="runtime-$(date +%s%N)"
+              BAO_TOKEN=arbor-test-root ${pkgs.openbao}/bin/bao kv put secret/arbor/db url="$secret_v1" >/dev/null
+              ${runtime}/bin/arbor-openbao-provider \
+                --address "$BAO_ADDR" \
+                --token-file "$token_file" \
+                --path secret/data/arbor/db \
+                --field url \
+                --output "$work/credential" \
+                --ready "$work/ready"
+              test "$(<"$work/credential")" = "$secret_v1"
+              test "$(stat -c '%a' "$work/credential")" = 600
+              test "$(stat -c '%a' "$work/ready")" = 644
+              test "$(wc -c <"$work/ready")" = 65
+              secret_v2="runtime-$(date +%s%N)"
+              BAO_TOKEN=arbor-test-root ${pkgs.openbao}/bin/bao kv put secret/arbor/db url="$secret_v2" >/dev/null
+              ${runtime}/bin/arbor-openbao-provider \
+                --address "$BAO_ADDR" \
+                --token-file "$token_file" \
+                --path secret/data/arbor/db \
+                --field url \
+                --output "$work/credential" \
+                --ready "$work/ready"
+              test "$(<"$work/credential")" = "$secret_v2"
+              if grep -F "$secret_v2" "$token_file" "$work/ready"; then exit 1; fi
+              touch "$out"
+            '';
       });
     };
 }

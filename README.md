@@ -62,6 +62,26 @@ evaluation and must not be committed. `generate_keypair` refuses to replace
 existing active key files; use a numbered `generation` to retain prior keys,
 or explicitly request `rotation=True` for an active-key rotation.
 
+## OpenBao runtime provider
+
+`nixosModules.vault-runtime` starts one `arbor-vault-runtime-<binding>` service
+per credential binding. It invokes the runtime-only `arbor-openbao-provider`,
+writes credentials with same-directory atomic rename and mode `0600`, and
+writes only a SHA-256 readiness marker under `/run/arbor-vaultd/ready`.
+It polls for rotation and runs `systemctl try-restart <consumer>` after a
+changed value is durably written. Failed refreshes retain the last good value;
+an initial failure leaves the consumer blocked because its fetcher is not
+ready.
+
+Set `providers.<name>.command` to an injected command reading
+`{"path": ..., "field": ...}` on stdin and returning an OpenBao-shaped JSON
+response. Alternatively set `address` and an optional runtime `tokenFile`;
+the HTTP adapter performs `GET /v1/<path>` with the runtime token and optional
+namespace. Token contents are never Nix option values, command-line arguments,
+or store inputs. The executable does not start OpenBao: live integration
+requires an externally managed endpoint or injected adapter command. Tests use
+a mock command and do not claim OpenBao dev-server coverage.
+
 Recovery authorization is deliberately stricter than ordinary envelope
 validation. Every approval must identify a trusted approver, role, and
 approver-key generation, and all approvals must target the lost generation

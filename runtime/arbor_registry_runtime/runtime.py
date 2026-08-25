@@ -314,7 +314,11 @@ class Runtime:
             return "quarantined", "framing-limit"
         def unsafe(value: Any) -> bool:
             if isinstance(value, str):
-                return value.startswith(("/nix/store/", "/run/secrets/", "-----BEGIN"))
+                return (
+                    value.startswith(("/nix/store/", "/run/secrets/", "-----BEGIN"))
+                    or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/?#\s]+:[^/?#\s]+@", value) is not None
+                    or re.match(r"^Bearer\s+\S+$", value, re.IGNORECASE) is not None
+                )
             if isinstance(value, dict):
                 return any(unsafe(key) or unsafe(item) for key, item in value.items())
             if isinstance(value, list):

@@ -322,9 +322,21 @@ let
       accessToken = "must-not-enter-state";
     };
   };
+  unsafeEndpoint = record {
+    schema = "endpoint";
+    payload = {
+      id = "unsafe-endpoint";
+      address = "https://user:password@example.invalid/api";
+    };
+  };
 in
 assert checked.quarantined == [ ];
 assert length checked.accepted == 3;
+assert
+  (registry.validateEnvelope {
+    record = unsafeEndpoint;
+    signers.root = signer;
+  }).quarantine.code == "unsafe-value";
 assert
   checked.materialized.identities == [
     {

@@ -1,4 +1,7 @@
 import json
+import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +10,7 @@ from nacl.signing import SigningKey
 
 from arbor_registry_runtime import FileProvider, OrbitDBProvider, Provider, Runtime, RuntimeKey, canonical_json, generate_keypair
 from arbor_registry_runtime.runtime import _key
+from arbor_registry_runtime.openbao_provider import _json_value
 
 
 class RuntimeTests(unittest.TestCase):
@@ -160,6 +164,26 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual([outcome["reason"] for outcome in outcomes], list(cases))
         self.assertEqual(self.runtime.accepted(), [])
 
+    def test_endpoint_credentials_embedded_in_urls_are_quarantined(self):
+        record = self.envelope(
+            "endpoint-url",
+            schema="endpoint",
+            payload={"address": "https://user:password@example.invalid/api"},
+        )
+        outcome = self.runtime.ingest([record])[0]
+        self.assertEqual(outcome["status"], "quarantined")
+        self.assertEqual(outcome["reason"], "unsafe-value")
+
+    def test_bearer_values_are_quarantined_even_without_secret_field_names(self):
+        record = self.envelope(
+            "endpoint-bearer",
+            schema="endpoint",
+            payload={"authorization": "Bearer runtime-secret"},
+        )
+        outcome = self.runtime.ingest([record])[0]
+        self.assertEqual(outcome["status"], "quarantined")
+        self.assertEqual(outcome["reason"], "unsafe-value")
+
     def test_conflicting_record_key_quarantines_both_variants(self):
         first = self.envelope("same")
         second = self.envelope("same", payload={"id": "different"})
@@ -184,6 +208,38 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("rollback:2", accepted_keys)
         self.assertNotIn("rollback:1", accepted_keys)
         self.assertIn("anti-rollback", {item["reason"] for item in self.runtime.quarantine()})
+
+
+class OpenBaoProviderTests(unittest.TestCase):
+    def test_mock_command_materializes_atomic_0600_value_and_digest_readiness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            provider = root / "provider.py"
+            provider.write_text(
+                "import json, sys\n"
+                "request = json.loads(sys.stdin.readline())\n"
+                "print(json.dumps({'data': {request['field']: 'runtime-secret'}}))\n",
+                encoding="utf-8",
+            )
+            output, ready = root / "credentials" / "db", root / "ready" / "db"
+            result = subprocess.run([
+                sys.executable, "-m", "arbor_registry_runtime.openbao_provider",
+                "--path", "kv/data/arbor/db", "--field", "url",
+                "--output", str(output), "--ready", str(ready),
+                "--provider-command", sys.executable, str(provider),
+            ], check=False, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(output.read_text(), "runtime-secret")
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(ready.stat().st_mode), 0o644)
+            self.assertNotIn("runtime-secret", ready.read_text())
+            self.assertEqual(len(ready.read_text().strip()), 64)
+
+    def test_openbao_shapes_require_string_field(self):
+        self.assertEqual(_json_value({"data": {"url": "x"}}, "url"), "x")
+        self.assertEqual(_json_value({"data": {"data": {"url": "x"}}}, "url"), "x")
+        with self.assertRaises(ValueError):
+            _json_value({"data": {"url": 1}}, "url")
 
 
 if __name__ == "__main__":

@@ -16,7 +16,9 @@ function request(socketPath, value, token = 'test-token') {
     socket.on('connect', () => socket.end(`${JSON.stringify({ ...value, token })}\n`))
     socket.on('data', chunk => { response += chunk })
     socket.on('error', reject)
-    socket.on('close', () => resolve(JSON.parse(response)))
+    socket.on('close', () => {
+      try { resolve(JSON.parse(response)) } catch (error) { reject(error) }
+    })
   })
 }
 
@@ -25,6 +27,28 @@ async function waitForSocket(socketPath) {
     try { await fs.access(socketPath); return } catch { await new Promise(resolve => setTimeout(resolve, 20)) }
   }
   throw new Error('daemon socket did not appear')
+}
+
+async function freeTcpPort() {
+  const probe = net.createServer()
+  await new Promise((resolve, reject) => {
+    probe.once('error', reject)
+    probe.listen(0, '127.0.0.1', resolve)
+  })
+  const port = probe.address().port
+  await new Promise(resolve => probe.close(resolve))
+  return port
+}
+
+async function waitForStatus(socketPath) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    try {
+      const result = await request(socketPath, { operation: 'status' })
+      if (result.ok && result.peerId && result.databaseAddresses) return result
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  throw new Error(`daemon status did not become available: ${socketPath}`)
 }
 
 test('separate daemon processes preserve the typed append/list transport', async () => {
@@ -45,6 +69,66 @@ test('separate daemon processes preserve the typed append/list transport', async
     assert.deepEqual(page.records.map(item => item.event), [event])
   } finally {
     if (!child.killed) child.kill('SIGTERM')
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('two daemons replicate an OrbitDB event over a bootstrapped libp2p peer', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-peers-'))
+  const portA = await freeTcpPort()
+  const portB = await freeTcpPort()
+  const stateA = path.join(root, 'a')
+  const stateB = path.join(root, 'b')
+  const socketA = path.join(root, 'a.sock')
+  const socketB = path.join(root, 'b.sock')
+  const base = { ...process.env, ARBOR_REGISTRY_SOCKET_TOKEN: 'test-token' }
+  let first
+  let second
+  const stop = async child => {
+    if (!child || child.killed) return
+    child.kill('SIGTERM')
+    await new Promise(resolve => child.once('exit', resolve))
+  }
+  try {
+    first = spawn(process.execPath, [daemon], {
+      env: {
+        ...base,
+        ARBOR_REGISTRY_STATE_DIR: stateA,
+        ARBOR_REGISTRY_SOCKET: socketA,
+        ARBOR_REGISTRY_LISTEN: `/ip4/127.0.0.1/tcp/${portA}`,
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    await waitForStatus(socketA)
+    const firstStatus = await request(socketA, { operation: 'status' })
+    const databaseAddresses = JSON.stringify(firstStatus.databaseAddresses)
+    second = spawn(process.execPath, [daemon], {
+      env: {
+        ...base,
+        ARBOR_REGISTRY_STATE_DIR: stateB,
+        ARBOR_REGISTRY_SOCKET: socketB,
+        ARBOR_REGISTRY_LISTEN: `/ip4/127.0.0.1/tcp/${portB}`,
+        ARBOR_REGISTRY_DATABASE_ADDRESSES: databaseAddresses,
+        ARBOR_REGISTRY_BOOTSTRAP_PEERS: `/ip4/127.0.0.1/tcp/${portA}/p2p/${firstStatus.peerId}`,
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    await waitForStatus(socketB)
+    const event = { recordId: 'replicated-node', recordVersion: 1, payload: { source: 'peer-a' } }
+    const appended = await request(socketA, { operation: 'append', stream: 'registry', event })
+    assert.equal(appended.ok, true)
+
+    let page
+    for (let attempt = 0; attempt < 100; attempt++) {
+      page = await request(socketB, { operation: 'list', stream: 'registry', cursor: 'v1:0', limit: 10 })
+      if (page.ok && page.records.some(item => JSON.stringify(item.event) === JSON.stringify(event))) break
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    assert.equal(page.ok, true)
+    assert.deepEqual(page.records.map(item => item.event), [event])
+  } finally {
+    await stop(second)
+    await stop(first)
     await fs.rm(root, { recursive: true, force: true })
   }
 })

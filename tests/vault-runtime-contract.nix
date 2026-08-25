@@ -45,11 +45,14 @@ let
   api = evaluated.config.systemd.services.api;
 in
 assert evaluated.config.systemd.services.systemd-vaultd != { };
-assert api.after == [ "systemd-vaultd.service" ];
-assert api.wants == [ "systemd-vaultd.service" ];
+assert api.after == [ "arbor-vault-runtime-api.service" ];
+assert api.wants == [ "arbor-vault-runtime-api.service" ];
 assert api.serviceConfig.LoadCredential == [ "db-url:/run/arbor-vaultd/credentials/api" ];
 assert !(builtins.hasAttr "Environment" api.serviceConfig);
 assert !(builtins.hasAttr "EnvironmentFile" api.serviceConfig);
+assert
+  evaluated.config.systemd.services.arbor-vault-runtime-api.serviceConfig.RuntimeDirectory
+  == "arbor-vaultd";
 pkgs.runCommand "arbor-registry-vault-runtime-contract"
   {
     nativeBuildInputs = [

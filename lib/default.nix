@@ -84,6 +84,8 @@ let
       lib.hasPrefix "/nix/store/" value
       || lib.hasPrefix "/run/secrets/" value
       || lib.hasPrefix "-----BEGIN" value
+      || builtins.match "^[A-Za-z][A-Za-z0-9+.-]*://[^/?#[:space:]]+:[^/?#[:space:]]+@.*$" value != null
+      || builtins.match "^Bearer[[:space:]]+[^[:space:]]+$" value != null
     );
   containsUnsafe =
     value:
