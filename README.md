@@ -73,6 +73,13 @@ changed value is durably written. Failed refreshes retain the last good value;
 an initial failure leaves the consumer blocked because its fetcher is not
 ready.
 
+The module requires either `runtimePackage` (normally the
+`arbor-registry-runtime` package from the same input) or an explicit
+runtime-only `runtimeCommand`. HTTP providers require `authMethod =
+"external"` and a `tokenFile` under `/run` or `/var/lib/arbor`; AppRole,
+Kubernetes, and Unix authentication are handled only by an injected provider
+command, which receives the declared method in its JSON request.
+
 Set `providers.<name>.command` to an injected command reading
 `{"path": ..., "field": ...}` on stdin and returning an OpenBao-shaped JSON
 response. Alternatively set `address` and an optional runtime `tokenFile`;

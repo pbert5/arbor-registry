@@ -61,6 +61,8 @@ let
       (credentialSource bindingName)
       "--ready"
       "/run/arbor-vaultd/ready/${bindingName}"
+      "--node-identity-path"
+      cfg.nodeIdentityPath
       "--auth-method"
       provider.authMethod
     ]

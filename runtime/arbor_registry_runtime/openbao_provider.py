@@ -59,6 +59,14 @@ def _read_token(token_file: Path) -> str:
     return token
 
 
+def _validate_command(command: Sequence[str]) -> None:
+    if not command or any(not isinstance(value, str) or not value for value in command):
+        raise ValueError("provider command must be a non-empty argv list")
+    for value in command[1:]:
+        if value.startswith(("-----BEGIN", "/run/secrets/", "Bearer ")) or re.search(r"(^|[?&])(token|password|secret|credential)=", value, re.IGNORECASE):
+            raise ValueError("provider command contains a secret-like argument")
+
+
 def _json_value(response: Any, field: str) -> str:
     """Accept command output and both KV-v1/KV-v2 OpenBao response shapes."""
     candidates = [response]
@@ -141,6 +149,11 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("one of --provider-command or --address is required")
     _validate_reference(args.path, "OpenBao path", path=True)
     _validate_reference(args.field, "OpenBao field")
+    if command:
+        _validate_command(command)
+    if args.node_identity_path:
+        if not args.node_identity_path.startswith(("/run/", "/var/lib/arbor/")):
+            raise ValueError("node identity path must be a runtime path")
     if args.namespace:
         _validate_reference(args.namespace, "OpenBao namespace", path=True)
     token_file = Path(args.token_file) if args.token_file else None
@@ -152,6 +165,8 @@ def run(args: argparse.Namespace) -> int:
     previous: str | None = None
     while True:
         request = {"path": args.path, "field": args.field, "authMethod": args.auth_method}
+        if args.node_identity_path:
+            request["nodeIdentityPath"] = args.node_identity_path
         if command:
             value = _command_fetch(command, request)
         else:
@@ -181,6 +196,7 @@ def main() -> int:
     parser.add_argument("--namespace")
     parser.add_argument("--token-file")
     parser.add_argument("--auth-method", choices=("approle", "kubernetes", "unix", "external"), default="external")
+    parser.add_argument("--node-identity-path")
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("--provider-command", nargs="+")
     parser.add_argument("--watch", action="store_true")
