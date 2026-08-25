@@ -39,6 +39,12 @@ let
       lib.any (name: hasUnsafeName name || hasUnsafeValue value.${name}) (lib.attrNames value)
     else
       false;
+  bindingsHaveDeclaredRequirements = lib.all (
+    binding: lib.elem binding.requirement config.cluster.vault.requirements
+  ) (lib.attrValues config.cluster.vault.bindings);
+  bindingsHavePublicServices = lib.all (
+    binding: binding.service != "" && !hasUnsafeValue binding.service
+  ) (lib.attrValues config.cluster.vault.bindings);
 in
 {
   options.cluster.registry = {
@@ -135,8 +141,14 @@ in
         assertion = !hasUnsafeValue config.cluster.vault;
         message = "cluster.vault contains a secret-like key or unsafe value";
       }
-    ]
-    ++ lib.optionals config.cluster.registry.enable [
+      {
+        assertion = bindingsHaveDeclaredRequirements;
+        message = "cluster.vault bindings must refer to declared requirements";
+      }
+      {
+        assertion = bindingsHavePublicServices;
+        message = "cluster.vault bindings must name public service identifiers";
+      }
       {
         assertion = !hasUnsafeValue config.cluster.registry.policy;
         message = "cluster.registry.policy contains a secret-like key or unsafe value";
