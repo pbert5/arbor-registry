@@ -216,13 +216,19 @@ def run(args: argparse.Namespace) -> int:
             value = _http_fetch(args.address, token_file, args.namespace, args.path, args.field, args.timeout)
         digest = hashlib.sha256(value.encode()).hexdigest()
         changed = previous is not None and digest != previous
-        if previous != digest or not args.output.exists():
+        needs_write = previous != digest or not args.output.exists()
+        if needs_write:
             _atomic_write(args.output, value)
-            _mark_ready(args.ready, digest)
         if changed and args.restart_command:
             result = subprocess.run(args.restart_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=args.timeout)
             if result.returncode:
                 raise RuntimeError(f"restart command failed with exit status {result.returncode}")
+        if needs_write:
+            # Commit the ready digest only after any consumer refresh succeeds.
+            # A failed refresh leaves the old digest, so a restarted watcher
+            # retries the same credential generation instead of treating it as
+            # already delivered.
+            _mark_ready(args.ready, digest)
         previous = digest
         if not args.watch:
             return 0
@@ -248,6 +254,8 @@ def main() -> int:
     # option-looking arguments (the provider-to-systemd-vaultd bridge does).
     parser.add_argument("--restart-command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.restart_command is not None and not args.restart_command:
+        parser.error("--restart-command requires a command")
     if args.timeout <= 0 or args.interval <= 0:
         parser.error("--timeout and --interval must be positive")
     try:
