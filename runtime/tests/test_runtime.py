@@ -283,6 +283,47 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.ingest([revoked])
         self.assertNotIn("node:2", {record["recordId"] for record in self.runtime.accepted()})
 
+    def test_recovery_generation_replays_out_of_order_and_rejects_stale_approver(self):
+        operator = RuntimeKey("operator", SigningKey.generate())
+        replacement = RuntimeKey("node-replacement", SigningKey.generate())
+        runtime = Runtime(
+            Path(self.temp.name) / "recovery-state",
+            FileProvider(Path(self.temp.name) / "recovery-raw" / "history.jsonl"),
+            {"root": self.key.public_key, "operator": operator.public_key},
+            approver_roles={"operator": {"operator"}, "parent": set(), "peer": set()},
+        )
+        try:
+            operator_generation = make_identity_generation(self.key, "operator", 1, operator.public_key)
+            lost = make_identity_generation(self.key, "node", 1, "old-key")
+            revoked = make_revocation(self.key, "node", 1, "lost-key")
+            approval = make_recovery_approval(operator, "node", 1, role="operator", approver_generation=1)
+            authorization = make_recovery_authorization(self.key, "node", 1, replacement.public_key, [approval])
+            recovered = make_identity_generation(
+                self.key, "node", 2, replacement.public_key,
+                predecessor="node:1", recovery_authorization=authorization,
+            )
+
+            outcomes = runtime.ingest([recovered, authorization, lost, operator_generation, revoked])
+            self.assertEqual({item["status"] for item in outcomes}, {"accepted", "quarantined"})
+            self.assertEqual(runtime.projection()["node"]["generation"], 2)
+            self.assertEqual(
+                {(record["recordId"], record["generation"]) for record in runtime.accepted()},
+                {
+                    ("node", 2), ("operator", 1),
+                    ("node:recovery:1", 1), ("node:revocation:1", 1),
+                },
+            )
+
+            current_operator = make_identity_generation(self.key, "operator", 2, "new-operator-key")
+            runtime.ingest([current_operator])
+            self.assertIn(
+                "stale-approver-generation",
+                {item["reason"] for item in runtime.quarantine()},
+            )
+            self.assertEqual(runtime.projection()["node"]["generation"], 2)
+        finally:
+            runtime.close()
+
     def test_recovery_approvals_are_signed_and_bound_to_lost_generation(self):
         approval = make_recovery_approval(self.key, "node", 1, role="operator", approver_generation=1)
         authorization = make_recovery_authorization(self.key, "node", 1, "new-key", [approval])

@@ -51,6 +51,17 @@ async function waitForStatus(socketPath) {
   throw new Error(`daemon status did not become available: ${socketPath}`)
 }
 
+async function waitForRecords(socketPath, ids) {
+  let page
+  for (let attempt = 0; attempt < 120; attempt++) {
+    page = await request(socketPath, { operation: 'list', stream: 'registry', cursor: 'v1:0', limit: 20 })
+    const records = page.ok ? page.records.map(item => item.event) : []
+    if (ids.every(id => records.some(event => event.recordId === id))) return records
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  throw new Error(`records did not arrive at ${socketPath}: ${ids.join(', ')}`)
+}
+
 test('separate daemon processes preserve the typed append/list transport', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-'))
   const socketPath = path.join(root, 'registry.sock')
@@ -129,6 +140,66 @@ test('two daemons replicate an OrbitDB event over a bootstrapped libp2p peer', a
   } finally {
     await stop(second)
     await stop(first)
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('three daemons replay a partitioned peer after reconnect and state recovery', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-recovery-'))
+  const ports = await Promise.all([freeTcpPort(), freeTcpPort(), freeTcpPort()])
+  const states = ports.map((_, index) => path.join(root, String.fromCharCode(97 + index)))
+  const sockets = ports.map((_, index) => path.join(root, `${String.fromCharCode(97 + index)}.sock`))
+  const base = { ...process.env, ARBOR_REGISTRY_SOCKET_TOKEN: 'test-token' }
+  const children = []
+  const start = async index => {
+    const bootstrap = index === 0 ? [] : [`/ip4/127.0.0.1/tcp/${ports[0]}/p2p/${(await request(sockets[0], { operation: 'status' })).peerId}`]
+    const child = spawn(process.execPath, [daemon], {
+      env: {
+        ...base,
+        ARBOR_REGISTRY_STATE_DIR: states[index],
+        ARBOR_REGISTRY_SOCKET: sockets[index],
+        ARBOR_REGISTRY_LISTEN: `/ip4/127.0.0.1/tcp/${ports[index]}`,
+        ...(index === 0 ? {} : {
+          ARBOR_REGISTRY_DATABASE_ADDRESSES: JSON.stringify((await request(sockets[0], { operation: 'status' })).databaseAddresses),
+          ARBOR_REGISTRY_BOOTSTRAP_PEERS: bootstrap.join(','),
+        }),
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    children[index] = child
+    await waitForStatus(sockets[index])
+    return request(sockets[index], { operation: 'status' })
+  }
+  const stop = async index => {
+    const child = children[index]
+    if (!child || child.exitCode !== null) return
+    child.kill('SIGTERM')
+    await new Promise(resolve => child.once('exit', resolve))
+  }
+  try {
+    const firstStatus = await start(0)
+    await start(1); await start(2)
+    const initial = { recordId: 'initial', recordVersion: 1, payload: { phase: 'connected' } }
+    const duringPartition = { recordId: 'during-partition', recordVersion: 1, payload: { phase: 'replay' } }
+    const afterReconnect = { recordId: 'after-reconnect', recordVersion: 1, payload: { phase: 'recovered' } }
+    assert.equal((await request(sockets[0], { operation: 'append', stream: 'registry', event: initial })).ok, true)
+    await waitForRecords(sockets[1], ['initial']); await waitForRecords(sockets[2], ['initial'])
+
+    const peerIdBeforeRestart = (await request(sockets[1], { operation: 'status' })).peerId
+    await stop(1)
+    assert.equal((await request(sockets[0], { operation: 'append', stream: 'registry', event: duringPartition })).ok, true)
+    await waitForRecords(sockets[2], ['during-partition'])
+
+    const restarted = await start(1)
+    assert.equal(restarted.peerId, peerIdBeforeRestart, 'recovery should retain the peer identity')
+    const replayed = await waitForRecords(sockets[1], ['initial', 'during-partition'])
+    assert.equal(replayed.filter(event => event.recordId === 'during-partition').length, 1)
+    assert.equal((await request(sockets[0], { operation: 'append', stream: 'registry', event: afterReconnect })).ok, true)
+    await waitForRecords(sockets[1], ['after-reconnect']); await waitForRecords(sockets[2], ['after-reconnect'])
+    assert.equal((await request(sockets[0], { operation: 'append', stream: 'registry', event: duringPartition })).duplicate, true)
+    assert.ok(firstStatus.peerId)
+  } finally {
+    await stop(2); await stop(1); await stop(0)
     await fs.rm(root, { recursive: true, force: true })
   }
 })
