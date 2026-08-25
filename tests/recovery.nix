@@ -18,19 +18,28 @@ let
     approver = "operator-1";
     role = "operator";
     subject = "parent-a";
+    issuer = "operator-authority";
     generation = 1;
+    operation = "recovery";
+    signature = "sig-operator";
   };
   parentApproval = registry.approvalRecord {
     approver = "parent-b";
     role = "parent";
     subject = "parent-a";
+    issuer = "parent-authority";
     generation = 1;
+    operation = "recovery";
+    signature = "sig-parent";
   };
   peerApproval = registry.approvalRecord {
     approver = "peer-1";
     role = "peer";
     subject = "parent-a";
+    issuer = "peer-authority";
     generation = 1;
+    operation = "recovery";
+    signature = "sig-peer";
   };
   authorization = registry.recoveryAuthorization {
     identity = "parent-a";
@@ -104,6 +113,17 @@ let
     peerApprovals = [ peerApproval ];
     revocations = [ revoked ];
   };
+  missingSignedMetadata = registry.recoveryAuthorization {
+    identity = "parent-a";
+    lostGeneration = lost;
+    newGeneration = recovered;
+    operator = "operator-1";
+    operatorApproval = registry.approvalRecord {
+      approver = "operator-1";
+      role = "operator";
+      subject = "parent-a";
+    };
+  };
   authority = registry.validateAuthorityNonAmplification {
     sourceAuthority = [
       "observe"
@@ -119,6 +139,7 @@ assert authorization.authorized;
 assert authorization.parentApprovalSet.thresholdCompatible;
 assert authorization.peerApprovalSet.approvedCount == 1;
 assert !rejected.authorized;
+assert !missingSignedMetadata.authorized;
 assert registry.isRevoked {
   identity = "parent-a";
   generation = 1;

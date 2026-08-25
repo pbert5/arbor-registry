@@ -6,6 +6,7 @@ from pathlib import Path
 from nacl.signing import SigningKey
 
 from arbor_registry_runtime import FileProvider, Runtime, RuntimeKey, canonical_json
+from arbor_registry_runtime.runtime import _key
 
 
 class RuntimeTests(unittest.TestCase):
@@ -30,7 +31,7 @@ class RuntimeTests(unittest.TestCase):
     def test_partition_reorder_and_materialization(self):
         parent = self.envelope("node", payload={"id": "node", "aliases": ["old"]})
         child = self.envelope("node", 2, "node", payload={"id": "node", "aliases": ["new"]}, record_version=2)
-        self.assertEqual(self.runtime.ingest([child])[0]["status"], "accepted")
+        self.assertEqual(self.runtime.ingest([child])[0]["status"], "quarantined")
         self.assertEqual(self.runtime.projection(), {})
         self.runtime.ingest([parent])
         self.assertEqual(self.runtime.projection()["node"]["payload"]["aliases"], ["new"])
@@ -62,6 +63,49 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(any(path.name.endswith(".private") for path in files))
         self.assertNotIn(bytes(self.key.signing_key).hex(), json.dumps(self.runtime.projection()))
         self.assertTrue(canonical_json({"b": 1, "a": 2}) == b'{"a":2,"b":1}')
+
+    def test_envelope_compatibility_and_unsafe_values_are_quarantined(self):
+        cases = {
+            "unknown-epoch": {"protocolEpoch": 2},
+            "unsupported-wire-version": {"wireVersion": 2},
+            "unsupported-schema-version": {"schemaVersion": 2},
+            "unsupported-required-feature": {"requiredFeatures": ["future"]},
+            "unsafe-value": {"payload": {"path": "/run/secrets/token"}},
+        }
+        records = []
+        for changes in cases.values():
+            record = self.envelope(changes.get("recordId", "compat" + str(len(records))), payload={"id": "x"})
+            record.update(changes)
+            record["signature"] = self.key.sign({k: v for k, v in record.items() if k != "signature"})
+            records.append(record)
+        outcomes = self.runtime.ingest(records)
+        self.assertEqual([outcome["reason"] for outcome in outcomes], list(cases))
+        self.assertEqual(self.runtime.accepted(), [])
+
+    def test_conflicting_record_key_quarantines_both_variants(self):
+        first = self.envelope("same")
+        second = self.envelope("same", payload={"id": "different"})
+        outcomes = self.runtime.ingest([first, second])
+        self.assertEqual([outcome["reason"] for outcome in outcomes], ["conflicting-record-key", "conflicting-record-key"])
+        self.assertEqual(self.runtime.accepted(), [])
+        self.assertEqual({item["reason"] for item in self.runtime.quarantine()}, {"conflicting-record-key"})
+
+    def test_forks_and_rollbacks_never_enter_accepted_state(self):
+        parent = self.envelope("parent")
+        fork_a = self.envelope("a", 2, "parent")
+        fork_b = self.envelope("b", 2, "parent")
+        self.runtime.ingest([parent, fork_a, fork_b])
+        self.assertEqual(self.runtime.accepted(), [parent])
+        self.assertEqual({item["reason"] for item in self.runtime.quarantine()}, {"forked-lineage"})
+        newer = self.envelope("rollback", 2, "rollback", record_version=2)
+        old = self.envelope("rollback", 1)
+        # The generation-two record is invalid until its predecessor exists;
+        # once both arrive, the stale generation-one record is not accepted.
+        self.runtime.ingest([newer, old])
+        accepted_keys = {_key(record) for record in self.runtime.accepted()}
+        self.assertIn("rollback:2", accepted_keys)
+        self.assertNotIn("rollback:1", accepted_keys)
+        self.assertIn("anti-rollback", {item["reason"] for item in self.runtime.quarantine()})
 
 
 if __name__ == "__main__":

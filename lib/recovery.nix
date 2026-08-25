@@ -34,7 +34,9 @@ let
       approver,
       role ? "peer",
       subject,
+      issuer ? null,
       generation ? null,
+      operation ? null,
       decision ? "approve",
       reason ? null,
       signature ? null,
@@ -45,11 +47,16 @@ let
         approver
         role
         subject
+        issuer
         generation
+        operation
         decision
         reason
         signature
         ;
+      # The interface carries signed metadata, but this pure model does not
+      # perform cryptographic verification.
+      signatureStatus = "present-unverified";
     };
 
   identityGeneration =
@@ -149,6 +156,20 @@ let
         approvals = peerApprovals;
         inherit threshold;
       };
+      signedApprovalMetadataOK =
+        approval:
+        let
+          issuer = get "issuer" null approval;
+          signature = get "signature" null approval;
+          operation = get "operation" null approval;
+          generation = get "generation" null approval;
+        in
+        builtins.isString issuer
+        && issuer != ""
+        && builtins.isString signature
+        && signature != ""
+        && operation == "recovery"
+        && generation == lostGeneration.generation;
       subjectOK = lib.all (approval: get "subject" null approval == identity) allApprovals;
       generationOK =
         newGeneration.identity == identity
@@ -170,6 +191,7 @@ let
         && get "status" "active" newGeneration == "active"
         && length operatorApprovals > 0
         && validApprovals operatorApprovals
+        && lib.all signedApprovalMetadataOK allApprovals
         && subjectOK
         && validApprovals allApprovals
         && (parentApprovals == [ ] || thresholdMet threshold parentApprovals)

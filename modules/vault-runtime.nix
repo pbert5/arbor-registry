@@ -22,6 +22,12 @@ let
       || lib.hasInfix "-----BEGIN" value
     );
 
+  isSafeIdentifier =
+    value:
+    builtins.isString value
+    && builtins.stringLength value <= 64
+    && builtins.match "[A-Za-z0-9][A-Za-z0-9_-]*" value != null;
+
   hasUnsafeValue =
     value:
     if builtins.isString value then
@@ -168,6 +174,10 @@ in
           && builtins.hasAttr cfg.bindings.${name}.requirement cfg.requirements
         ) (lib.attrNames cfg.bindings);
         message = "cluster.vault.runtime bindings must refer to declared requirements";
+      }
+      {
+        assertion = lib.all isSafeIdentifier (lib.attrNames cfg.bindings);
+        message = "cluster.vault.runtime binding names must be safe path identifiers (ASCII alphanumeric, '_' or '-')";
       }
       {
         assertion = !hasUnsafeValue cfg;

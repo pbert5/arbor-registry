@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import hashlib
 import json
 import os
 import sqlite3
+import fcntl
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +32,10 @@ def _without_signature(record: dict[str, Any]) -> dict[str, Any]:
 
 def _key(record: dict[str, Any]) -> str:
     return f"{record.get('recordId')}:{record.get('recordVersion')}"
+
+
+def _digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(record)).hexdigest()
 
 
 def _b64(data: bytes) -> str:
@@ -79,23 +86,31 @@ class FileProvider(Provider):
         self.raw_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     def append(self, record: dict[str, Any]) -> int:
-        cursor = 0
-        while True:
-            batch = self.fetch(cursor, 1000)
-            for offset, item in batch:
-                if _key(item) == _key(record):
-                    return offset
-            if len(batch) < 1000:
-                break
-            cursor += len(batch)
-        if self.raw_path.exists():
-            with self.raw_path.open(encoding="utf-8") as stream:
-                cursor = sum(1 for _ in stream)
-        else:
-            cursor = 0
-        with self.raw_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-        return cursor
+        lock_path = self.raw_path.with_name(self.raw_path.name + ".lock")
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                cursor = 0
+                while True:
+                    batch = self.fetch(cursor, 1000)
+                    for offset, item in batch:
+                        if _key(item) == _key(record) and item == record:
+                            return offset
+                    if len(batch) < 1000:
+                        break
+                    cursor += len(batch)
+                if self.raw_path.exists():
+                    with self.raw_path.open(encoding="utf-8") as stream:
+                        cursor = sum(1 for _ in stream)
+                else:
+                    cursor = 0
+                with self.raw_path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                return cursor
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def fetch(self, cursor: int = 0, limit: int = 100) -> list[tuple[int, dict[str, Any]]]:
         if cursor < 0 or limit < 1 or limit > 1000:
@@ -119,7 +134,8 @@ class Runtime:
         self.provider = provider
         self.public_keys = dict(public_keys)
         self.max_bytes = max_bytes
-        self.db = sqlite3.connect(self.state_dir / "registry.sqlite3")
+        self.db = sqlite3.connect(self.state_dir / "registry.sqlite3", timeout=30)
+        self.db.execute("PRAGMA busy_timeout = 30000")
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS records (
             record_key TEXT PRIMARY KEY, record_id TEXT, generation INTEGER,
@@ -135,51 +151,156 @@ class Runtime:
         self.db.close()
 
     def _validate(self, record: dict[str, Any]) -> tuple[str, str | None]:
-        required = ("recordId", "recordVersion", "generation", "schema", "schemaVersion", "payload", "issuer", "signature")
+        required = ("protocolEpoch", "wireVersion", "schemaVersion", "recordId", "recordVersion",
+                    "generation", "predecessor", "schema", "payload", "issuer", "signature")
         if not isinstance(record, dict) or any(name not in record for name in required):
             return "quarantined", "malformed-record"
-        if not isinstance(record["recordId"], str) or not isinstance(record["recordVersion"], int) or not isinstance(record["generation"], int):
+        integer_fields = ("protocolEpoch", "wireVersion", "schemaVersion", "recordVersion", "generation")
+        if any(isinstance(record[name], bool) or not isinstance(record[name], int) for name in integer_fields):
             return "quarantined", "malformed-record"
-        if not isinstance(record["payload"], dict) or record["schema"] not in SCHEMAS:
+        if (not isinstance(record["recordId"], str) or not isinstance(record["schema"], str)
+                or not isinstance(record["payload"], dict) or record["generation"] < 1
+                or not isinstance(record["predecessor"], (str, type(None)))
+                or not isinstance(record["issuer"], str) or not isinstance(record["signature"], str)):
+            return "quarantined", "malformed-record"
+        if record["schema"] not in SCHEMAS:
             return "quarantined", "unknown-schema" if record.get("schema") not in SCHEMAS else "malformed-record"
-        if len(canonical_json(record)) > self.max_bytes:
+        if record["schemaVersion"] != 1:
+            return "quarantined", "unsupported-schema-version"
+        if record["protocolEpoch"] != 1:
+            return "quarantined", "unknown-epoch"
+        if record["wireVersion"] != 1:
+            return "quarantined", "unsupported-wire-version"
+        features = record.get("requiredFeatures", [])
+        if (not isinstance(features, list) or any(not isinstance(feature, str) for feature in features)):
+            return "quarantined", "malformed-record"
+        if features:
+            return "quarantined", "unsupported-required-feature"
+        try:
+            encoded = canonical_json(record)
+            unsigned = canonical_json(_without_signature(record))
+        except (TypeError, ValueError):
+            return "quarantined", "malformed-record"
+        if len(encoded) > self.max_bytes:
             return "quarantined", "framing-limit"
+        def unsafe(value: Any) -> bool:
+            if isinstance(value, str):
+                return value.startswith(("/nix/store/", "/run/secrets/", "-----BEGIN"))
+            if isinstance(value, dict):
+                return any(unsafe(key) or unsafe(item) for key, item in value.items())
+            if isinstance(value, list):
+                return any(unsafe(item) for item in value)
+            return False
+        if unsafe(_without_signature(record)):
+            return "quarantined", "unsafe-value"
         try:
             verify = VerifyKey(_unb64(self.public_keys[record["issuer"]]))
-            verify.verify(canonical_json(_without_signature(record)), _unb64(record["signature"]))
-        except (KeyError, ValueError, BadSignatureError):
+            verify.verify(unsigned, _unb64(record["signature"]))
+        except (KeyError, ValueError, TypeError, binascii.Error, BadSignatureError):
             return "quarantined", "invalid-signature"
         return "accepted", None
 
     def ingest(self, records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         outcomes = []
         for record in records:
-            record_key = _key(record)
-            status, reason = self._validate(record)
-            existing = self.db.execute("SELECT envelope, status FROM records WHERE record_key = ?", (record_key,)).fetchone()
-            if existing:
-                status, reason = existing[1], None
+            if isinstance(record, dict) and "recordId" in record and "recordVersion" in record:
+                record_key = _key(record)
             else:
+                try:
+                    record_key = "malformed:" + _digest(record)
+                except (TypeError, ValueError):
+                    record_key = "malformed:unserializable"
+            status, reason = self._validate(record)
+            try:
+                envelope = canonical_json(record).decode()
+            except (TypeError, ValueError):
+                envelope = json.dumps({"malformed": repr(record)}, sort_keys=True)
+            exact = self.db.execute("SELECT record_key, status FROM records WHERE envelope = ?", (envelope,)).fetchone()
+            existing = self.db.execute("SELECT envelope, status FROM records WHERE record_key = ?", (record_key,)).fetchone()
+            if exact:
+                record_key = exact[0]
+                status, reason = exact[1], None
+            else:
+                if existing:
+                    record_key = f"{record_key}#conflict:{hashlib.sha256(envelope.encode()).hexdigest()}"
                 self.provider.append(record)
                 self.db.execute("INSERT INTO records VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (record_key, record.get("recordId"), record.get("generation"), record.get("predecessor"),
-                     status, reason, canonical_json(record).decode()))
+                     status, reason, envelope))
             outcomes.append({"recordKey": record_key, "status": status, "reason": reason})
         self.db.commit()
+        self._reconcile()
         self._materialize()
+        for outcome in outcomes:
+            row = self.db.execute("SELECT status, reason FROM records WHERE record_key = ?", (outcome["recordKey"],)).fetchone()
+            if row:
+                outcome["status"], outcome["reason"] = row
         return outcomes
 
+    def _reconcile(self) -> None:
+        rows = self.db.execute("SELECT rowid, record_key, record_id, generation, predecessor, envelope FROM records").fetchall()
+        records = [(rowid, record_key, json.loads(raw)) for rowid, record_key, _, _, _, raw in rows]
+        by_key: dict[str, list[tuple[int, str, dict[str, Any]]]] = {}
+        for rowid, record_key, record in records:
+            base_key = _key(record) if isinstance(record, dict) else record_key
+            by_key.setdefault(base_key, []).append((rowid, record_key, record))
+        reasons: dict[int, str | None] = {}
+        valid = []
+        for rowid, record_key, record in records:
+            status, reason = self._validate(record)
+            reasons[rowid] = reason
+            if status == "accepted":
+                valid.append((rowid, record_key, record))
+        for entries in by_key.values():
+            if len({canonical_json(item[2]) for item in entries}) > 1:
+                for rowid, _, _ in entries:
+                    reasons[rowid] = "conflicting-record-key"
+        candidates = [entry for entry in valid if reasons[entry[0]] is None]
+        by_id: dict[str, list[dict[str, Any]]] = {}
+        for _, _, record in candidates:
+            by_id.setdefault(record["recordId"], []).append(record)
+        max_generation = {record_id: max(item["generation"] for item in items) for record_id, items in by_id.items()}
+        for rowid, _, record in candidates:
+            if record["generation"] < max_generation[record["recordId"]]:
+                reasons[rowid] = "anti-rollback"
+        successors: dict[str, set[tuple[str, int]]] = {}
+        for _, _, record in candidates:
+            if record["predecessor"] is not None:
+                successors.setdefault(record["predecessor"], set()).add((record["recordId"], record["generation"]))
+        for rowid, _, record in candidates:
+            if record["predecessor"] is not None and len(successors.get(record["predecessor"], set())) > 1:
+                reasons[rowid] = "forked-lineage"
+        # Historical predecessors remain usable for continuity even when they
+        # are no longer current state (anti-rollback). They are not exposed as
+        # accepted records or projected state below.
+        available = {(record["recordId"], record["generation"]) for rowid, _, record in candidates
+                     if reasons[rowid] not in {"conflicting-record-key", "forked-lineage"}}
+        for rowid, _, record in candidates:
+            if reasons[rowid] is not None:
+                continue
+            predecessor = record["predecessor"]
+            if not ((record["generation"] == 1 and predecessor is None)
+                    or (predecessor, record["generation"] - 1) in available):
+                reasons[rowid] = "missing-predecessor"
+        with self.db:
+            for rowid, _, _, _, _, _ in rows:
+                status = "accepted" if reasons[rowid] is None else "quarantined"
+                self.db.execute("UPDATE records SET status = ?, reason = ? WHERE rowid = ?", (status, reasons[rowid], rowid))
+
     def _materialize(self) -> None:
-        accepted = self.db.execute("SELECT record_id, generation, predecessor, envelope FROM records WHERE status = 'accepted' ORDER BY generation, record_key").fetchall()
+        accepted = self.db.execute("SELECT record_key, record_id, generation, predecessor, status, reason, envelope FROM records WHERE status = 'accepted' OR reason = 'anti-rollback' ORDER BY generation, record_key").fetchall()
         available: dict[str, dict[str, Any]] = {}
         available_ids: set[str] = set()
-        for record_id, generation, predecessor, raw in accepted:
+        accepted_keys = {record_key for record_key, _, _, _, status, _, _ in accepted if status == "accepted"}
+        for record_key, record_id, generation, predecessor, _, _, raw in accepted:
             if (generation == 1 and predecessor is None) or predecessor in available_ids:
                 record = json.loads(raw)
                 available[_key(record)] = record
                 available_ids.add(record["recordId"])
         latest: dict[str, tuple[int, dict[str, Any]]] = {}
         for record in available.values():
+            if _key(record) not in accepted_keys:
+                continue
             current = latest.get(record["recordId"])
             if current is None or record["generation"] >= current[0]:
                 latest[record["recordId"]] = (record["generation"], record)
