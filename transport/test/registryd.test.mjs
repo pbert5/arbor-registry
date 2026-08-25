@@ -144,7 +144,7 @@ test('two daemons replicate an OrbitDB event over a bootstrapped libp2p peer', a
   }
 })
 
-test('three daemons replay a partitioned peer after reconnect and state recovery', async () => {
+test('three persisted daemons replay missed events after restart and reconnect', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-recovery-'))
   const ports = await Promise.all([freeTcpPort(), freeTcpPort(), freeTcpPort()])
   const states = ports.map((_, index) => path.join(root, String.fromCharCode(97 + index)))
@@ -178,7 +178,9 @@ test('three daemons replay a partitioned peer after reconnect and state recovery
   }
   try {
     const firstStatus = await start(0)
-    await start(1); await start(2)
+    const secondStatus = await start(1)
+    const thirdStatus = await start(2)
+    assert.equal(new Set([firstStatus.peerId, secondStatus.peerId, thirdStatus.peerId]).size, 3)
     const initial = { recordId: 'initial', recordVersion: 1, payload: { phase: 'connected' } }
     const duringPartition = { recordId: 'during-partition', recordVersion: 1, payload: { phase: 'replay' } }
     const afterReconnect = { recordId: 'after-reconnect', recordVersion: 1, payload: { phase: 'recovered' } }
@@ -188,7 +190,8 @@ test('three daemons replay a partitioned peer after reconnect and state recovery
     const peerIdBeforeRestart = (await request(sockets[1], { operation: 'status' })).peerId
     await stop(1)
     assert.equal((await request(sockets[0], { operation: 'append', stream: 'registry', event: duringPartition })).ok, true)
-    await waitForRecords(sockets[2], ['during-partition'])
+    const livePeerRecords = await waitForRecords(sockets[2], ['initial', 'during-partition'])
+    assert.equal(livePeerRecords.filter(event => event.recordId === 'during-partition').length, 1)
 
     const restarted = await start(1)
     assert.equal(restarted.peerId, peerIdBeforeRestart, 'recovery should retain the peer identity')
