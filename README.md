@@ -58,4 +58,15 @@ The runtime checks and package can be exercised with `nix flake check` and
 `.#arbor-registry-transport`. It requires Node 22 and its pinned npm closure,
 and is not needed by the Python runtime or pure Nix checks. Runtime identity keys and accepted state
 are created under explicit runtime paths; they are never inputs to Nix
-evaluation and must not be committed.
+evaluation and must not be committed. `generate_keypair` refuses to replace
+existing active key files; use a numbered `generation` to retain prior keys,
+or explicitly request `rotation=True` for an active-key rotation.
+
+Recovery authorization is deliberately stricter than ordinary envelope
+validation. Every approval must identify a trusted approver, role, and
+approver-key generation, and all approvals must target the lost generation
+and recovery operation. Pure Nix does not implement cryptography: callers
+must provide a `signatureVerifier` function backed by a real verifier. If it
+is absent, recovery is rejected; a non-empty signature field alone is never
+authorization. The runtime's Ed25519 verifier is the reference boundary for
+that interface.

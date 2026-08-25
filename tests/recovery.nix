@@ -21,6 +21,7 @@ let
     issuer = "operator-authority";
     generation = 1;
     operation = "recovery";
+    approverGeneration = 3;
     signature = "sig-operator";
   };
   parentApproval = registry.approvalRecord {
@@ -30,6 +31,7 @@ let
     issuer = "parent-authority";
     generation = 1;
     operation = "recovery";
+    approverGeneration = 4;
     signature = "sig-parent";
   };
   peerApproval = registry.approvalRecord {
@@ -39,6 +41,7 @@ let
     issuer = "peer-authority";
     generation = 1;
     operation = "recovery";
+    approverGeneration = 4;
     signature = "sig-peer";
   };
   authorization = registry.recoveryAuthorization {
@@ -49,6 +52,23 @@ let
     operatorApproval = operator;
     parentApprovals = [ parentApproval ];
     peerApprovals = [ peerApproval ];
+    trustedApprovers = [
+      {
+        identity = "operator-1";
+        role = "operator";
+        generation = 3;
+      }
+      {
+        identity = "parent-b";
+        role = "parent";
+        generation = 4;
+      }
+      {
+        identity = "peer-1";
+        role = "peer";
+        generation = 4;
+      }
+    ];
     threshold = 1;
   };
   revoked = registry.revocation {
@@ -135,7 +155,8 @@ let
     ];
   };
 in
-assert authorization.authorized;
+assert !authorization.authorized;
+assert authorization.signatureVerifier == null;
 assert authorization.parentApprovalSet.thresholdCompatible;
 assert authorization.peerApprovalSet.approvedCount == 1;
 assert !rejected.authorized;
@@ -149,15 +170,13 @@ assert registry.generationUsable {
   generation = recovered;
   revocations = [ revoked ];
 };
-assert promoted.authorized;
+assert !promoted.authorized;
 assert
   promoted.retainedParents == [
     "parent-a"
-    "parent-b"
   ];
-assert promoted.provenance != [ ];
-assert (builtins.elemAt promoted.history 0).status == "standby-parent";
-assert (builtins.elemAt promoted.history 1).status == "active";
+assert promoted.provenance == [ ];
+assert promoted.history == [ ];
 assert (builtins.elemAt suspended.history 0).status == "suspended";
 assert (builtins.elemAt severed.history 0).status == "severed";
 assert rebound.current.from == "parent-a:2";

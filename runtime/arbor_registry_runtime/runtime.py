@@ -62,14 +62,33 @@ class RuntimeKey:
         return _b64(self.signing_key.sign(canonical_json(unsigned)).signature)
 
 
-def generate_keypair(key_dir: Path, issuer: str) -> RuntimeKey:
-    """Create a runtime-only private key and its public verification key."""
+def generate_keypair(
+    key_dir: Path,
+    issuer: str,
+    *,
+    rotation: bool = False,
+    generation: int | None = None,
+) -> RuntimeKey:
+    """Create runtime key material without silently replacing an identity.
+
+    A generation writes ``<issuer>.g<generation>`` files, preserving older
+    generations. Replacing the active ``<issuer>`` files requires the explicit
+    ``rotation=True`` operation.
+    """
+    if not isinstance(issuer, str) or not issuer:
+        raise ValueError("issuer must be a non-empty string")
+    if generation is not None and (isinstance(generation, bool) or not isinstance(generation, int) or generation < 1):
+        raise ValueError("generation must be a positive integer")
     key_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     key = RuntimeKey(issuer, SigningKey.generate())
-    private_path = key_dir / f"{issuer}.private"
-    private_path.write_text(_b64(bytes(key.signing_key)))
+    suffix = f".g{generation}" if generation is not None else ""
+    private_path = key_dir / f"{issuer}{suffix}.private"
+    public_path = key_dir / f"{issuer}{suffix}.public"
+    if not rotation and (private_path.exists() or public_path.exists()):
+        raise FileExistsError(f"key material already exists for {issuer}{suffix}; use rotation=True or a new generation")
+    private_path.write_text(_b64(bytes(key.signing_key)), encoding="ascii")
     os.chmod(private_path, 0o600)
-    (key_dir / f"{issuer}.public").write_text(key.public_key + "\n")
+    public_path.write_text(key.public_key + "\n", encoding="ascii")
     return key
 
 
@@ -164,6 +183,7 @@ class OrbitDBProvider(Provider):
         self.timeout = timeout
         self.encode = encode or (lambda record: record)
         self.decode = decode or (lambda record: record)
+        self.next_cursor: ProviderCursor | None = None
 
     def _request(self, request: dict[str, Any]) -> dict[str, Any]:
         request = dict(request)
@@ -217,11 +237,18 @@ class OrbitDBProvider(Provider):
         records = response.get("records")
         if not isinstance(records, list):
             raise ValueError("OrbitDB provider list response has no records")
+        next_cursor = response.get("nextCursor")
+        if not isinstance(next_cursor, str):
+            raise ValueError("OrbitDB provider list response has no next cursor")
+        self.next_cursor = next_cursor
         result = []
         for item in records:
             if not isinstance(item, dict) or not isinstance(item.get("hash"), str) or not isinstance(item.get("event"), dict):
                 raise ValueError("OrbitDB provider list response contains a malformed record")
-            result.append((item["hash"], self.decode(item["event"])))
+            cursor = item.get("sequence", item["hash"])
+            if not isinstance(cursor, (int, str)) or isinstance(cursor, bool):
+                raise ValueError("OrbitDB provider list response contains a malformed cursor")
+            result.append((cursor, self.decode(item["event"])))
         return result
 
 

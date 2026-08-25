@@ -37,6 +37,7 @@ let
       issuer ? null,
       generation ? null,
       operation ? null,
+      approverGeneration ? null,
       decision ? "approve",
       reason ? null,
       signature ? null,
@@ -50,13 +51,13 @@ let
         issuer
         generation
         operation
+        approverGeneration
         decision
         reason
         signature
         ;
-      # The interface carries signed metadata, but this pure model does not
-      # perform cryptographic verification.
-      signatureStatus = "present-unverified";
+      # Cryptographic verification belongs to the injected runtime verifier.
+      signatureStatus = "requires-external-verifier";
     };
 
   identityGeneration =
@@ -135,6 +136,8 @@ let
       operatorApproval ? null,
       parentApprovals ? [ ],
       peerApprovals ? [ ],
+      trustedApprovers ? [ ],
+      signatureVerifier ? null,
       threshold ? null,
       reason ? "recovery",
       provenance ? [ ],
@@ -170,7 +173,36 @@ let
         && signature != ""
         && operation == "recovery"
         && generation == lostGeneration.generation;
+      trustedApproverOK =
+        approval:
+        let
+          approver = get "approver" null approval;
+          role = get "role" null approval;
+          approverGeneration = get "approverGeneration" null approval;
+        in
+        builtins.isString approver
+        && approver != ""
+        && builtins.isString role
+        && builtins.isInt approverGeneration
+        && approverGeneration > 0
+        && lib.any (
+          trusted:
+          let
+            trustedIdentity = get "identity" (get "approver" null trusted) trusted;
+          in
+          trustedIdentity == approver
+          && get "role" null trusted == role
+          && get "generation" null trusted == approverGeneration
+        ) trustedApprovers;
+      signatureVerified =
+        builtins.isFunction signatureVerifier
+        && lib.all (approval: signatureVerifier approval) allApprovals;
       subjectOK = lib.all (approval: get "subject" null approval == identity) allApprovals;
+      roleOK =
+        (operatorApproval != null && get "approver" null operatorApproval == operator)
+        && get "role" null operatorApproval == "operator"
+        && lib.all (approval: get "role" null approval == "parent") parentApprovals
+        && lib.all (approval: get "role" null approval == "peer") peerApprovals;
       generationOK =
         newGeneration.identity == identity
         && newGeneration.generation == lostGeneration.generation + 1
@@ -192,7 +224,10 @@ let
         && length operatorApprovals > 0
         && validApprovals operatorApprovals
         && lib.all signedApprovalMetadataOK allApprovals
+        && lib.all trustedApproverOK allApprovals
+        && signatureVerified
         && subjectOK
+        && roleOK
         && validApprovals allApprovals
         && (parentApprovals == [ ] || thresholdMet threshold parentApprovals)
         && (peerApprovals == [ ] || thresholdMet threshold peerApprovals);
@@ -207,6 +242,8 @@ let
         operatorApproval
         parentApprovals
         peerApprovals
+        trustedApprovers
+        signatureVerifier
         threshold
         reason
         provenance
