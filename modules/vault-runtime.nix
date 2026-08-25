@@ -11,6 +11,22 @@ let
     types
     ;
   cfg = config.cluster.vault.runtime;
+  upstreamSecret =
+    name: binding:
+    let
+      requirement = requirements.${binding.requirement};
+    in
+    {
+      serviceConfig.LoadCredential = [ "${requirements.${binding.requirement}.credentialName}:/run/systemd-vaultd/sock" ];
+      vault = {
+        changeAction = "restart";
+        template = ''{{ with secret "${requirement.path}" }}{{ .Data.data | toJSON }}{{ end }}'';
+        secrets.${requirements.${binding.requirement}.credentialName} = {
+          path = requirement.path;
+          field = requirement.field;
+        };
+      };
+    };
 
   isUnsafeString =
     value:
@@ -93,16 +109,21 @@ let
     let
       fetcher = "arbor-vault-runtime-${name}-init";
     in
-    lib.nameValuePair binding.service {
-      after = [ "${fetcher}.service" ];
-      wants = [ "${fetcher}.service" ];
-      requires = [ "${fetcher}.service" ];
-      serviceConfig = {
-        LoadCredential = [ "${bindingCredential name binding}:${credentialSource name}" ];
-        Restart = "on-failure";
-        RestartSec = "5s";
-      };
-    }
+    lib.nameValuePair binding.service (
+      if cfg.useUpstreamVaultd then
+        upstreamSecret name binding
+      else
+        {
+          after = [ "${fetcher}.service" ];
+          wants = [ "${fetcher}.service" ];
+          requires = [ "${fetcher}.service" ];
+          serviceConfig = {
+            LoadCredential = [ "${bindingCredential name binding}:${credentialSource name}" ];
+            Restart = "on-failure";
+            RestartSec = "5s";
+          };
+        }
+    )
   ) cfg.bindings;
   initServices = lib.mapAttrs' (
     name: binding:
@@ -162,6 +183,12 @@ in
 
   options.cluster.vault.runtime = {
     enable = mkEnableOption "the runtime-only OpenBao/systemd-vaultd boundary";
+
+    useUpstreamVaultd = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Project requirements onto the upstream systemd-vaultd/vault-agent NixOS modules.";
+    };
 
     nodeIdentityPath = mkOption {
       type = types.str;
@@ -359,12 +386,13 @@ in
                 && !isUnsafeString provider.tokenFile
               )
             )
-            && lib.all (value: !isUnsafeString value) (lib.tail commandArgs)
+            && lib.all (value: !isUnsafeString value) (lib.drop 1 commandArgs)
           ) (lib.attrNames cfg.providers);
         message = "cluster.vault.runtime contains a Nix store path or secret value";
       }
     ];
 
-    systemd.services = services // initServices // fetcherServices;
+    systemd.services =
+      if cfg.useUpstreamVaultd then services else services // initServices // fetcherServices;
   };
 }

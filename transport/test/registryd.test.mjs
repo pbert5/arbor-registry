@@ -175,7 +175,7 @@ test('concurrent appends retain one ordered cursor per event', async () => {
     const values = [{ id: 1 }, { id: 2 }, { id: 3 }]
     const results = await Promise.all(values.map(event => daemon.append('registry', event)))
     assert.equal(new Set(results.map(result => result.hash)).size, 3)
-    assert.deepEqual(results.map(result => result.cursor).sort(), ['v1:0', 'v1:1', 'v1:2'])
+    assert.deepEqual(results.map(result => result.cursor).sort(), ['v2:hash-0', 'v2:hash-1', 'v2:hash-2'])
     assert.deepEqual((await daemon.list('registry', 'v1:0', 10)).records.map(record => record.sequence), [0, 1, 2])
   } finally { await fs.rm(root, { recursive: true, force: true }) }
 })
@@ -192,7 +192,7 @@ test('append cursor is inclusive and stale lock leases are recovered', async () 
   await fs.writeFile(path.join(root, 'transport-index.lock', 'owner.json'), JSON.stringify({ owner: 'dead-host', pid: 999999, acquiredAt: 0 }))
   try {
     const appended = await daemon.append('registry', { id: 1 })
-    assert.equal(appended.cursor, 'v1:0')
+    assert.equal(appended.cursor, 'v2:hash-0')
     assert.deepEqual((await daemon.list('registry', appended.cursor, 10)).records.map(record => record.event), [{ id: 1 }])
   } finally { await fs.rm(root, { recursive: true, force: true }) }
 })

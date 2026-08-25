@@ -1,10 +1,14 @@
 {
   description = "Arbor Registry: pure signed-record reconciliation and graph library";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    systemd-vaultd.url = "github:numtide/systemd-vaultd";
+    systemd-vaultd.inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, systemd-vaultd, ... }:
     let
       systems = [
         "x86_64-linux"
@@ -33,6 +37,14 @@
       nixosModules = {
         default = nixosModule;
         vault-runtime = vaultRuntimeModule;
+        vault-runtime-upstream = {
+          imports = [
+            systemd-vaultd.nixosModules.systemdVaultd
+            systemd-vaultd.nixosModules.vaultAgent
+            vaultRuntimeModule
+          ];
+          cluster.vault.runtime.useUpstreamVaultd = true;
+        };
       };
       formatter = forAllSystems (system: (import nixpkgs { inherit system; }).nixfmt-tree);
       checks = forAllSystems (system: {
@@ -82,6 +94,11 @@
         vault-runtime-contract = import ./tests/vault-runtime-contract.nix {
           module = vaultRuntimeModule;
           pkgs = import nixpkgs { inherit system; };
+        };
+        vault-upstream = import ./tests/vault-upstream.nix {
+          module = vaultRuntimeModule;
+          pkgs = import nixpkgs { inherit system; };
+          upstreamModules = [ ];
         };
         openbao-runtime =
           let

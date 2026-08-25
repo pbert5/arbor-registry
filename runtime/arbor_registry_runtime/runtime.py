@@ -5,12 +5,14 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import sqlite3
 import fcntl
 import socket
+import stat
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -26,6 +28,41 @@ SCHEMAS = frozenset({
     "enrollment", "revocation", "recovery-authorization", "receipt",
 })
 ProviderCursor: TypeAlias = int | str
+_SECRET_KEY = re.compile(r"(?:secret|password|passphrase|token|credential|private|signingkey|apikey|accesskey|seed)", re.IGNORECASE)
+
+
+def _unsafe_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return (
+            value.startswith(("/nix/store/", "/run/secrets/", "-----BEGIN"))
+            or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/?#\s]+:[^/?#\s]+@", value) is not None
+            or re.match(r"^Bearer\s+\S+$", value, re.IGNORECASE) is not None
+        )
+    if isinstance(value, dict):
+        return any(_SECRET_KEY.search(str(key)) is not None or _unsafe_value(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_unsafe_value(item) for item in value)
+    return False
+
+
+def _secure_directory(path: Path) -> None:
+    path = Path(path)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+        raise ValueError(f"runtime directory is not private: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError(f"runtime directory has unexpected owner: {path}")
+
+
+def _secure_file(path: Path) -> None:
+    if not path.exists():
+        return
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+        raise ValueError(f"runtime file is not private: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError(f"runtime file has unexpected owner: {path}")
 
 
 def canonical_json(value: Any) -> bytes:
@@ -357,7 +394,8 @@ class FileProvider(Provider):
 
     def __init__(self, raw_path: Path):
         self.raw_path = Path(raw_path)
-        self.raw_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _secure_directory(self.raw_path.parent)
+        _secure_file(self.raw_path)
 
     def append(self, record: dict[str, Any]) -> int:
         lock_path = self.raw_path.with_name(self.raw_path.name + ".lock")
@@ -431,7 +469,10 @@ class OrbitDBProvider(Provider):
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(self.timeout)
             connection.connect(str(self.socket_path))
-            connection.sendall(payload)
+            try:
+                connection.sendall(payload)
+            except OSError as error:
+                raise ValueError("OrbitDB provider connection failed") from error
             response = bytearray()
             while not response.endswith(b"\n"):
                 remaining = deadline - time.monotonic()
@@ -508,13 +549,35 @@ class OrbitDBProvider(Provider):
 class Runtime:
     """Ingest envelopes, retain quarantine, and rebuild a deterministic projection."""
 
-    def __init__(self, state_dir: Path, provider: Provider, public_keys: dict[str, str], max_bytes: int = 131072):
+    def __init__(
+        self,
+        state_dir: Path,
+        provider: Provider,
+        public_keys: dict[str, str],
+        max_bytes: int = 131072,
+        *,
+        authority_issuers: set[str] | None = None,
+        approver_roles: dict[str, set[str]] | None = None,
+        recovery_thresholds: dict[str, int] | None = None,
+    ):
         self.state_dir = Path(state_dir)
-        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _secure_directory(self.state_dir)
         self.provider = provider
         self.public_keys = dict(public_keys)
+        self.authority_issuers = set(authority_issuers) if authority_issuers is not None else (
+            {"root"} if "root" in self.public_keys else set(self.public_keys)
+        )
+        self.approver_roles = approver_roles or {"operator": set(self.authority_issuers), "parent": set(), "peer": set()}
+        self.recovery_thresholds = recovery_thresholds or {"operator": 1, "parent": 0, "peer": 0}
+        if not self.authority_issuers.issubset(self.public_keys):
+            raise ValueError("authority issuers must have configured public keys")
         self.max_bytes = max_bytes
-        self.db = sqlite3.connect(self.state_dir / "registry.sqlite3", timeout=30)
+        self.max_quarantine_records = 10000
+        database_path = self.state_dir / "registry.sqlite3"
+        self.db = sqlite3.connect(database_path, timeout=30)
+        if database_path.exists():
+            os.chmod(database_path, 0o600)
+        _secure_file(self.state_dir / "registry.sqlite3")
         self.db.execute("PRAGMA busy_timeout = 30000")
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS records (
@@ -531,6 +594,8 @@ class Runtime:
         self.db.close()
 
     def _validate(self, record: dict[str, Any]) -> tuple[str, str | None]:
+        if isinstance(record, dict) and record.get("quarantined") is True and record.get("reason") == "unsafe-value":
+            return "quarantined", "unsafe-value"
         required = ("protocolEpoch", "wireVersion", "schemaVersion", "recordId", "recordVersion",
                     "generation", "predecessor", "schema", "payload", "issuer", "signature")
         if not isinstance(record, dict) or any(name not in record for name in required):
@@ -563,19 +628,7 @@ class Runtime:
             return "quarantined", "malformed-record"
         if len(encoded) > self.max_bytes:
             return "quarantined", "framing-limit"
-        def unsafe(value: Any) -> bool:
-            if isinstance(value, str):
-                return (
-                    value.startswith(("/nix/store/", "/run/secrets/", "-----BEGIN"))
-                    or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/?#\s]+:[^/?#\s]+@", value) is not None
-                    or re.match(r"^Bearer\s+\S+$", value, re.IGNORECASE) is not None
-                )
-            if isinstance(value, dict):
-                return any(unsafe(key) or unsafe(item) for key, item in value.items())
-            if isinstance(value, list):
-                return any(unsafe(item) for item in value)
-            return False
-        if unsafe(_without_signature(record)):
+        if _unsafe_value(_without_signature(record)):
             return "quarantined", "unsafe-value"
         try:
             verify = VerifyKey(_unb64(self.public_keys[record["issuer"]]))
@@ -583,6 +636,15 @@ class Runtime:
         except (KeyError, ValueError, TypeError, binascii.Error, BadSignatureError):
             return "quarantined", "invalid-signature"
         payload = record["payload"]
+        sensitive_schemas = {
+            "node-identity", "identity-generation", "enrollment", "revocation",
+            "recovery-authorization", "receipt", "relationship", "capability",
+        }
+        if record["schema"] in sensitive_schemas and record["issuer"] not in self.authority_issuers:
+            return "quarantined", "unauthorized-authority"
+        authority_root = payload.get("authorityRoot")
+        if authority_root is not None and authority_root not in self.authority_issuers:
+            return "quarantined", "unauthorized-authority-root"
         if record["schema"] == "enrollment":
             if (not isinstance(payload.get("identity"), str) or not isinstance(payload.get("publicKey"), str)
                     or not isinstance(payload.get("requestDigest"), str)
@@ -616,6 +678,8 @@ class Runtime:
                 or not isinstance(approvals, list) or not approvals
                 or not isinstance(payload.get("provenance", []), list)):
             return "malformed-recovery-authorization"
+        seen: set[tuple[str, str]] = set()
+        counts = {role: 0 for role in ("operator", "parent", "peer")}
         for approval in approvals:
             if not isinstance(approval, dict) or any(key not in approval for key in (
                     "approver", "role", "subject", "generation", "operation", "approverGeneration", "decision", "signature")):
@@ -629,12 +693,23 @@ class Runtime:
                     or approval["approverGeneration"] < 1
                     or approval.get("approver") != approval.get("issuer")):
                 return "unbound-recovery-approval"
+            approver = approval["approver"]
+            role = approval["role"]
+            if approver not in self.approver_roles.get(role, set()):
+                return "untrusted-recovery-approver"
+            identity_key = (approver, role)
+            if identity_key in seen:
+                return "duplicate-recovery-approver"
+            seen.add(identity_key)
+            counts[role] += 1
             try:
                 key = VerifyKey(_unb64(self.public_keys[approval["approver"]]))
                 unsigned = {key: value for key, value in approval.items() if key not in {"signature", "issuer"}}
                 key.verify(canonical_json(unsigned), _unb64(approval["signature"]))
             except (KeyError, ValueError, TypeError, binascii.Error, BadSignatureError):
                 return "invalid-recovery-approval-signature"
+        if any(counts[role] < threshold for role, threshold in self.recovery_thresholds.items()):
+            return "recovery-quorum-not-met"
         return None
 
     def ingest(self, records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -648,10 +723,18 @@ class Runtime:
                 except (TypeError, ValueError):
                     record_key = "malformed:unserializable"
             status, reason = self._validate(record)
-            try:
-                envelope = canonical_json(record).decode()
-            except (TypeError, ValueError):
-                envelope = json.dumps({"malformed": repr(record)}, sort_keys=True)
+            unsafe = _unsafe_value(_without_signature(record)) if isinstance(record, dict) else False
+            if unsafe:
+                envelope = json.dumps({
+                    "quarantined": True, "reason": "unsafe-value",
+                    "recordId": record.get("recordId") if isinstance(record, dict) else None,
+                    "recordVersion": record.get("recordVersion") if isinstance(record, dict) else None,
+                }, sort_keys=True)
+            else:
+                try:
+                    envelope = canonical_json(record).decode()
+                except (TypeError, ValueError):
+                    envelope = json.dumps({"malformed": "unserializable-record"}, sort_keys=True)
             exact = self.db.execute("SELECT record_key, status FROM records WHERE envelope = ?", (envelope,)).fetchone()
             existing = self.db.execute("SELECT envelope, status FROM records WHERE record_key = ?", (record_key,)).fetchone()
             if exact:
@@ -660,11 +743,13 @@ class Runtime:
             else:
                 if existing:
                     record_key = f"{record_key}#conflict:{hashlib.sha256(envelope.encode()).hexdigest()}"
-                self.provider.append(record)
+                if not unsafe:
+                    self.provider.append(record)
                 self.db.execute("INSERT INTO records VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (record_key, record.get("recordId"), record.get("generation"), record.get("predecessor"),
                      status, reason, envelope))
             outcomes.append({"recordKey": record_key, "status": status, "reason": reason})
+        self.db.execute("DELETE FROM records WHERE status = 'quarantined' AND rowid NOT IN (SELECT rowid FROM records WHERE status = 'quarantined' ORDER BY rowid DESC LIMIT ?)", (self.max_quarantine_records,))
         self.db.commit()
         self._reconcile()
         self._materialize()
@@ -714,22 +799,24 @@ class Runtime:
             and isinstance(record["payload"].get("identity"), str)
             and isinstance(record["payload"].get("newGeneration"), int)
         }
-        active_generations = {
-            record["payload"]["identity"]: max(record["payload"]["generation"] for _, _, record in candidates
-                if record["schema"] == "identity-generation"
-                and isinstance(record.get("payload"), dict)
-                and isinstance(record["payload"].get("identity"), str)
-                and isinstance(record["payload"].get("generation"), int)
-                and record["payload"].get("status", "active") == "active")
-            for identity in {record["payload"].get("identity") for _, _, record in candidates
-                if record["schema"] == "identity-generation" and isinstance(record.get("payload"), dict)
-                and isinstance(record["payload"].get("identity"), str)}
-            for record in [next(record for _, _, record in candidates
-                if record["schema"] == "identity-generation"
-                and record["payload"].get("identity") == identity
-                and record["payload"].get("generation") == max(item["payload"]["generation"] for _, _, item in candidates
-                    if item["schema"] == "identity-generation" and item.get("payload", {}).get("identity") == identity))]
-        }
+        active_generations: dict[str, int] = {}
+        for _, _, record in candidates:
+            payload = record.get("payload", {})
+            if (record["schema"] == "identity-generation" and isinstance(payload, dict)
+                    and isinstance(payload.get("identity"), str)
+                    and isinstance(payload.get("generation"), int)
+                    and payload.get("status", "active") == "active"):
+                identity = payload["identity"]
+                active_generations[identity] = max(active_generations.get(identity, 0), payload["generation"])
+        for rowid, _, record in candidates:
+            if record["schema"] != "recovery-authorization" or reasons[rowid] is not None:
+                continue
+            for approval in record.get("payload", {}).get("approvals", []):
+                approver = approval.get("approver") if isinstance(approval, dict) else None
+                generation = approval.get("approverGeneration") if isinstance(approval, dict) else None
+                if approver not in self.authority_issuers and active_generations.get(approver) != generation:
+                    reasons[rowid] = "stale-approver-generation"
+                    break
         for rowid, _, record in candidates:
             payload = record.get("payload", {})
             identity = payload.get("identity") if isinstance(payload, dict) else None

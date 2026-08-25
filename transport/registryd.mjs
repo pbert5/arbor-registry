@@ -163,13 +163,13 @@ export class TransportDaemon {
         await this.refreshIndex(stream)
         const key = digest(event); const entries = this.index.streams[stream] ??= []
         const existing = entries.find(item => item.key === key)
-        if (existing) return { hash: existing.hash, cursor: `v1:${entries.indexOf(existing)}`, duplicate: true }
+        if (existing) return { hash: existing.hash, cursor: `v2:${existing.hash}`, duplicate: true }
         const hash = String(await (await this.open(stream)).add(event))
         await this.refreshIndex(stream)
         const refreshed = this.index.streams[stream] ??= []
         let position = refreshed.findIndex(item => item.hash === hash)
         if (position < 0) { refreshed.push({ key, hash, order: `1:${hash}` }); position = refreshed.length - 1 }
-        const cursor = `v1:${position}`
+        const cursor = `v2:${hash}`
         await assertOwned(); await this.saveIndex(assertOwned)
         return { hash, cursor, duplicate: false }
       })
@@ -178,18 +178,32 @@ export class TransportDaemon {
     return operation
   }
 
-  async list(stream, cursor = 'v1:0', limit = 100) {
+  async list(stream, cursor = 'v2:begin', limit = 100) {
     if (!this.streams.includes(stream) || !Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new Error('invalid list request')
     return this.withIndexLock(async assertOwned => {
       await this.reloadIndex(); await this.refreshIndex(stream); await assertOwned(); await this.saveIndex(assertOwned)
       const entries = validateIndex(this.index, this.streams).streams[stream] ?? []
       let start
-      const match = typeof cursor === 'string' && /^v1:(0|[1-9][0-9]*)$/.exec(cursor)
-      if (match) start = Number(match[1])
-      else if (typeof cursor === 'string') {
+      const v2 = typeof cursor === 'string' && /^v2:(begin|[A-Za-z0-9._:-]{1,1024})$/.exec(cursor)
+      const v2After = typeof cursor === 'string' && /^v2-after:([A-Za-z0-9._:-]{1,1024})$/.exec(cursor)
+      const legacy = typeof cursor === 'string' && /^v1:(0|[1-9][0-9]*)$/.exec(cursor)
+      if (v2After) {
+        const position = entries.findIndex(item => item.hash === v2After[1])
+        if (position < 0) throw new Error('invalid cursor')
+        start = position + 1
+      } else if (v2) {
+        if (v2[1] === 'begin') start = 0
+        else {
+          const position = entries.findIndex(item => item.hash === v2[1])
+          if (position < 0) throw new Error('invalid cursor')
+          start = position
+        }
+      } else if (legacy) {
+        start = Number(legacy[1])
+      } else if (typeof cursor === 'string') {
         const position = entries.findIndex(item => item.hash === cursor)
         if (position < 0) throw new Error('invalid cursor')
-        start = position
+        start = position + 1
       } else throw new Error('invalid cursor')
       if (!Number.isSafeInteger(start) || start > Number.MAX_SAFE_INTEGER - limit) throw new Error('invalid cursor')
       const selected = entries.slice(start, start + limit); const db = await this.open(stream)
@@ -198,7 +212,7 @@ export class TransportDaemon {
       for (const [sequence, item] of selected.entries()) {
         try { records.push({ hash: item.hash, event: await db.get(item.hash), sequence: start + sequence }); processed = sequence + 1 } catch { break }
       }
-      const nextCursor = `v1:${start + processed}`
+      const nextCursor = processed > 0 ? `v2-after:${records[records.length - 1].hash}` : cursor
       return { records, nextCursor, hasMore: start + processed < entries.length }
     })
   }
@@ -356,7 +370,7 @@ export class TransportDaemon {
       if (request.operation === 'health') return reply(true, { status: 'ok' })
       if (request.operation === 'status') return reply(true, { peerId: this.libp2p.peerId.toString(), databaseAddresses: this.addresses })
       if (request.operation === 'append') return reply(true, await this.append(request.stream, request.event))
-      if (request.operation === 'list') return reply(true, await this.list(request.stream, request.cursor ?? 'v1:0', request.limit ?? 100))
+      if (request.operation === 'list') return reply(true, await this.list(request.stream, request.cursor ?? 'v2:begin', request.limit ?? 100))
       return reply(false, { code: 'unsupported_operation' })
     } catch { return reply(false, { code: 'invalid_request' }) }
   }

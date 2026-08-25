@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -42,6 +43,14 @@ def _validate_address(address: str) -> str:
         raise ValueError("OpenBao address is invalid") from error
     if parsed.scheme not in {"http", "https"} or not hostname or parsed.username or parsed.password:
         raise ValueError("OpenBao address must be an http(s) URL without embedded credentials")
+    if parsed.scheme == "http":
+        local_names = {"localhost", "127.0.0.1", "::1"}
+        try:
+            local = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            local = hostname.lower() in local_names
+        if not local:
+            raise ValueError("unencrypted OpenBao HTTP is permitted only on loopback")
     if parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
         raise ValueError("OpenBao address must not contain a path, query, or fragment")
     return address.rstrip("/")
