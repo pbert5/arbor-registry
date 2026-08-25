@@ -5,10 +5,11 @@
 }:
 pkgs.testers.nixosTest {
   name = "arbor-registry-vault-upstream";
-  nodes.machine = {
-    config,
-    ...
-  }:
+  nodes.machine =
+    {
+      config,
+      ...
+    }:
     {
       imports = upstreamModules ++ [ module ];
       system.stateVersion = "25.05";
@@ -30,8 +31,14 @@ pkgs.testers.nixosTest {
 
       systemd.services.api = {
         wantedBy = [ "multi-user.target" ];
-        after = [ "seed-vaultd-secret.service" "systemd-vaultd.service" ];
-        requires = [ "seed-vaultd-secret.service" "systemd-vaultd.socket" ];
+        after = [
+          "seed-vaultd-secret.service"
+          "systemd-vaultd.service"
+        ];
+        requires = [
+          "seed-vaultd-secret.service"
+          "systemd-vaultd.socket"
+        ];
         script = ''
           cat "$CREDENTIALS_DIRECTORY/db-url" > /run/api-credential
         '';

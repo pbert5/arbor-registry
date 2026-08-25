@@ -314,6 +314,53 @@ let
     raw = [ (peer // { signature = "invalid"; }) ];
     signers.root = signer;
   };
+  authorityChain = registry.reconcile {
+    raw = [
+      (relationship "authority-root-child" "root" "child" "parent" "active")
+      (registry.makeEnvelope childSigner {
+        recordId = "relationship:child-grandchild";
+        generation = 1;
+        issuer = "child";
+        subject = "grandchild";
+        schema = "relationship";
+        payload = {
+          relationshipId = "authority-child-grandchild";
+          from = "child";
+          to = "grandchild";
+          kind = "parent";
+          status = "active";
+          scope = [ "observe" ];
+          autonomy = "dependent";
+          authorityRoot = "root";
+        };
+      })
+      (registry.makeEnvelope childSigner {
+        recordId = "relationship:child-forged-root";
+        generation = 1;
+        issuer = "child";
+        subject = "forged";
+        schema = "relationship";
+        payload = {
+          relationshipId = "authority-child-forged-root";
+          from = "root";
+          to = "forged";
+          kind = "parent";
+          status = "active";
+          scope = [ "observe" ];
+          autonomy = "dependent";
+          authorityRoot = "root";
+        };
+      })
+    ];
+    signers = {
+      root = signer;
+      child = childSigner;
+    };
+    authorizedIssuers = [
+      "root"
+      "child"
+    ];
+  };
   transport = registry.makeTransport [
     (identity "b")
     (identity "a")
@@ -558,6 +605,15 @@ assert length (registry.validateGraph { relationships = multipleParents; }).mult
 assert compatibility.quarantine.code == "unsupported-required-feature";
 assert !capability.valid;
 assert signedAuthorityChecked.accepted == [ signedCapabilityRoot ];
+assert
+  (map (entry: entry.recordId) authorityChain.accepted) == [
+    "relationship:authority-root-child"
+    "relationship:child-grandchild"
+  ];
+assert
+  (builtins.elemAt (builtins.filter (
+    entry: entry.recordId == "relationship:child-forged-root"
+  ) authorityChain.quarantined) 0).quarantine.code == "unauthorized-relationship";
 assert
   (map (entry: entry.quarantine.code) signedAuthorityChecked.quarantined) == [
     "unauthorized-capability"

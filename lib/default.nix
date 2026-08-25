@@ -601,6 +601,13 @@ let
         && isString (get "from" null record.payload)
         && isString (get "to" null record.payload)
         && (record.schema == "peer-relationship" || isString (get "kind" null record.payload));
+      relationshipIssuerOK =
+        record:
+        let
+          root = rootOf record;
+          from = get "from" null record.payload;
+        in
+        record.issuer == root || record.issuer == from;
       capabilityPayloadOK =
         record:
         isAttrs record.payload
@@ -613,14 +620,19 @@ let
         accepted: record: root:
         let
           edges = relationshipRecords accepted;
-          children = node: map (edge: edge.to) (filter (
-            edge:
-            edgeActive edge
-            && edgeKind edge == "parent"
-            && edge.from == node
-            && get "authorityRoot" root edge == root
-          ) edges);
-          walk = seen: frontier:
+          children =
+            node:
+            map (edge: edge.to) (
+              filter (
+                edge:
+                edgeActive edge
+                && edgeKind edge == "parent"
+                && edge.from == node
+                && get "authorityRoot" root edge == root
+              ) edges
+            );
+          walk =
+            seen: frontier:
             if elem record.issuer frontier then
               true
             else if frontier == [ ] then
@@ -650,6 +662,7 @@ let
             root = rootOf record;
           in
           relationshipPayloadOK record
+          && relationshipIssuerOK record
           && isString record.issuer
           && isString root
           && (authorizedIssuers == null || elem root authorizedIssuers)

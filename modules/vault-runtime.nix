@@ -17,7 +17,9 @@ let
       requirement = requirements.${binding.requirement};
     in
     {
-      serviceConfig.LoadCredential = [ "${requirements.${binding.requirement}.credentialName}:/run/systemd-vaultd/sock" ];
+      serviceConfig.LoadCredential = [
+        "${requirements.${binding.requirement}.credentialName}:/run/systemd-vaultd/sock"
+      ];
       vault = {
         changeAction = "restart";
         template = ''{{ with secret "${requirement.path}" }}{{ index .Data.data "${requirement.field}" }}{{ end }}'';
@@ -322,7 +324,9 @@ in
         message = "cluster.vault.runtime requires runtimePackage or runtimeCommand";
       }
       {
-        assertion = cfg.runtimeCommand == null || (lib.hasPrefix "/" cfg.runtimeCommand && !isUnsafeString cfg.runtimeCommand);
+        assertion =
+          cfg.runtimeCommand == null
+          || (lib.hasPrefix "/" cfg.runtimeCommand && !isUnsafeString cfg.runtimeCommand);
         message = "cluster.vault.runtime.runtimeCommand must be an absolute non-secret runtime path";
       }
       {
