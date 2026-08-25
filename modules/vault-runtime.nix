@@ -20,6 +20,8 @@ let
       serviceConfig.LoadCredential = [
         "${requirements.${binding.requirement}.credentialName}:/run/systemd-vaultd/sock"
       ];
+    }
+    // lib.optionalAttrs (!cfg.useProviderBridge) {
       vault = {
         changeAction = "restart";
         template = ''{{ with secret "${requirement.path}" }}{{ index .Data.data "${requirement.field}" }}{{ end }}'';
@@ -64,6 +66,30 @@ let
       "${cfg.runtimePackage}/bin/arbor-openbao-provider"
     else
       cfg.runtimeCommand;
+  bridgeExecutable =
+    if cfg.runtimePackage != null then
+      "${cfg.runtimePackage}/bin/arbor-systemd-vaultd-bridge"
+    else
+      cfg.bridgeCommand;
+  bridgeArgs =
+    service: bindingList: restart:
+    [
+      bridgeExecutable
+      "--service"
+      service
+    ]
+    ++ lib.concatMap (binding: [
+      "--credential"
+      "${bindingCredential binding.name binding}:${credentialSource binding.name}"
+    ]) bindingList
+    ++ lib.optional (restart != null) "--restart"
+    ++ lib.optional (restart != null) restart;
+  serviceNames = lib.unique (map (binding: binding.service) (lib.attrValues cfg.bindings));
+  serviceBindings =
+    service:
+    lib.filter (binding: binding.service == service) (
+      lib.mapAttrsToList (name: binding: binding // { inherit name; }) cfg.bindings
+    );
   providerArgs =
     provider: requirement: bindingName: service: watch:
     [
@@ -98,32 +124,56 @@ let
       "--watch"
       "--interval"
       (toString cfg.refreshInterval)
+    ]
+    ++ lib.optionals (watch && !cfg.useProviderBridge) [
       "--restart-command"
       "/run/current-system/sw/bin/systemctl"
       "try-restart"
       service
     ];
-  services = lib.mapAttrs' (
-    name: binding:
-    let
-      fetcher = "arbor-vault-runtime-${name}-init";
-    in
-    lib.nameValuePair binding.service (
-      if cfg.useUpstreamVaultd then
-        upstreamSecret name binding
-      else
-        {
-          after = [ "${fetcher}.service" ];
-          wants = [ "${fetcher}.service" ];
-          requires = [ "${fetcher}.service" ];
-          serviceConfig = {
-            LoadCredential = [ "${bindingCredential name binding}:${credentialSource name}" ];
-            Restart = "on-failure";
-            RestartSec = "5s";
-          };
-        }
-    )
-  ) cfg.bindings;
+  services = lib.listToAttrs (
+    map (
+      service:
+      let
+        bindings = serviceBindings service;
+        initDependencies = map (binding: "arbor-vault-runtime-${binding.name}-init.service") bindings;
+        credentials = map (
+          binding: "${bindingCredential binding.name binding}:${credentialSource binding.name}"
+        ) bindings;
+        common = {
+          serviceConfig.LoadCredential =
+            if cfg.useUpstreamVaultd then
+              map (binding: "${bindingCredential binding.name binding}:/run/systemd-vaultd/sock") bindings
+            else
+              credentials;
+        };
+        upstream = upstreamSecret (builtins.head bindings).name (builtins.head bindings);
+      in
+      {
+        name = service;
+        value =
+          if cfg.useUpstreamVaultd then
+            (lib.optionalAttrs (!cfg.useProviderBridge) upstream)
+            // common
+            // lib.optionalAttrs cfg.useProviderBridge {
+              after = [ "arbor-vault-runtime-${service}-bridge.service" ];
+              wants = [ "arbor-vault-runtime-${service}-bridge.service" ];
+              requires = [ "arbor-vault-runtime-${service}-bridge.service" ];
+            }
+          else
+            common
+            // {
+              after = initDependencies;
+              wants = initDependencies;
+              requires = initDependencies;
+              serviceConfig = common.serviceConfig // {
+                Restart = "on-failure";
+                RestartSec = "5s";
+              };
+            };
+      }
+    ) serviceNames
+  );
   initServices = lib.mapAttrs' (
     name: binding:
     let
@@ -164,7 +214,13 @@ let
       requires = [ "${fetcher}-init.service" ];
       serviceConfig = {
         Type = "simple";
-        ExecStart = lib.escapeShellArgs (providerArgs provider requirement name binding.service true);
+        ExecStart = lib.escapeShellArgs (
+          providerArgs provider requirement name binding.service true
+          ++ lib.optionals cfg.useProviderBridge [ "--restart-command" ]
+          ++ lib.optionals cfg.useProviderBridge (
+            bridgeArgs binding.service (serviceBindings binding.service) binding.service
+          )
+        );
         Restart = "on-failure";
         RestartSec = "5s";
         RuntimeDirectory = "arbor-vaultd";
@@ -172,6 +228,31 @@ let
       };
     }
   ) cfg.bindings;
+  bridgeServices = lib.listToAttrs (
+    map (
+      service:
+      let
+        bindings = serviceBindings service;
+        initDependencies = map (binding: "arbor-vault-runtime-${binding.name}-init.service") bindings;
+      in
+      {
+        name = "arbor-vault-runtime-${service}-bridge";
+        value = {
+          description = "Materialize provider credentials for systemd-vaultd (${service})";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "systemd-vaultd.service" ] ++ initDependencies;
+          wants = [ "systemd-vaultd.service" ];
+          requires = initDependencies;
+          before = [ "${service}.service" ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = lib.escapeShellArgs (bridgeArgs service bindings null);
+          };
+        };
+      }
+    ) serviceNames
+  );
 in
 {
   # The explicit upstream interface is a module defining
@@ -187,6 +268,12 @@ in
       type = types.bool;
       default = false;
       description = "Project requirements onto the upstream systemd-vaultd/vault-agent NixOS modules.";
+    };
+
+    useProviderBridge = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Feed runtime provider files into the upstream systemd-vaultd JSON directory.";
     };
 
     nodeIdentityPath = mkOption {
@@ -288,6 +375,12 @@ in
       description = "Absolute runtime path to arbor-openbao-provider when runtimePackage is not supplied.";
     };
 
+    bridgeCommand = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Absolute runtime path to arbor-systemd-vaultd-bridge when runtimePackage is not supplied.";
+    };
+
     runtimePackage = mkOption {
       type = types.nullOr types.package;
       default = null;
@@ -322,6 +415,14 @@ in
       {
         assertion = runtimeExecutable != null;
         message = "cluster.vault.runtime requires runtimePackage or runtimeCommand";
+      }
+      {
+        assertion = !cfg.useProviderBridge || cfg.useUpstreamVaultd;
+        message = "cluster.vault.runtime.useProviderBridge requires useUpstreamVaultd";
+      }
+      {
+        assertion = !cfg.useProviderBridge || bridgeExecutable != null;
+        message = "cluster.vault.runtime.useProviderBridge requires runtimePackage or bridgeCommand";
       }
       {
         assertion =
@@ -374,6 +475,7 @@ in
               "providers"
               "runtimePackage"
               "runtimeCommand"
+              "bridgeCommand"
             ]
           )
           && lib.all (
@@ -395,9 +497,19 @@ in
           ) (lib.attrNames cfg.providers);
         message = "cluster.vault.runtime contains a Nix store path or secret value";
       }
+      {
+        assertion =
+          cfg.bridgeCommand == null
+          || (lib.hasPrefix "/" cfg.bridgeCommand && !isUnsafeString cfg.bridgeCommand);
+        message = "cluster.vault.runtime.bridgeCommand must be an absolute non-secret runtime path";
+      }
     ];
 
     systemd.services =
-      if cfg.useUpstreamVaultd then services else services // initServices // fetcherServices;
+      if cfg.useUpstreamVaultd then
+        services
+        // lib.optionalAttrs cfg.useProviderBridge (initServices // fetcherServices // bridgeServices)
+      else
+        services // initServices // fetcherServices;
   };
 }

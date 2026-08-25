@@ -10,3 +10,4 @@ requires-python = ">=3.11"
 
 [project.scripts]
 arbor-openbao-provider = "arbor_registry_runtime.openbao_provider:main"
+arbor-systemd-vaultd-bridge = "arbor_registry_runtime.vaultd_bridge:main"

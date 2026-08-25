@@ -244,7 +244,9 @@ def main() -> int:
     parser.add_argument("--provider-command", nargs="+")
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--interval", type=float, default=30.0)
-    parser.add_argument("--restart-command", nargs="+")
+    # This is deliberately the final option: the command may itself contain
+    # option-looking arguments (the provider-to-systemd-vaultd bridge does).
+    parser.add_argument("--restart-command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.timeout <= 0 or args.interval <= 0:
         parser.error("--timeout and --interval must be positive")
