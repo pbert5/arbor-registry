@@ -91,6 +91,38 @@ test('concurrent appends retain one ordered cursor per event', async () => {
     const values = [{ id: 1 }, { id: 2 }, { id: 3 }]
     const results = await Promise.all(values.map(event => daemon.append('registry', event)))
     assert.equal(new Set(results.map(result => result.hash)).size, 3)
+    assert.deepEqual(results.map(result => result.cursor).sort(), ['v1:0', 'v1:1', 'v1:2'])
     assert.deepEqual((await daemon.list('registry', 'v1:0', 10)).records.map(record => record.sequence), [0, 1, 2])
+  } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+test('append cursor is inclusive and stale lock leases are recovered', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-'))
+  const daemon = new TransportDaemon({ stateDir: root })
+  const events = new Map()
+  daemon.open = async () => ({
+    add: async event => { const hash = `hash-${events.size}`; events.set(hash, event); return hash },
+    get: async hash => events.get(hash)
+  })
+  await fs.mkdir(path.join(root, 'transport-index.lock'), { recursive: true })
+  await fs.writeFile(path.join(root, 'transport-index.lock', 'owner.json'), JSON.stringify({ owner: 'dead-host', pid: 999999, acquiredAt: 0 }))
+  try {
+    const appended = await daemon.append('registry', { id: 1 })
+    assert.equal(appended.cursor, 'v1:0')
+    assert.deepEqual((await daemon.list('registry', appended.cursor, 10)).records.map(record => record.event), [{ id: 1 }])
+  } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+test('malformed replicated entries are quarantined and skipped', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-'))
+  const daemon = new TransportDaemon({ stateDir: root })
+  daemon.open = async () => ({
+    iterator: async function * () { yield { hash: 42, value: {} }; yield { hash: 'good', value: { id: 1 } } },
+    get: async hash => ({ id: hash })
+  })
+  try {
+    await daemon.withIndexLock(async () => { await daemon.refreshIndex('registry') })
+    assert.deepEqual(daemon.index.streams.registry.map(item => item.hash), ['good'])
+    assert.match(await fs.readFile(path.join(root, 'transport-quarantine.jsonl'), 'utf8'), /malformed-replicated-entry/)
   } finally { await fs.rm(root, { recursive: true, force: true }) }
 })

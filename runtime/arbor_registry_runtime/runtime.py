@@ -7,6 +7,7 @@ import binascii
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import fcntl
 import socket
@@ -75,8 +76,9 @@ def generate_keypair(
     generations. Replacing the active ``<issuer>`` files requires the explicit
     ``rotation=True`` operation.
     """
-    if not isinstance(issuer, str) or not issuer:
-        raise ValueError("issuer must be a non-empty string")
+    if (not isinstance(issuer, str) or not issuer or issuer in {".", ".."}
+            or issuer != Path(issuer).name or "/" in issuer or "\\" in issuer or "\x00" in issuer):
+        raise ValueError("issuer must be a single safe path component")
     if generation is not None and (isinstance(generation, bool) or not isinstance(generation, int) or generation < 1):
         raise ValueError("generation must be a positive integer")
     key_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -219,9 +221,9 @@ class OrbitDBProvider(Provider):
 
     def append(self, record: dict[str, Any]) -> ProviderCursor:
         response = self._request({"operation": "append", "stream": self.stream, "event": self.encode(record)})
-        result = response.get("hash")
-        if not isinstance(result, str) or not result:
-            raise ValueError("OrbitDB provider append response has no hash")
+        result = response.get("cursor")
+        if not isinstance(result, str) or not re.fullmatch(r"v1:(0|[1-9][0-9]*)", result):
+            raise ValueError("OrbitDB provider append response has no valid cursor")
         return result
 
     def fetch(self, cursor: ProviderCursor = 0, limit: int = 100) -> list[tuple[ProviderCursor, dict[str, Any]]]:

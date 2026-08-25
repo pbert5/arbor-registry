@@ -17,9 +17,13 @@ import { tcp } from '@libp2p/tcp'
 import { multiaddr } from '@multiformats/multiaddr'
 import { LevelBlockstore } from 'blockstore-level'
 import { LevelDatastore } from 'datastore-level'
+import os from 'node:os'
 
 const MAX_LINE = 1024 * 1024
 const MAX_PAGE = 500
+const LOCK_LEASE_MS = 30_000
+const LOCK_RETRY_TIMEOUT_MS = 30_000
+const LOCK_RETRY_MS = 10
 const SOCKET_MODE = 0o660
 const canonical = value => JSON.stringify(value, (_, v) => v && typeof v === 'object' && !Array.isArray(v)
   ? Object.fromEntries(Object.keys(v).sort().map(k => [k, v[k]])) : v)
@@ -81,6 +85,7 @@ export class TransportDaemon {
     this.appendQueue = Promise.resolve()
     this.indexQueue = Promise.resolve()
     this.lockPath = path.join(this.stateDir, 'transport-index.lock')
+    this.quarantinePath = path.join(this.stateDir, 'transport-quarantine.jsonl')
   }
 
   async start() {
@@ -99,7 +104,9 @@ export class TransportDaemon {
     const ipfs = { libp2p: orbitdbLibp2p(this.libp2p), pins: helia.pins, blockstore: { put: (cid, value, options) => helia.blockstore.put(cid, value, options), async *get(cid, options) { yield await helia.blockstore.get(cid, options) } } }
     this.orbitdb = await createOrbitDB({ ipfs, id: peerId.toString(), directory: path.join(this.stateDir, 'orbitdb') })
     for (const stream of this.streams) await this.open(stream)
-    for (const stream of this.streams) await this.refreshIndex(stream)
+    for (const stream of this.streams) await this.withIndexLock(async () => {
+      await this.reloadIndex(); await this.refreshIndex(stream); await this.saveIndex()
+    })
   }
 
   async dialBootstrapPeers() {
@@ -123,10 +130,11 @@ export class TransportDaemon {
         await this.refreshIndex(stream)
         const key = digest(event); const entries = this.index.streams[stream] ??= []
         const existing = entries.find(item => item.key === key)
-        if (existing) return { hash: existing.hash, duplicate: true }
+        if (existing) return { hash: existing.hash, cursor: `v1:${entries.indexOf(existing)}`, duplicate: true }
         const hash = String(await (await this.open(stream)).add(event))
+        const cursor = `v1:${entries.length}`
         entries.push({ key, hash }); await this.saveIndex()
-        return { hash, duplicate: false }
+        return { hash, cursor, duplicate: false }
       })
     })
     this.appendQueue = operation.catch(() => {})
@@ -135,22 +143,26 @@ export class TransportDaemon {
 
   async list(stream, cursor = 'v1:0', limit = 100) {
     if (!this.streams.includes(stream) || !Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new Error('invalid list request')
-    await this.refreshIndex(stream)
-    const entries = validateIndex(this.index, this.streams).streams[stream] ?? []
-    let start
-    const match = typeof cursor === 'string' && /^v1:(0|[1-9][0-9]*)$/.exec(cursor)
-    if (match) start = Number(match[1])
-    else if (typeof cursor === 'string') {
-      const position = entries.findIndex(item => item.hash === cursor)
-      if (position < 0) throw new Error('invalid cursor')
-      start = position + 1
-    } else throw new Error('invalid cursor')
-    if (!Number.isSafeInteger(start) || start > Number.MAX_SAFE_INTEGER - limit) throw new Error('invalid cursor')
-    const selected = entries.slice(start, start + limit); const db = await this.open(stream)
-    const records = []
-    for (const [sequence, item] of selected.entries()) records.push({ hash: item.hash, event: await db.get(item.hash), sequence: start + sequence })
-    const nextCursor = `v1:${start + selected.length}`
-    return { records, nextCursor, hasMore: start + selected.length < entries.length }
+    return this.withIndexLock(async () => {
+      await this.reloadIndex(); await this.refreshIndex(stream); await this.saveIndex()
+      const entries = validateIndex(this.index, this.streams).streams[stream] ?? []
+      let start
+      const match = typeof cursor === 'string' && /^v1:(0|[1-9][0-9]*)$/.exec(cursor)
+      if (match) start = Number(match[1])
+      else if (typeof cursor === 'string') {
+        const position = entries.findIndex(item => item.hash === cursor)
+        if (position < 0) throw new Error('invalid cursor')
+        start = position
+      } else throw new Error('invalid cursor')
+      if (!Number.isSafeInteger(start) || start > Number.MAX_SAFE_INTEGER - limit) throw new Error('invalid cursor')
+      const selected = entries.slice(start, start + limit); const db = await this.open(stream)
+      const records = []
+      for (const [sequence, item] of selected.entries()) {
+        try { records.push({ hash: item.hash, event: await db.get(item.hash), sequence: start + sequence }) } catch { await this.quarantineEntry(item, 'unreadable-replicated-entry') }
+      }
+      const nextCursor = `v1:${start + selected.length}`
+      return { records, nextCursor, hasMore: start + selected.length < entries.length }
+    })
   }
 
   async saveIndex() {
@@ -171,16 +183,39 @@ export class TransportDaemon {
   }
 
   async withIndexLock(operation) {
+    const deadline = Date.now() + LOCK_RETRY_TIMEOUT_MS
     for (;;) {
       try {
         await fs.mkdir(this.lockPath)
+        await fs.writeFile(path.join(this.lockPath, 'owner.json'), JSON.stringify({ owner: os.hostname(), pid: process.pid, acquiredAt: Date.now() }), { mode: 0o600, flag: 'wx' })
         break
       } catch (cause) {
         if (cause.code !== 'EEXIST') throw cause
-        await new Promise(resolve => setTimeout(resolve, 10))
+        if (await this.lockIsStale()) { await fs.rm(this.lockPath, { recursive: true, force: true }); continue }
+        if (Date.now() >= deadline) throw new Error('transport index lock timed out')
+        await new Promise(resolve => setTimeout(resolve, LOCK_RETRY_MS))
       }
     }
     try { return await operation() } finally { await fs.rm(this.lockPath, { recursive: true, force: true }) }
+  }
+
+  async lockIsStale() {
+    try {
+      const owner = JSON.parse(await fs.readFile(path.join(this.lockPath, 'owner.json'), 'utf8'))
+      const age = Date.now() - owner.acquiredAt
+      if (owner.owner !== os.hostname() || !Number.isInteger(owner.pid) || !Number.isFinite(owner.acquiredAt)) return age > LOCK_LEASE_MS
+      try { process.kill(owner.pid, 0); return age > LOCK_LEASE_MS } catch (cause) { return cause.code === 'ESRCH' || age > LOCK_LEASE_MS }
+    } catch (cause) {
+      if (cause.code === 'ENOENT') return false
+      const stat = await fs.stat(this.lockPath).catch(() => null)
+      return Boolean(stat && Date.now() - stat.mtimeMs > LOCK_LEASE_MS)
+    }
+  }
+
+  async quarantineEntry(entry, reason) {
+    let raw
+    try { raw = JSON.stringify(entry) } catch { raw = JSON.stringify({ malformed: String(entry) }) }
+    await fs.appendFile(this.quarantinePath, `${JSON.stringify({ reason, entry: raw })}\n`, { mode: 0o600 })
   }
 
   async refreshIndex(stream) {
@@ -189,13 +224,14 @@ export class TransportDaemon {
     if (typeof database.iterator !== 'function') return
     const known = new Set(entries.map(item => item.hash))
     for await (const entry of database.iterator()) {
-      const hash = String(entry.hash)
+      if (!entry || typeof entry !== 'object' || typeof entry.hash !== 'string' || !entry.hash || !entry.value || typeof entry.value !== 'object' || Array.isArray(entry.value)) {
+        await this.quarantineEntry(entry, 'malformed-replicated-entry'); continue
+      }
+      const hash = entry.hash
       if (!known.has(hash)) {
-        entries.push({ key: digest(entry.value), hash })
-        known.add(hash)
+        try { entries.push({ key: digest(entry.value), hash }); known.add(hash) } catch { await this.quarantineEntry(entry, 'malformed-replicated-entry') }
       }
     }
-    await this.saveIndex()
   }
   async handle(request) {
     try {

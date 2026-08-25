@@ -93,6 +93,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue((key_dir / "operator.g1.private").exists())
         self.assertTrue((key_dir / "operator.g2.private").exists())
 
+    def test_generate_keypair_rejects_path_traversal_and_absolute_issuers(self):
+        key_dir = Path(self.temp.name) / "identity"
+        for issuer in ("../escape", "nested/operator", "\\absolute", "/absolute", ".", ".."):
+            with self.assertRaises(ValueError):
+                generate_keypair(key_dir, issuer)
+
     def test_orbitdb_provider_maps_bounded_socket_contract(self):
         import socketserver
         import threading
@@ -118,6 +124,23 @@ class RuntimeTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join()
+
+    def test_orbitdb_provider_requires_append_cursor(self):
+        import socketserver
+        import threading
+
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self):
+                self.wfile.write(json.dumps({"ok": True, "hash": "h1"}).encode() + b"\n")
+
+        path = Path(self.temp.name) / "append.sock"
+        server = socketserver.UnixStreamServer(str(path), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            with self.assertRaises(ValueError):
+                OrbitDBProvider(path, "membership").append({"id": 1})
+        finally:
+            server.shutdown(); server.server_close(); thread.join()
 
     def test_envelope_compatibility_and_unsafe_values_are_quarantined(self):
         cases = {
