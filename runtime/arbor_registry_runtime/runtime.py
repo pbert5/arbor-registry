@@ -25,6 +25,7 @@ from nacl.signing import SigningKey, VerifyKey
 
 SCHEMAS = frozenset({
     "node-identity", "identity-generation", "relationship", "capability", "service", "endpoint",
+    "machine-facts", "hardware-snapshot", "configuration-intent", "compatibility",
     "enrollment", "revocation", "recovery-authorization", "receipt",
 })
 ProviderCursor: TypeAlias = int | str
@@ -215,6 +216,34 @@ def make_lifecycle_record(
         "recordId": record_id, "generation": generation, "predecessor": predecessor,
         "issuer": issuer_key.issuer, "schema": schema, "payload": payload,
     }
+    return {**unsigned, "signature": issuer_key.sign(unsigned)}
+
+
+def make_public_record(
+    issuer_key: RuntimeKey,
+    schema: str,
+    record_id: str,
+    payload: dict[str, Any],
+    *,
+    generation: int = 1,
+    issuer_generation: int | None = None,
+) -> dict[str, Any]:
+    """Create a signed, typed public advertisement for Runtime.ingest."""
+    if schema not in {"machine-facts", "hardware-snapshot", "configuration-intent", "compatibility", "endpoint", "service", "relationship"}:
+        raise ValueError("schema is not a public advertisement family")
+    if not isinstance(record_id, str) or not record_id or not isinstance(payload, dict):
+        raise ValueError("record id and object payload are required")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise ValueError("generation must be a positive integer")
+    unsigned = {
+        "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+        "recordVersion": generation, "recordId": record_id, "generation": generation,
+        "predecessor": None, "issuer": issuer_key.issuer, "schema": schema, "payload": payload,
+    }
+    if issuer_generation is not None:
+        if isinstance(issuer_generation, bool) or not isinstance(issuer_generation, int) or issuer_generation < 1:
+            raise ValueError("issuer generation must be a positive integer")
+        unsigned["issuerGeneration"] = issuer_generation
     return {**unsigned, "signature": issuer_key.sign(unsigned)}
 
 
@@ -924,3 +953,12 @@ class Runtime:
     def projection(self) -> dict[str, dict[str, Any]]:
         return {record_id: {"schema": schema, "payload": json.loads(payload), "generation": generation}
                 for record_id, schema, payload, generation in self.db.execute("SELECT record_id, schema, payload, generation FROM projection")}
+
+    def status(self) -> dict[str, int]:
+        """Return non-sensitive deterministic runtime counters."""
+        return {
+            "records": self.db.execute("SELECT COUNT(*) FROM records").fetchone()[0],
+            "accepted": self.db.execute("SELECT COUNT(*) FROM records WHERE status = 'accepted'").fetchone()[0],
+            "quarantined": self.db.execute("SELECT COUNT(*) FROM records WHERE status = 'quarantined'").fetchone()[0],
+            "projected": self.db.execute("SELECT COUNT(*) FROM projection").fetchone()[0],
+        }

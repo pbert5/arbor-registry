@@ -11,5 +11,6 @@ python3Packages.buildPythonApplication {
   meta = {
     description = "Local durable runtime for signed Arbor Registry records";
     license = lib.licenses.mit;
+    mainProgram = "arbor-registryctl";
   };
 }
