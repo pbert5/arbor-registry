@@ -27,6 +27,8 @@ const LOCK_RETRY_TIMEOUT_MS = 30_000
 const LOCK_RETRY_MS = 10
 const SOCKET_MODE = 0o660
 const MAX_QUARANTINE_ENTRIES = 10_000
+const STOP_TIMEOUT_MS = 10_000
+const STOP_STEP_TIMEOUT_MS = 2_000
 const canonical = value => JSON.stringify(value, (_, v) => v && typeof v === 'object' && !Array.isArray(v)
   ? Object.fromEntries(Object.keys(v).sort().map(k => [k, v[k]])) : v)
 const digest = value => createHash('sha256').update(canonical(value)).digest('hex')
@@ -104,6 +106,7 @@ export class TransportDaemon {
     this.indexQueue = Promise.resolve()
     this.lockPath = path.join(this.stateDir, 'transport-index.lock')
     this.quarantinePath = path.join(this.stateDir, 'transport-quarantine.jsonl')
+    this.stopPromise = null
     this.bootstrapStatePath = path.join(this.stateDir, 'transport-bootstrap.json')
   }
 
@@ -404,7 +407,39 @@ export class TransportDaemon {
     } catch { return reply(false, { code: 'invalid_request' }) }
   }
 
-  async stop() { if (this.bootstrapTimer) clearInterval(this.bootstrapTimer); for (const db of this.databases.values()) await db.close(); await this.orbitdb?.stop(); await this.helia?.stop(); await this.datastore?.close(); await this.blockstore?.close(); await this.libp2p?.stop() }
+  async stop({ timeoutMs = STOP_TIMEOUT_MS } = {}) {
+    if (this.stopPromise) return this.stopPromise
+    this.stopPromise = (async () => {
+      if (this.bootstrapTimer) clearInterval(this.bootstrapTimer)
+      const deadline = Date.now() + Math.max(0, timeoutMs)
+      const stopOne = async operation => {
+        const remaining = Math.min(STOP_STEP_TIMEOUT_MS, deadline - Date.now())
+        if (remaining <= 0 || !operation) return false
+        let timer
+        try {
+          // Keep cleanup moving when one OrbitDB/Helia close waits on a lost
+          // peer. The process-level deadline is the final containment bound.
+          await Promise.race([
+            Promise.resolve().then(operation).catch(() => {}),
+            new Promise(resolve => { timer = setTimeout(resolve, remaining) }),
+          ])
+          return true
+        } finally { clearTimeout(timer) }
+      }
+
+      await stopOne(() => this.appendQueue)
+      await stopOne(() => this.indexQueue)
+      for (const db of this.databases.values()) await stopOne(() => db.close())
+      // Keep the database-first order so OrbitDB can persist its replication
+      // state. Each close is bounded; a lost peer cannot block the rest.
+      await stopOne(() => this.orbitdb?.stop())
+      await stopOne(() => this.helia?.stop())
+      await stopOne(() => this.datastore?.close())
+      await stopOne(() => this.blockstore?.close())
+      await stopOne(() => this.libp2p?.stop())
+    })()
+    return this.stopPromise
+  }
 }
 
 export function startSocketServer(daemon, socketPath, authorization = {}) {
@@ -414,9 +449,12 @@ export function startSocketServer(daemon, socketPath, authorization = {}) {
   if (!Number.isInteger(mode) || mode < 0 || mode > 0o777 || (uid == null) !== (gid == null) || (uid != null && (!Number.isInteger(uid) || uid < 0 || !Number.isInteger(gid) || gid < 0))) throw new Error('invalid socket ownership or mode')
   const authorized = async request => (token != null && request != null && request.token === token)
     || typeof authorizePeer === 'function' && await authorizePeer(request)
+  const sockets = new Set()
   // Clients write one request and half-close their write side. Keep the read
   // side alive until the asynchronous handler has produced its response.
   const server = net.createServer({ allowHalfOpen: true }, socket => {
+    sockets.add(socket)
+    socket.once('close', () => sockets.delete(socket))
     let buffer = ''; let handled = false
     const timer = setTimeout(() => socket.destroy(), 30_000)
     const finish = value => { clearTimeout(timer); if (!socket.destroyed) socket.end(JSON.stringify(value) + '\n') }
@@ -435,6 +473,11 @@ export function startSocketServer(daemon, socketPath, authorization = {}) {
     socket.on('close', () => clearTimeout(timer))
     socket.on('error', () => clearTimeout(timer))
   })
+  server.shutdown = async (graceMs = 1_000) => {
+    server.close()
+    await new Promise(resolve => setTimeout(resolve, graceMs))
+    for (const socket of sockets) socket.destroy()
+  }
   return fs.mkdir(path.dirname(socketPath), { recursive: true, mode: 0o750 }).then(async () => {
     const parent = await fs.lstat(path.dirname(socketPath))
     if (!parent.isDirectory() || parent.mode & 0o022 || (typeof process.getuid === 'function' && parent.uid !== process.getuid())) throw new Error('insecure socket parent permissions')
@@ -458,7 +501,19 @@ async function main() {
   if (!token) throw new Error('ARBOR_REGISTRY_SOCKET_TOKEN is required')
   await daemon.start()
   const server = await startSocketServer(daemon, socketPath, { token })
-  const stop = async () => { await new Promise(resolve => server.close(resolve)); await daemon.stop(); await fs.unlink(socketPath).catch(() => {}); process.exit(0) }
+  let stopping = false
+  const stop = async () => {
+    if (stopping) return
+    stopping = true
+    // Remove readiness before touching network-backed state. A restart must
+    // never observe the old socket while the previous process is winding down.
+    await fs.unlink(socketPath).catch(() => {})
+    await Promise.all([
+      server.shutdown?.().catch(() => {}),
+      daemon.stop().catch(() => {}),
+    ])
+    process.exit(0)
+  }
   process.once('SIGTERM', stop); process.once('SIGINT', stop)
 }
 if (process.argv[1] === new URL(import.meta.url).pathname) main().catch(cause => { console.error(cause); process.exit(1) })

@@ -84,6 +84,41 @@ test('separate daemon processes preserve the typed append/list transport', async
   }
 })
 
+test('shutdown is bounded when a shared database close waits forever', async () => {
+  const daemon = new TransportDaemon({ stateDir: await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-stop-')) })
+  let orbitdbStopped = false
+  daemon.databases.set('registry', { close: () => new Promise(() => {}) })
+  daemon.orbitdb = { stop: async () => { orbitdbStopped = true } }
+  const started = Date.now()
+  try {
+    await daemon.stop({ timeoutMs: 2_500 })
+    assert.ok(Date.now() - started < 3_000, 'shutdown exceeded its caller-provided deadline')
+    assert.equal(orbitdbStopped, true, 'cleanup must continue after a database close times out')
+    await daemon.stop({ timeoutMs: 2_500 })
+  } finally { await fs.rm(daemon.stateDir, { recursive: true, force: true }) }
+})
+
+test('socket shutdown destroys clients that never finish a request', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-socket-stop-'))
+  const socketPath = path.join(root, 'registry.sock')
+  const server = await startSocketServer({ handle: async () => ({ ok: true }) }, socketPath, 'test-token')
+  const client = net.createConnection(socketPath)
+  try {
+    await new Promise((resolve, reject) => {
+      client.once('connect', resolve)
+      client.once('error', reject)
+    })
+    client.write('{"operation":"health"')
+    const closed = new Promise(resolve => client.once('close', resolve))
+    await server.shutdown(0)
+    await closed
+    assert.equal(client.destroyed, true)
+  } finally {
+    client.destroy()
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
 test('legacy name-only opens bind the manifest to each creator identity', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-manifest-'))
   const first = new TransportDaemon({ stateDir: path.join(root, 'a') })
