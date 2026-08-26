@@ -13,6 +13,7 @@ from arbor_registry_runtime.runtime import (
     approve_enrollment,
     make_identity_generation,
     make_lifecycle_record,
+    make_public_record,
     make_recovery_approval,
     make_recovery_authorization,
     make_revocation,
@@ -98,6 +99,48 @@ class RuntimeTests(unittest.TestCase):
             generate_keypair(key_dir, "operator")
         rotated = generate_keypair(key_dir, "operator", rotation=True)
         self.assertNotEqual(first.public_key, rotated.public_key)
+
+    def test_delegated_lifecycle_requires_explicit_grant(self):
+        child = RuntimeKey("child", SigningKey.generate())
+        identity = make_identity_generation(self.key, "child", 1, child.public_key)
+        relationship = make_public_record(
+            self.key, "relationship", "root-child",
+            {"from": "root", "to": "child", "kind": "parent", "scope": ["observe"], "authorityRoot": "root"},
+        )
+        revocation = make_lifecycle_record(child, "revocation", "child-revocation", {"identity": "other", "generation": 1, "reason": "retired"})
+        revocation["issuerGeneration"] = 1
+        revocation["signature"] = child.sign({key: value for key, value in revocation.items() if key != "signature"})
+        self.assertEqual(self.runtime.ingest([identity, relationship, revocation])[-1]["reason"], "unauthorized-authority")
+        grant = make_public_record(
+            self.key, "relationship", "root-child-revocation",
+            {"from": "root", "to": "child", "kind": "parent", "scope": ["revocation"], "authorityRoot": "root"},
+        )
+        authorized = dict(revocation, recordId="child-revocation-authorized")
+        authorized["signature"] = child.sign({key: value for key, value in authorized.items() if key != "signature"})
+        self.assertEqual(self.runtime.ingest([grant, authorized])[-1]["status"], "accepted")
+
+    def test_node_binding_and_revoked_generation_gate_dependents(self):
+        child = RuntimeKey("child", SigningKey.generate())
+        identity = make_identity_generation(self.key, "child", 1, child.public_key)
+        relationship = make_public_record(self.key, "relationship", "root-child", {"from": "root", "to": "child", "kind": "parent", "scope": ["observe"], "authorityRoot": "root"})
+        endpoint = make_public_record(child, "endpoint", "child-endpoint", {"node": "child", "address": "https://example.invalid"}, issuer_generation=1)
+        self.assertEqual({item["status"] for item in self.runtime.ingest([identity, relationship, endpoint])}, {"accepted"})
+        self.assertEqual(self.runtime.ingest([make_revocation(self.key, "child", 1, "compromised")])[0]["status"], "accepted")
+        stale = make_public_record(child, "service", "child-service", {"node": "child", "name": "demo"}, issuer_generation=1)
+        self.assertEqual(self.runtime.ingest([stale])[0]["reason"], "revoked-generation")
+        missing = self.envelope("endpoint-missing", schema="endpoint", payload={})
+        conflicting = self.envelope("endpoint-conflicting", schema="endpoint", payload={"node": "other"})
+        self.assertEqual([item["reason"] for item in self.runtime.ingest([missing, conflicting])], ["missing-node-binding", "issuer-node-mismatch"])
+
+    def test_invalid_recovery_generation_cannot_seed_same_batch_dependent(self):
+        child = RuntimeKey("child", SigningKey.generate())
+        identity = make_identity_generation(self.key, "child", 1, child.public_key)
+        invalid = make_identity_generation(self.key, "child", 2, child.public_key, predecessor="child:1", recovery_authorization={"authorization": "not-a-record"})
+        dependent = make_public_record(child, "endpoint", "child-endpoint-generation-two", {"node": "child", "address": "https://example.invalid"}, issuer_generation=2)
+        outcomes = self.runtime.ingest([identity, invalid, dependent])
+        self.assertEqual([item["status"] for item in outcomes], ["accepted", "quarantined", "quarantined"])
+        self.assertEqual(outcomes[1]["reason"], "missing-recovery-authorization")
+        self.assertEqual(outcomes[2]["reason"], "stale-issuer-generation")
 
     def test_generate_keypair_preserves_prior_generations(self):
         key_dir = Path(self.temp.name) / "identity"
