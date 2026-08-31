@@ -2,15 +2,28 @@ import json
 
 start_all()
 nodes = (root_a, root_b, child, grandchild)
+def wait_for_health(node):
+    node.wait_until_succeeds("python3 -c %r" % (
+        "import json,socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/arbor-registry/registry.sock'); "
+        "s.sendall((json.dumps({'operation':'health','token':open('/run/arbor-registry/socket-token').read().strip()})+'\\n').encode()); "
+        "v=json.loads(s.recv(65536)); assert v.get('ok') is True and v.get('status') == 'ok', v;"
+    ), timeout=120)
+
 for node in nodes:
     node.wait_for_unit("arbor-registry-transport.service", timeout=120)
-    node.wait_for_unit("arbor-registry.service", timeout=120)
-    node.wait_until_succeeds("test -S /run/arbor-registry/registry.sock", timeout=30)
-    node.wait_until_succeeds("test -S /run/arbor-registry-transport/transport.sock", timeout=30)
+    node.wait_until_succeeds("test -S /run/arbor-registry-transport/transport.sock", timeout=120)
+    node.succeed("systemctl stop arbor-registry.service")
 
 root_a.succeed("python3 /etc/arbor-test/graph.py")
+authorities = root_a.succeed("cat /run/arbor-test/bootstrap-authorities.json").strip()
+for node in nodes:
+    node.succeed("mkdir -p /run/arbor-test; printf '%%s\\n' %r > /run/arbor-test/bootstrap-authorities.json" % authorities)
+    node.succeed("systemctl start arbor-registry.service")
+    node.wait_for_unit("arbor-registry.service", timeout=120)
+    wait_for_health(node)
 root_a.succeed("systemctl restart arbor-registry.service")
 root_a.wait_for_unit("arbor-registry.service", timeout=120)
+wait_for_health(root_a)
 
 def request(node, operation, **extra):
     script = ("import json,socket; value=" + repr({"operation": operation, **extra}) + "; "
@@ -50,10 +63,9 @@ for node in nodes[1:]:
 print("MATRIX cross-node-transport-convergence: PASS")
 
 for node in nodes[1:]:
-    authorities = root_a.succeed("cat /run/arbor-test/bootstrap-authorities.json").strip()
-    node.succeed("mkdir -p /run/arbor-test; printf '%%s\\n' %r > /run/arbor-test/bootstrap-authorities.json" % authorities)
     node.succeed("systemctl restart arbor-registry.service")
     node.wait_for_unit("arbor-registry.service", timeout=120)
+    wait_for_health(node)
     result = request(node, "ingest", records=records)
     assert result["ok"] and all(item["status"] == "accepted" for item in result["outcomes"]), result
     node.succeed("systemctl is-active arbor-registry-transport.service arbor-registry.service")
@@ -66,6 +78,7 @@ assert status["ok"]
 root_a.succeed("test -s /var/lib/arbor-registry/registry.sqlite3")
 root_a.succeed("systemctl restart arbor-registry.service")
 root_a.wait_for_unit("arbor-registry.service", timeout=120)
+wait_for_health(root_a)
 print("MATRIX persisted-registry-state-restart: PASS")
 
 root_a.succeed("systemctl stop arbor-registry-transport.service")
