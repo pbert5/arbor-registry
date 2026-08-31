@@ -21,6 +21,7 @@ root_a.succeed("python3 /etc/arbor-test/graph.py")
 authorities = root_a.succeed("cat /run/arbor-test/bootstrap-authorities.json").strip()
 for node in nodes:
     node.succeed("mkdir -p /run/arbor-test; printf '%%s\\n' %r > /run/arbor-test/bootstrap-authorities.json" % authorities)
+    node.succeed("chmod 0755 /run/arbor-test; chmod 0644 /run/arbor-test/bootstrap-authorities.json")
     node.succeed("systemctl start arbor-registry.service")
     node.wait_for_unit("arbor-registry.service", timeout=120)
     wait_for_health(node)
