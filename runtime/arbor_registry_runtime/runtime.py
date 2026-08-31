@@ -1566,11 +1566,17 @@ class Runtime:
     def accepted(self, cursor: int = 0, limit: int = 100) -> list[dict[str, Any]]:
         if limit < 1 or limit > 1000 or cursor < 0:
             raise ValueError("cursor must be non-negative and limit must be between 1 and 1000")
-        rows = self.db.execute("SELECT envelope FROM records WHERE status = 'accepted' ORDER BY rowid LIMIT ? OFFSET ?", (limit, cursor)).fetchall()
+        rows = self.db.execute(
+            "SELECT envelope FROM records WHERE status = 'accepted' "
+            "ORDER BY generation, record_id, record_key LIMIT ? OFFSET ?", (limit, cursor)
+        ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
     def quarantine(self) -> list[dict[str, Any]]:
-        return [{"record": json.loads(raw), "reason": reason} for raw, reason in self.db.execute("SELECT envelope, reason FROM records WHERE status = 'quarantined' ORDER BY rowid")]
+        return [{"record": json.loads(raw), "reason": reason} for raw, reason in self.db.execute(
+            "SELECT envelope, reason FROM records WHERE status = 'quarantined' "
+            "ORDER BY reason, record_id, record_key"
+        )]
 
     def projection(self) -> dict[str, dict[str, Any]]:
         return {record_id: {"schema": schema, "payload": json.loads(payload), "generation": generation}

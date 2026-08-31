@@ -21,6 +21,12 @@ let
     ;
   optional = condition: value: if condition then [ value ] else [ ];
   unique = values: foldl' (out: value: if elem value out then out else out ++ [ value ]) [ ] values;
+  dedupeRecords =
+    records:
+    foldl' (
+      out: record:
+      if lib.any (existing: canonical existing == canonical record) out then out else out ++ [ record ]
+    ) [ ] (sortRecords records);
   findFirst =
     predicate: fallback: values:
     let
@@ -54,6 +60,12 @@ let
 
   unsigned = envelope: if isAttrs envelope then removeAttrs envelope [ "signature" ] else { };
   canonical = value: toJSON value;
+  recordOrderKey =
+    record:
+    "${get "recordId" "" record}:${toString (get "recordVersion" 0 record)}:${
+      toString (get "generation" 0 record)
+    }:${get "schema" "" record}:${canonical record}";
+  sortRecords = records: lib.sortOn recordOrderKey records;
   recordKey = record: "${record.recordId}:${toString record.recordVersion}";
   issuerOf = record: get "issuer" null record;
   isType = expected: value: typeOf value == expected;
@@ -82,9 +94,23 @@ let
   normalizeUnsafeKey = name: lib.replaceStrings [ "_" "-" ] [ "" "" ] (lib.toLower name);
   unsafeKey =
     name:
-    let normalized = normalizeUnsafeKey name;
-    in elem normalized unsafeKeys
-      || lib.any (suffix: lib.hasSuffix suffix normalized) [ "secret" "password" "passphrase" "token" "credential" "authorization" "apikey" "accesskey" "privatekey" "signingkey" "seed" ];
+    let
+      normalized = normalizeUnsafeKey name;
+    in
+    elem normalized unsafeKeys
+    || lib.any (suffix: lib.hasSuffix suffix normalized) [
+      "secret"
+      "password"
+      "passphrase"
+      "token"
+      "credential"
+      "authorization"
+      "apikey"
+      "accesskey"
+      "privatekey"
+      "signingkey"
+      "seed"
+    ];
   unsafeString =
     value:
     typeOf value == "string"
@@ -226,9 +252,10 @@ let
   validateHistory =
     records:
     let
+      records' = sortRecords (dedupeRecords records);
       byId = foldl' (
         out: record: out // { "${record.recordId}" = (out.${record.recordId} or [ ]) ++ [ record ]; }
-      ) { } records;
+      ) { } records';
       checkOne =
         record:
         let
@@ -237,13 +264,11 @@ let
           maxGeneration = lib.foldl' lib.max 0 generations;
           currentPeers = filter (x: x.generation == maxGeneration) peers;
           conflict = length (unique (map canonical currentPeers)) > 1;
-          predecessorRecord = findFirst (
+          predecessorRecord = lib.any (
             x: x.recordId == record.predecessor && x.generation == record.generation - 1
-          ) null records;
-          predecessorOK =
-            (record.predecessor == null && record.generation == 1)
-            || (predecessorRecord != null && predecessorRecord.generation + 1 == record.generation);
-          successors = filter (x: x.predecessor == record.predecessor) records;
+          ) records';
+          predecessorOK = (record.predecessor == null && record.generation == 1) || predecessorRecord;
+          successors = unique (map recordKey (filter (x: x.predecessor == record.predecessor) records'));
           fork = record.predecessor != null && length successors > 1;
           current = record.generation == maxGeneration;
         in
@@ -278,14 +303,24 @@ let
             quarantine = null;
           };
     in
-    map checkOne records;
+    map checkOne records';
 
   materialize =
     accepted:
     let
-      byFamily = family: filter (record: record.schema == family) accepted;
+      accepted' = sortRecords (dedupeRecords accepted);
+      byFamily = family: sortRecords (filter (record: record.schema == family) accepted');
       ordered = values: lib.sortOn (value: toJSON value) values;
-      identities = map (record: record.payload) (byFamily "node-identity");
+      # Identity presentation follows the stable descending identity key used
+      # by the established projection contract; all other families use the
+      # canonical ascending record order below.
+      identities = map (record: record.payload) (
+        lib.reverseList (
+          lib.sortOn (
+            record: "${canonical record.payload}:${record.recordId}:${toString record.recordVersion}"
+          ) (byFamily "node-identity")
+        )
+      );
       relationships = map (record: record.payload) (
         (byFamily "relationship") ++ (byFamily "peer-relationship")
       );
@@ -294,17 +329,16 @@ let
         records:
         map (
           id:
-          findFirst (
-            x:
-            x.recordId == id
-            &&
-              x.generation == lib.foldl' lib.max 0 (map (y: y.generation) (filter (y: y.recordId == id) records))
-          ) null records
-        ) (unique (map (x: x.recordId) records));
+          let
+            sameId = filter (x: x.recordId == id) records;
+            maxGeneration = lib.foldl' lib.max 0 (map (x: x.generation) sameId);
+          in
+          head (sortRecords (filter (x: x.generation == maxGeneration) sameId))
+        ) (lib.sort builtins.lessThan (unique (map (x: x.recordId) records)));
     in
     {
       inherit identities relationships peerRelationships;
-      records = latest accepted;
+      records = latest accepted';
       endpoints = ordered (map (record: record.payload) (byFamily "endpoint"));
       names = ordered (
         (map (record: record.payload) (byFamily "name"))
@@ -336,6 +370,7 @@ let
       authorizedIssuers ? null,
     }:
     let
+      raw' = sortRecords raw;
       envelopeResults = map (
         record:
         validateEnvelope {
@@ -349,8 +384,10 @@ let
             ;
           authorizedIssuers = null;
         }
-      ) raw;
-      envelopeAccepted = map (result: result.record) (filter (result: result.accepted) envelopeResults);
+      ) raw';
+      envelopeAccepted = dedupeRecords (
+        map (result: result.record) (filter (result: result.accepted) envelopeResults)
+      );
       historyResults = validateHistory envelopeAccepted;
       historyAccepted = map (result: result.record) (filter (result: result.accepted) historyResults);
       rejectedHistory = filter (result: !result.accepted) historyResults;
@@ -392,7 +429,39 @@ let
         ) historyAccepted;
         inherit authorizedIssuers signers;
       };
-      accepted = authority.accepted;
+      authorityAccepted = sortRecords (dedupeRecords authority.accepted);
+      revocationKeys = unique (
+        map
+          (record: {
+            identity = record.payload.identity;
+            generation = record.payload.generation;
+          })
+          (
+            filter (
+              record:
+              record.schema == "revocation"
+              && isAttrs record.payload
+              && isString (get "identity" null record.payload)
+              && isInt (get "generation" null record.payload)
+            ) authorityAccepted
+          )
+      );
+      revoked =
+        record:
+        record.schema != "revocation"
+        && lib.any (
+          item:
+          get "identity" null record.payload == item.identity
+          && get "generation" null record.payload == item.generation
+        ) revocationKeys;
+      accepted = filter (record: !revoked record) authorityAccepted;
+      revokedQuarantined = map (
+        record:
+        record
+        // {
+          quarantine = reason "revoked-generation" "record belongs to a revoked identity generation";
+        }
+      ) (filter revoked authorityAccepted);
       authorizedGraphRecords = filter (
         record: elem (recordKey record) (map recordKey accepted)
       ) historyAccepted;
@@ -422,7 +491,8 @@ let
             ) historyAccepted
           )
         )
-        ++ authority.quarantined;
+        ++ authority.quarantined
+        ++ revokedQuarantined;
       graph = validateGraph {
         relationships = map (
           record:
@@ -431,12 +501,12 @@ let
             kind = if record.schema == "peer-relationship" then "peer" else record.payload.kind;
             authorityRoot = get "authorityRoot" record.issuer record.payload;
           }
-        ) authorizedRelationships;
+        ) (sortRecords authorizedRelationships);
       };
       cycleRecords = filter (
         record:
         (record.schema == "relationship" || record.schema == "peer-relationship")
-        && elem record.recordId (map (item: item.recordId) authorizedGraphRecords)
+        && elem (recordKey record) (map recordKey authorizedGraphRecords)
         && relationshipEvidenceOK record
         && (
           let
@@ -455,9 +525,9 @@ let
           elem record.payload.from (validateGraph { relationships = scoped; }).cycles
           && elem record.payload.to (validateGraph { relationships = scoped; }).cycles
         )
-      ) authorizedGraphRecords;
-      cycleRecordIds = map (record: record.recordId) cycleRecords;
-      graphAccepted = filter (record: !elem record.recordId cycleRecordIds) accepted;
+      ) (sortRecords authorizedGraphRecords);
+      cycleRecordKeys = map recordKey cycleRecords;
+      graphAccepted = sortRecords (filter (record: !elem (recordKey record) cycleRecordKeys) accepted);
       cycleQuarantined = map (
         record:
         record
@@ -467,9 +537,9 @@ let
       ) cycleRecords;
     in
     {
-      raw = raw;
+      raw = raw';
       accepted = graphAccepted;
-      quarantined = quarantined ++ cycleQuarantined;
+      quarantined = sortRecords (quarantined ++ cycleQuarantined);
       inherit graph;
       materialized = materialize graphAccepted;
     };
@@ -518,7 +588,8 @@ let
     }:
     filter (edge: (from == null || edge.from == from) && (to == null || edge.to == to)) relationships;
   parentEdges =
-    relationships: filter (edge: edgeActive edge && edgeKind edge == "parent") relationships;
+    relationships:
+    lib.sortOn canonical (filter (edge: edgeActive edge && edgeKind edge == "parent") relationships);
   parentGraph =
     relationships:
     foldl' (out: edge: out // { "${edge.from}" = (out.${edge.from} or [ ]) ++ [ edge.to ]; }) { } (
@@ -682,10 +753,10 @@ let
           );
         in
         !(lib.all (capability: elem capability inherited) (capabilitiesOf grant))
-      ) grants;
+      ) (lib.sortOn canonical grants);
     in
     {
-      inherit violations;
+      violations = lib.sortOn canonical violations;
       valid = violations == [ ];
     };
 
