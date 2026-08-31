@@ -30,7 +30,7 @@ let
   hasUnsafeName =
     name:
     let
-      normalized = lib.toLower (builtins.replaceStrings [ "_" ] [ "" ] name);
+      normalized = lib.toLower (builtins.replaceStrings [ "_" "-" ] [ "" "" ] name);
     in
     lib.elem normalized unsafeNames;
   hasUnsafeValue =

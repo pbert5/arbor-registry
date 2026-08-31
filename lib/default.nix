@@ -76,7 +76,8 @@ let
     "access-token"
     "seed"
   ];
-  unsafeKey = name: elem (lib.toLower name) unsafeKeys;
+  normalizeUnsafeKey = name: lib.replaceStrings [ "_" "-" ] [ "" "" ] (lib.toLower name);
+  unsafeKey = name: elem (normalizeUnsafeKey name) unsafeKeys;
   unsafeString =
     value:
     typeOf value == "string"
@@ -386,7 +387,7 @@ let
       };
       accepted = authority.accepted;
       authorizedGraphRecords = filter (
-        record: elem record.recordId (map (item: item.recordId) accepted)
+        record: elem (recordKey record) (map recordKey accepted)
       ) historyAccepted;
       authorizedRelationships = filter (
         record:
@@ -805,27 +806,49 @@ let
           && (record.issuer == root || lib.all (capability: elem capability inherited) requested)
         else
           let
-            sensitive = elem record.schema [
+            projectionBearing = elem record.schema [
               "node-identity"
               "identity-generation"
-              "enrollment"
-              "revocation"
-              "recovery-authorization"
-              "receipt"
+              "capability"
+              "service"
+              "endpoint"
+              "name"
+              "trusted-peer"
+              "reachability"
+              "compatibility"
+              "machine-facts"
+              "hardware-snapshot"
+              "configuration-intent"
             ];
+            sensitive =
+              projectionBearing
+              || elem record.schema [
+                "enrollment"
+                "revocation"
+                "recovery-authorization"
+                "receipt"
+              ];
             root = rootOf record;
+            localDomain = findFirst (
+              genesis:
+              genesis.issuer == record.issuer
+              && get "domain" null genesis.payload == get "domain" null record.payload
+            ) null (filter isSelfGenesis accepted);
             establishedIdentity =
               record.schema == "node-identity"
               && lib.any (edge: edge.to == record.issuer && get "authorityRoot" root edge == root) (
                 relationshipRecords accepted
               );
           in
-          !sensitive
+          (projectionBearing && localDomain != null && record.issuer == root)
           || (
-            isString record.issuer
-            && isString root
-            && (rootEstablished accepted root || isSelfGenesis record)
-            && (issuerHasPath accepted record root || establishedIdentity)
+            !sensitive
+            || (
+              isString record.issuer
+              && isString root
+              && (rootEstablished accepted root || isSelfGenesis record)
+              && (issuerHasPath accepted record root || establishedIdentity)
+            )
           );
       resolve =
         accepted: pending:

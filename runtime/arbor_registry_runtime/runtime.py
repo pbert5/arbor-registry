@@ -92,6 +92,26 @@ def _fsync_directory(path: Path) -> None:
         os.close(directory_fd)
 
 
+def _write_durable(path: Path, value: str) -> None:
+    """Replace a small journal atomically, with both file and directory durable."""
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
 def canonical_json(value: Any) -> bytes:
     """The wire canonical form: UTF-8, sorted keys, no insignificant whitespace."""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -421,18 +441,23 @@ def generate_keypair(
             return
         try:
             transaction = json.loads(journal_path.read_text(encoding="ascii"))
-            if transaction.get("phase") == "installed":
+            phase = transaction.get("phase")
+            if phase == "installed":
                 for name in transaction["backups"].values():
                     if name:
                         (key_dir / name).unlink(missing_ok=True)
-            else:
-                for name in transaction["destinations"].values():
-                    (key_dir / name).unlink(missing_ok=True)
+            elif phase in {"prepared", "backed-up"}:
+                # A prepared journal is intentionally not proof that an old
+                # destination was backed up. Never delete it. If a backup is
+                # present, restore it only when the destination is absent.
                 for kind, name in transaction["backups"].items():
                     if name:
                         backup = key_dir / name
-                        if backup.exists():
+                        destination = key_dir / transaction["destinations"][kind]
+                        if backup.exists() and (phase == "backed-up" or not destination.exists()):
                             os.replace(backup, private_path if kind == "private" else public_path)
+            else:
+                raise ValueError("unknown key-pair transaction phase")
             for name in transaction["temporary"].values():
                 (key_dir / name).unlink(missing_ok=True)
             journal_path.unlink(missing_ok=True)
@@ -473,12 +498,9 @@ def generate_keypair(
             transaction = {"phase": "prepared", "temporary": temporary,
                            "destinations": {kind: path.name for kind, (path, _, _) in zip(("private", "public"), values)},
                            "backups": backups}
-            journal_path.write_text(json.dumps(transaction, sort_keys=True), encoding="ascii")
-            os.chmod(journal_path, 0o600)
-            _fsync_directory(key_dir)
+            _write_durable(journal_path, json.dumps(transaction, sort_keys=True))
             transaction["phase"] = "backed-up"
-            journal_path.write_text(json.dumps(transaction, sort_keys=True), encoding="ascii")
-            _fsync_directory(key_dir)
+            _write_durable(journal_path, json.dumps(transaction, sort_keys=True))
             for kind, (destination, _, _) in zip(("private", "public"), values):
                 if backups[kind]:
                     _replace_keypair(str(destination), key_dir / backups[kind])
@@ -488,8 +510,7 @@ def generate_keypair(
             for kind, (destination, _, _) in zip(("private", "public"), values):
                 _replace_keypair(str(key_dir / temporary[kind]), destination)
             transaction["phase"] = "installed"
-            journal_path.write_text(json.dumps(transaction, sort_keys=True), encoding="ascii")
-            _fsync_directory(key_dir)
+            _write_durable(journal_path, json.dumps(transaction, sort_keys=True))
             recover()
             return key
         finally:
@@ -799,9 +820,9 @@ class Runtime:
             ).fetchone() == (_digest(record),)
         )
 
-    _SENSITIVE_SCHEMAS = {
-        "node-identity", "identity-generation", "enrollment", "revocation",
-        "recovery-authorization", "receipt", "relationship", "capability",
+    _SENSITIVE_SCHEMAS = set(SCHEMAS)
+    _PROJECTION_SCHEMAS = SCHEMAS - {
+        "enrollment", "revocation", "recovery-authorization", "receipt",
     }
 
     @staticmethod
@@ -860,6 +881,16 @@ class Runtime:
             root = root_of(record)
             if not isinstance(root, str) or root not in self.authority_issuers:
                 return False
+            # A local root may publish records explicitly scoped to its own
+            # domain. This is the only projection exception to graph-derived
+            # authority; it cannot be used for a foreign domain or identity.
+            local_scope = self.local_authorities.get(issuer)
+            payload = record.get("payload", {})
+            if (record.get("schema") in self._PROJECTION_SCHEMAS
+                    and local_scope is not None and issuer == root
+                    and isinstance(payload, dict)
+                    and payload.get("domain") == local_scope[0]):
+                return True
             root_genesis = any(
                 candidate.get("issuer") == root and self._is_exact_local_genesis(candidate)
                 for candidate in accepted
@@ -1019,8 +1050,11 @@ class Runtime:
         local_scope = self.local_authorities.get(record["issuer"])
         if local_scope is not None:
             domain, public_key = local_scope
-            if (payload.get("identity") != record["issuer"] or payload.get("domain") != domain
+            if record["schema"] == "node-identity" and (
+                    payload.get("identity") != record["issuer"] or payload.get("domain") != domain
                     or payload.get("publicKey") != public_key):
+                return "quarantined", "unauthorized-local-authority-scope"
+            if record["schema"] != "node-identity" and payload.get("domain") is not None and payload.get("domain") != domain:
                 return "quarantined", "unauthorized-local-authority-scope"
         if record["schema"] == "enrollment":
             if (not isinstance(payload.get("identity"), str) or not isinstance(payload.get("publicKey"), str)

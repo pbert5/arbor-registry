@@ -166,6 +166,51 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotEqual(first.public_key, recovered.public_key)
         self.assertFalse((key_dir / ".operator.keypair-transaction").exists())
 
+    def test_prepared_keypair_journal_never_deletes_originals(self):
+        key_dir = Path(self.temp.name) / "prepared-identity"
+        first = generate_keypair(key_dir, "operator")
+        private = key_dir / "operator.private"
+        public = key_dir / "operator.public"
+        old_private, old_public = private.read_text(), public.read_text()
+        journal = key_dir / ".operator.keypair-transaction"
+        journal.write_text(json.dumps({
+            "phase": "prepared",
+            "temporary": {"private": ".missing-private", "public": ".missing-public"},
+            "destinations": {"private": private.name, "public": public.name},
+            "backups": {"private": ".operator.private.backup", "public": ".operator.public.backup"},
+        }))
+        journal.chmod(0o600)
+        with self.assertRaises(FileExistsError):
+            generate_keypair(key_dir, "operator")
+        self.assertEqual(private.read_text(), old_private)
+        self.assertEqual(public.read_text(), old_public)
+
+    def test_projection_records_require_graph_authority_but_local_domain_is_allowed(self):
+        child = RuntimeKey("child", SigningKey.generate())
+        self.runtime.public_keys["child"] = child.public_key
+        service = self.envelope("service-child", schema="service", payload={
+            "id": "service-child", "domain": "root.internal",
+        })
+        service["issuer"] = "child"
+        service["payload"]["authorityRoot"] = "root"
+        service["signature"] = child.sign({key: value for key, value in service.items() if key != "signature"})
+        self.assertEqual(self.runtime.ingest([service])[0]["reason"], "unauthorized-authority")
+
+        node = RuntimeKey("local", SigningKey.generate())
+        local = Runtime(Path(self.temp.name) / "local-projection", FileProvider(Path(self.temp.name) / "local-projection-raw" / "history.jsonl"), {}, node_key=node)
+        try:
+            local.local_genesis("local", "example.internal")
+            record = {
+                "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1, "recordVersion": 1,
+                "recordId": "service-local", "generation": 1, "predecessor": None,
+                "issuer": "local", "schema": "service",
+                "payload": {"id": "service-local", "domain": "example.internal", "authorityRoot": "local"},
+            }
+            record["signature"] = node.sign(record)
+            self.assertEqual(local.ingest([record])[0]["status"], "accepted")
+        finally:
+            local.close()
+
     def test_orbitdb_provider_maps_bounded_socket_contract(self):
         import socketserver
         import threading
