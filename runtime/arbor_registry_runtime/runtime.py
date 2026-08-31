@@ -135,6 +135,22 @@ def _digest(record: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(record)).hexdigest()
 
 
+def _recovery_proposal(identity: str, lost_generation: int, new_generation: int,
+                       new_public_key: str) -> dict[str, Any]:
+    """Return the immutable fields an approval authorizes."""
+    return {
+        "identity": identity,
+        "lostGeneration": lost_generation,
+        "newGeneration": new_generation,
+        "newPublicKey": new_public_key,
+    }
+
+
+def _recovery_proposal_digest(identity: str, lost_generation: int, new_generation: int,
+                              new_public_key: str) -> str:
+    return _digest(_recovery_proposal(identity, lost_generation, new_generation, new_public_key))
+
+
 def _b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode().rstrip("=")
 
@@ -303,6 +319,9 @@ def make_recovery_approval(
     *,
     role: str,
     approver_generation: int,
+    new_public_key: str | None = None,
+    new_generation: int | None = None,
+    proposal_digest: str | None = None,
     operation: str = "recovery",
     decision: str = "approve",
 ) -> dict[str, Any]:
@@ -314,6 +333,21 @@ def make_recovery_approval(
             or approver_generation < 1 or operation != "recovery"
             or decision != "approve"):
         raise ValueError("invalid recovery approval")
+    if new_generation is None:
+        new_generation = lost_generation + 1
+    if new_public_key is not None and (
+            not isinstance(new_public_key, str) or not new_public_key):
+        raise ValueError("invalid recovery replacement key")
+    if (isinstance(new_generation, bool) or not isinstance(new_generation, int)
+            or new_generation != lost_generation + 1):
+        raise ValueError("invalid recovery replacement generation")
+    if new_public_key is not None and proposal_digest is None:
+        proposal_digest = _recovery_proposal_digest(
+            identity, lost_generation, new_generation, new_public_key
+        )
+    if proposal_digest is not None and (
+            not isinstance(proposal_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", proposal_digest)):
+        raise ValueError("invalid recovery proposal digest")
     unsigned = {
         "approver": approver_key.issuer,
         "role": role,
@@ -323,6 +357,12 @@ def make_recovery_approval(
         "approverGeneration": approver_generation,
         "decision": decision,
     }
+    if new_public_key is not None:
+        unsigned.update({
+            "newPublicKey": new_public_key,
+            "newGeneration": new_generation,
+            "proposalDigest": proposal_digest,
+        })
     return {**unsigned, "issuer": approver_key.issuer, "signature": approver_key.sign(unsigned)}
 
 
@@ -336,13 +376,21 @@ def make_recovery_authorization(
     provenance: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build an authority-signed recovery authorization transaction."""
-    if not isinstance(new_public_key, str) or not isinstance(approvals, list) or not approvals:
+    if (not isinstance(identity, str) or not identity or isinstance(lost_generation, bool)
+            or not isinstance(lost_generation, int) or lost_generation < 1
+            or not isinstance(new_public_key, str) or not new_public_key
+            or not isinstance(approvals, list) or not approvals):
         raise ValueError("recovery authorization is incomplete")
+    new_generation = lost_generation + 1
+    proposal_digest = _recovery_proposal_digest(
+        identity, lost_generation, new_generation, new_public_key
+    )
     payload = {
         "identity": identity,
         "lostGeneration": lost_generation,
-        "newGeneration": lost_generation + 1,
+        "newGeneration": new_generation,
         "newPublicKey": new_public_key,
+        "proposalDigest": proposal_digest,
         "approvals": approvals,
         "provenance": provenance or [],
     }
@@ -442,30 +490,71 @@ def generate_keypair(
     journal_path = key_dir / f".{issuer}{suffix}.keypair-transaction"
     lock_path = key_dir / f".{issuer}{suffix}.keypair-lock"
 
+    def confined(name: Any, *, expected: str | None = None) -> Path:
+        if (not isinstance(name, str) or not name or name in {".", ".."}
+                or name != Path(name).name or "/" in name or "\\" in name or "\x00" in name):
+            raise ValueError("key-pair transaction contains an unsafe path")
+        if expected is not None and name != expected:
+            raise ValueError("key-pair transaction destination mismatch")
+        return key_dir / name
+
+    def transaction_entry(name: Any, mode: int) -> Path:
+        path = confined(name)
+        if path.exists() or os.path.lexists(path):
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != mode:
+                raise ValueError("key-pair transaction entry is not a safe regular file")
+            if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                raise ValueError("key-pair transaction entry has unexpected owner")
+        return path
+
     def recover() -> None:
-        if not journal_path.exists():
+        if not os.path.lexists(journal_path):
             return
         try:
+            _secure_file(journal_path)
             transaction = json.loads(journal_path.read_text(encoding="ascii"))
+            if not isinstance(transaction, dict):
+                raise ValueError("key-pair transaction is not an object")
             phase = transaction.get("phase")
+            destinations = transaction.get("destinations")
+            temporary = transaction.get("temporary")
+            backups = transaction.get("backups")
+            expected_destinations = {"private": private_path.name, "public": public_path.name}
+            if (not isinstance(destinations, dict) or not isinstance(temporary, dict)
+                    or not isinstance(backups, dict)
+                    or set(destinations) != set(expected_destinations)
+                    or set(temporary) != set(expected_destinations)
+                    or set(backups) != set(expected_destinations)):
+                raise ValueError("key-pair transaction has an invalid shape")
+            for kind, expected in expected_destinations.items():
+                confined(destinations[kind], expected=expected)
+                temporary_path = transaction_entry(temporary[kind], 0o600 if kind == "private" else 0o644)
+                backup_name = backups[kind]
+                if backup_name is not None:
+                    expected_backup = f".{expected}.backup"
+                    confined(backup_name, expected=expected_backup)
+                    transaction_entry(backup_name, 0o600 if kind == "private" else 0o644)
+                if temporary_path.name in {journal_path.name, lock_path.name, expected}:
+                    raise ValueError("key-pair transaction entry collides with key material")
             if phase == "installed":
-                for name in transaction["backups"].values():
+                for name in backups.values():
                     if name:
-                        (key_dir / name).unlink(missing_ok=True)
+                        confined(name).unlink(missing_ok=True)
             elif phase in {"prepared", "backed-up"}:
                 # A prepared journal is intentionally not proof that an old
                 # destination was backed up. Never delete it. If a backup is
                 # present, restore it only when the destination is absent.
-                for kind, name in transaction["backups"].items():
+                for kind, name in backups.items():
                     if name:
-                        backup = key_dir / name
-                        destination = key_dir / transaction["destinations"][kind]
+                        backup = confined(name)
+                        destination = confined(destinations[kind], expected=expected_destinations[kind])
                         if backup.exists() and (phase == "backed-up" or not destination.exists()):
                             os.replace(backup, private_path if kind == "private" else public_path)
             else:
                 raise ValueError("unknown key-pair transaction phase")
-            for name in transaction["temporary"].values():
-                (key_dir / name).unlink(missing_ok=True)
+            for name in temporary.values():
+                confined(name).unlink(missing_ok=True)
             journal_path.unlink(missing_ok=True)
             _fsync_directory(key_dir)
         except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as error:
@@ -474,7 +563,11 @@ def generate_keypair(
     # The lock makes pair recovery and replacement mutually exclusive with
     # readers/writers that use this API. The journal makes an interrupted pair
     # recoverable without putting private key material in the journal itself.
-    with lock_path.open("a+") as lock:
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as error:
+        raise ValueError("key-pair lock is not safe") from error
+    with os.fdopen(lock_fd, "a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         recover()
         lock_path.chmod(0o600)
@@ -1093,26 +1186,44 @@ class Runtime:
                 return "quarantined", "malformed-receipt"
         return "accepted", None
 
-    def _recovery_approval_reason(self, payload: dict[str, Any]) -> str | None:
+    def _recovery_approval_reason(
+        self,
+        payload: dict[str, Any],
+        *,
+        generation_keys: dict[tuple[str, int], str] | None = None,
+        current_generations: dict[str, int] | None = None,
+        revoked_generations: set[tuple[str, int]] | None = None,
+        graph_records: list[dict[str, Any]] | None = None,
+        authority_root: str | None = None,
+    ) -> str | None:
         identity = payload.get("identity")
         lost = payload.get("lostGeneration")
         new = payload.get("newGeneration")
+        replacement = payload.get("newPublicKey")
+        proposal_digest = payload.get("proposalDigest")
         approvals = payload.get("approvals")
         if (not isinstance(identity, str) or not isinstance(lost, int) or isinstance(lost, bool) or lost < 1
-                or new != lost + 1 or not isinstance(payload.get("newPublicKey"), str)
+                or new != lost + 1 or not isinstance(replacement, str) or not replacement
+                or not isinstance(proposal_digest, str)
+                or proposal_digest != _recovery_proposal_digest(identity, lost, new, replacement)
                 or not isinstance(approvals, list) or not approvals
                 or not isinstance(payload.get("provenance", []), list)):
             return "malformed-recovery-authorization"
+        if any(not isinstance(item, dict) for item in payload.get("provenance", [])):
+            return "malformed-recovery-provenance"
         seen: set[tuple[str, str]] = set()
         counts = {role: 0 for role in ("operator", "parent", "peer")}
         for approval in approvals:
             if not isinstance(approval, dict) or any(key not in approval for key in (
-                    "approver", "role", "subject", "generation", "operation", "approverGeneration", "decision", "signature")):
+                    "approver", "role", "subject", "generation", "operation", "approverGeneration",
+                    "decision", "newPublicKey", "newGeneration", "proposalDigest", "signature")):
                 return "invalid-recovery-approval"
             if approval.get("subject") != identity or approval.get("generation") != lost:
                 return "unbound-recovery-approval"
             if (approval["subject"] != identity or approval["generation"] != lost
                     or approval["operation"] != "recovery" or approval["decision"] != "approve"
+                    or approval["newPublicKey"] != replacement or approval["newGeneration"] != new
+                    or approval["proposalDigest"] != proposal_digest
                     or approval["role"] not in {"operator", "parent", "peer"}
                     or not isinstance(approval["approverGeneration"], int)
                     or approval["approverGeneration"] < 1
@@ -1122,13 +1233,45 @@ class Runtime:
             role = approval["role"]
             if approver not in self.approver_roles.get(role, set()):
                 return "untrusted-recovery-approver"
+            if graph_records is not None and role in {"parent", "peer"}:
+                current_role = False
+                for candidate in graph_records:
+                    edge = self._edge(candidate)
+                    if edge is None or edge[3] != authority_root:
+                        continue
+                    edge_payload = candidate.get("payload", {})
+                    if edge_payload.get("status", "active") != "active":
+                        continue
+                    if role == "parent":
+                        current_role = edge[2] == "parent" and edge[0] == approver and edge[1] == identity
+                    else:
+                        current_role = edge[2] == "peer" and {
+                            edge[0], edge[1]
+                        } == {approver, identity}
+                    if current_role:
+                        break
+                if not current_role:
+                    return "stale-recovery-role"
             identity_key = (approver, role)
             if identity_key in seen:
                 return "duplicate-recovery-approver"
             seen.add(identity_key)
             counts[role] += 1
             try:
-                key = VerifyKey(_unb64(self.public_keys[approval["approver"]]))
+                if generation_keys is not None:
+                    if revoked_generations and (approver, approval["approverGeneration"]) in revoked_generations:
+                        return "revoked-approver-generation"
+                    if approver in self.authority_issuers and (approver, approval["approverGeneration"]) not in generation_keys:
+                        public_key = self.public_keys[approver]
+                    else:
+                        if current_generations and current_generations.get(approver) != approval["approverGeneration"]:
+                            return "stale-approver-generation"
+                        public_key = generation_keys.get((approver, approval["approverGeneration"]))
+                        if public_key is None:
+                            return "unknown-approver-generation"
+                else:
+                    public_key = self.public_keys[approval["approver"]]
+                key = VerifyKey(_unb64(public_key))
                 unsigned = {key: value for key, value in approval.items() if key not in {"signature", "issuer"}}
                 key.verify(canonical_json(unsigned), _unb64(approval["signature"]))
             except (KeyError, ValueError, TypeError, binascii.Error, BadSignatureError):
@@ -1323,6 +1466,61 @@ class Runtime:
             if candidate_index in authority_rejected:
                 reasons[rowid] = authority_rejected[candidate_index]
         candidates = [entry for entry in candidates if reasons[entry[0]] is None]
+
+        # Recovery approvals use the exact key published by the approver's
+        # currently active identity generation.  The configured public-key
+        # map is only a bootstrap map; it must not make a rotated or revoked
+        # generation authoritative.
+        generation_keys: dict[tuple[str, int], str] = {}
+        current_generations: dict[str, int] = {}
+        for _, _, record in candidates:
+            if record["schema"] not in {"node-identity", "identity-generation"}:
+                continue
+            payload = record.get("payload", {})
+            identity = payload.get("identity") if isinstance(payload, dict) else None
+            generation = payload.get("generation", record.get("generation")) if isinstance(payload, dict) else None
+            public_key = payload.get("publicKey") if isinstance(payload, dict) else None
+            if (not isinstance(identity, str) or isinstance(generation, bool)
+                    or not isinstance(generation, int) or generation < 1
+                    or not isinstance(public_key, str) or payload.get("status", "active") != "active"
+                    or (identity, generation) in revocations):
+                continue
+            generation_keys[(identity, generation)] = public_key
+            current_generations[identity] = max(current_generations.get(identity, 0), generation)
+        graph_records = [record for _, _, record in candidates]
+        for rowid, _, record in candidates:
+            if record["schema"] != "recovery-authorization":
+                continue
+            payload = record.get("payload", {})
+            root = payload.get("authorityRoot", record.get("issuer")) if isinstance(payload, dict) else None
+            reason = self._recovery_approval_reason(
+                payload,
+                generation_keys=generation_keys,
+                current_generations=current_generations,
+                revoked_generations=revocations,
+                graph_records=graph_records,
+                authority_root=root,
+            )
+            if reason is not None:
+                reasons[rowid] = reason
+
+        # A replacement generation cannot bootstrap an approver or become a
+        # usable predecessor when the authorization which names it failed.
+        for rowid, _, record in candidates:
+            if record["schema"] != "identity-generation" or reasons[rowid] is not None:
+                continue
+            payload = record.get("payload", {})
+            identity = payload.get("identity") if isinstance(payload, dict) else None
+            generation = payload.get("generation") if isinstance(payload, dict) else None
+            if not isinstance(generation, int) or generation <= 1:
+                continue
+            authorization_row = next((candidate for candidate in candidates
+                                      if candidate[2]["schema"] == "recovery-authorization"
+                                      and candidate[2].get("payload", {}).get("identity") == identity
+                                      and candidate[2].get("payload", {}).get("newGeneration") == generation), None)
+            if authorization_row is None or reasons[authorization_row[0]] is not None:
+                reasons[rowid] = "missing-recovery-authorization"
+
         # Authority is a prerequisite for graph evidence. In particular, an
         # unauthorized reverse edge must not turn an otherwise valid path into
         # a cycle. Genuine cycles among authorized, active parent edges remain
