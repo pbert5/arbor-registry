@@ -14,6 +14,12 @@ The pipeline is intentionally explicit:
 raw transport -> envelope validation -> accepted history -> materialized state
 ```
 
+Reconciliation consumes the complete retained record set. Its conflict,
+revocation, lineage, authority, graph, capability, quarantine, and projection
+outputs are canonicalized independently of transport arrival order. The
+runtime invokes this bounded reconciliation pass after each ingestion batch;
+providers remain append/fetch-only and do not perform authorization.
+
 `makeTransport` is a deterministic in-process fixture for tests and snapshots.
 It is only an append/fetch fixture. The runtime adapter uses Ed25519 signatures
 and an append-only local provider. `OrbitDBProvider` is an optional,

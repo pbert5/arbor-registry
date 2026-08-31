@@ -62,6 +62,10 @@
           inherit registry;
           pkgs = import nixpkgs { inherit system; };
         };
+        deterministic-reconciliation = import ./tests/deterministic-reconciliation.nix {
+          inherit registry;
+          pkgs = import nixpkgs { inherit system; };
+        };
         recovery = import ./tests/recovery.nix {
           inherit registry;
           pkgs = import nixpkgs { inherit system; };
