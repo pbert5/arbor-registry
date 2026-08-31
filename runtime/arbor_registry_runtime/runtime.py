@@ -193,6 +193,34 @@ def approve_enrollment(
     return {**unsigned, "signature": authority_key.sign(unsigned)}
 
 
+def make_local_genesis(
+    node_key: RuntimeKey,
+    identity: str,
+    domain: str,
+    *,
+    platform: str = "unknown",
+) -> dict[str, Any]:
+    """Build the single generation-one, self-authorized local identity record."""
+    if (not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", identity)
+            or node_key.issuer != identity):
+        raise ValueError("local genesis identity does not match the runtime-held key")
+    if not isinstance(domain, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", domain):
+        raise ValueError("local genesis domain is invalid")
+    if not isinstance(platform, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", platform):
+        raise ValueError("platform is invalid")
+    unsigned = {
+        "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1, "recordVersion": 1,
+        "recordId": identity, "generation": 1, "predecessor": None,
+        "issuer": identity, "schema": "node-identity",
+        "payload": {
+            "identity": identity, "publicKey": node_key.public_key, "domain": domain,
+            "platform": platform, "genesis": True, "approvedBy": identity,
+            "authorityRoot": identity,
+        },
+    }
+    return {**unsigned, "signature": node_key.sign(unsigned)}
+
+
 def make_lifecycle_record(
     issuer_key: RuntimeKey,
     schema: str,
@@ -562,11 +590,15 @@ class Runtime:
         authority_issuers: set[str] | None = None,
         approver_roles: dict[str, set[str]] | None = None,
         recovery_thresholds: dict[str, int] | None = None,
+        node_key: RuntimeKey | None = None,
     ):
         self.state_dir = Path(state_dir)
         _secure_directory(self.state_dir)
         self.provider = provider
         self.public_keys = dict(public_keys)
+        self.node_key = node_key
+        if node_key is not None:
+            self.public_keys.setdefault(node_key.issuer, node_key.public_key)
         self.authority_issuers = set(authority_issuers) if authority_issuers is not None else (
             {"root"} if "root" in self.public_keys else set()
         )
@@ -590,11 +622,58 @@ class Runtime:
           CREATE TABLE IF NOT EXISTS projection (
             record_id TEXT PRIMARY KEY, schema TEXT NOT NULL, payload TEXT NOT NULL, generation INTEGER NOT NULL
           );
+          CREATE TABLE IF NOT EXISTS local_genesis (
+            identity TEXT PRIMARY KEY, domain TEXT NOT NULL, public_key TEXT NOT NULL,
+            record_digest TEXT NOT NULL
+          );
         """)
+        self.local_authorities: dict[str, tuple[str, str]] = {
+            identity: (domain, public_key)
+            for identity, domain, public_key in self.db.execute(
+                "SELECT identity, domain, public_key FROM local_genesis"
+            )
+        }
+        for identity, (domain, public_key) in self.local_authorities.items():
+            if self.node_key is not None and self.node_key.issuer == identity and self.node_key.public_key != public_key:
+                raise ValueError("runtime-held node key conflicts with persisted local genesis")
+            self.public_keys.setdefault(identity, public_key)
+            self.authority_issuers.add(identity)
         self.db.commit()
 
     def close(self) -> None:
         self.db.close()
+
+    def local_genesis(self, identity: str, domain: str, *, platform: str = "unknown") -> dict[str, Any]:
+        """Perform the explicitly bounded local-genesis operation.
+
+        The key is supplied at construction and remains in the process. Only
+        public metadata and the signed, ordinary node-identity record persist.
+        """
+        if self.node_key is None:
+            raise ValueError("local genesis requires a runtime-held node key")
+        if identity != self.node_key.issuer:
+            raise ValueError("local genesis identity is foreign to the runtime-held key")
+        record = make_local_genesis(self.node_key, identity, domain, platform=platform)
+        digest = _digest(record)
+        existing = self.local_authorities.get(identity)
+        if existing is not None:
+            if existing != (domain, self.node_key.public_key):
+                raise ValueError("conflicting second local genesis")
+            stored_digest = self.db.execute(
+                "SELECT record_digest FROM local_genesis WHERE identity = ?", (identity,)
+            ).fetchone()[0]
+            if stored_digest != digest:
+                raise ValueError("local genesis state differs from persisted state")
+        else:
+            self.db.execute(
+                "INSERT INTO local_genesis VALUES (?, ?, ?, ?)",
+                (identity, domain, self.node_key.public_key, digest),
+            )
+            self.local_authorities[identity] = (domain, self.node_key.public_key)
+            self.public_keys[identity] = self.node_key.public_key
+            self.authority_issuers.add(identity)
+            self.db.commit()
+        return self.ingest([record])[0]
 
     def _validate(self, record: dict[str, Any]) -> tuple[str, str | None]:
         if isinstance(record, dict) and record.get("quarantined") is True and record.get("reason") == "unsafe-value":
@@ -645,6 +724,12 @@ class Runtime:
         }
         if record["schema"] in sensitive_schemas and record["issuer"] not in self.authority_issuers:
             return "quarantined", "unauthorized-authority"
+        local_scope = self.local_authorities.get(record["issuer"])
+        if local_scope is not None:
+            domain, public_key = local_scope
+            if (payload.get("identity") != record["issuer"] or payload.get("domain") != domain
+                    or payload.get("publicKey") != public_key):
+                return "quarantined", "unauthorized-local-authority-scope"
         authority_root = payload.get("authorityRoot")
         if authority_root is not None and authority_root not in self.authority_issuers:
             return "quarantined", "unauthorized-authority-root"

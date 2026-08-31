@@ -62,6 +62,15 @@ evaluation and must not be committed. `generate_keypair` refuses to replace
 existing active key files; use a numbered `generation` to retain prior keys,
 or explicitly request `rotation=True` for an active-key rotation.
 
+For a deliberately bootstrapped standalone node, construct `Runtime` with its
+runtime-held `node_key` and call `local_genesis(identity, domain)` exactly once.
+This emits the existing generation-one `node-identity` record, self-authorized
+only for that exact identity and domain. The runtime persists only the public
+key, domain, and record digest; repeated identical calls are idempotent and a
+different identity, domain, key, or state is rejected. The ordinary
+`make_enrollment_request` flow remains self-signed proof for external
+authority approval and does not create authority by itself.
+
 ## OpenBao runtime provider
 
 `nixosModules.vault-runtime` starts one `arbor-vault-runtime-<binding>` service

@@ -18,6 +18,7 @@ from arbor_registry_runtime.runtime import (
     make_revocation,
     make_receipt,
     make_enrollment_request,
+    make_local_genesis,
 )
 from arbor_registry_runtime.runtime import _key
 from arbor_registry_runtime.openbao_provider import _json_value
@@ -257,6 +258,42 @@ class RuntimeTests(unittest.TestCase):
             make_receipt(self.key, "node", "digest"),
         ]
         self.assertEqual([item["status"] for item in self.runtime.ingest(records)], ["accepted"] * 3)
+
+    def test_local_genesis_is_explicit_scoped_and_idempotent_across_restart(self):
+        node = RuntimeKey("node", SigningKey.generate())
+        state = Path(self.temp.name) / "genesis-state"
+        raw = FileProvider(Path(self.temp.name) / "genesis-raw" / "history.jsonl")
+        runtime = Runtime(state, raw, {"root": self.key.public_key}, node_key=node)
+        try:
+            outcome = runtime.local_genesis("node", "example.internal", platform="linux")
+            self.assertEqual(outcome["status"], "accepted")
+            self.assertEqual(runtime.projection()["node"]["payload"]["domain"], "example.internal")
+            self.assertNotIn(bytes(node.signing_key).hex(), json.dumps(runtime.projection()))
+            self.assertEqual(runtime.local_genesis("node", "example.internal", platform="linux"), outcome)
+            with self.assertRaises(ValueError):
+                runtime.local_genesis("node", "other.internal", platform="linux")
+            with self.assertRaises(ValueError):
+                runtime.local_genesis("other", "example.internal", platform="linux")
+        finally:
+            runtime.close()
+        restarted = Runtime(state, raw, {"root": self.key.public_key}, node_key=node)
+        try:
+            self.assertEqual(restarted.projection()["node"]["generation"], 1)
+            self.assertEqual(restarted.local_genesis("node", "example.internal", platform="linux")["status"], "accepted")
+        finally:
+            restarted.close()
+
+    def test_local_authority_cannot_escape_its_identity_and_domain(self):
+        node = RuntimeKey("node", SigningKey.generate())
+        runtime = Runtime(Path(self.temp.name) / "scoped-state", FileProvider(Path(self.temp.name) / "scoped-raw" / "history.jsonl"), {}, node_key=node)
+        try:
+            runtime.local_genesis("node", "example.internal")
+            escaped = make_local_genesis(node, "node", "example.internal")
+            escaped["payload"]["identity"] = "foreign"
+            escaped["signature"] = node.sign({key: value for key, value in escaped.items() if key != "signature"})
+            self.assertEqual(runtime.ingest([escaped])[0]["reason"], "unauthorized-local-authority-scope")
+        finally:
+            runtime.close()
 
     def test_active_generation_and_revocation_gate_validation_and_projection(self):
         generation_one = make_identity_generation(self.key, "node", 1, "old-key")
