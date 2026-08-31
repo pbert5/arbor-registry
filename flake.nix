@@ -101,6 +101,10 @@
           module = serviceContractModule;
           pkgs = import nixpkgs { inherit system; };
         };
+        graph-vm = import ./tests/graph-vm.nix {
+          module = serviceContractModule;
+          pkgs = import nixpkgs { inherit system; };
+        };
         vault-upstream = import ./tests/vault-upstream.nix {
           inherit nixpkgs system;
           pkgs = import nixpkgs { inherit system; };
