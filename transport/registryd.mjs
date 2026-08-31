@@ -102,6 +102,7 @@ export class TransportDaemon {
     this.index = { version: 1, streams: Object.fromEntries(this.streams.map(s => [s, []])) }
     this.appendQueue = Promise.resolve()
     this.indexQueue = Promise.resolve()
+    this.replication = Object.fromEntries(this.streams.map(stream => [stream, { joins: 0, updates: 0, leaves: 0 }]))
     this.lockPath = path.join(this.stateDir, 'transport-index.lock')
     this.quarantinePath = path.join(this.stateDir, 'transport-quarantine.jsonl')
     this.bootstrapStatePath = path.join(this.stateDir, 'transport-bootstrap.json')
@@ -172,6 +173,21 @@ export class TransportDaemon {
     if (this.realmId != null) options.AccessController = IPFSAccessController({ write: ['*'] })
     const database = await this.orbitdb.open(this.addresses[stream] ?? name, options)
     this.addresses[stream] = String(database.address); this.databases.set(stream, database)
+    const observation = this.replication[stream] ??= { joins: 0, updates: 0, leaves: 0 }
+    if (database.events?.on) {
+      database.events.on('join', (peerId, heads = []) => {
+        observation.joins++
+        observation.lastJoin = { peerId: String(peerId), heads: Array.isArray(heads) ? heads.length : 0 }
+      })
+      database.events.on('update', entry => {
+        observation.updates++
+        observation.lastUpdate = { hash: typeof entry?.hash === 'string' ? entry.hash : null }
+      })
+      database.events.on('leave', peerId => {
+        observation.leaves++
+        observation.lastLeave = { peerId: String(peerId) }
+      })
+    }
     if (this.realmId) await fs.writeFile(this.bootstrapStatePath, `${JSON.stringify({ realmId: this.realmId, protocolEpoch: this.protocolEpoch, databaseAddresses: this.addresses })}\n`, { mode: 0o600 })
     return database
   }
@@ -415,6 +431,7 @@ export class TransportDaemon {
         listenMultiaddrs: this.libp2p.getMultiaddrs().map(String),
         connectedPeers: this.libp2p.getConnections().map(connection => connection.remotePeer.toString()),
         bootstrapPeers: this.bootstrapPeers.map(String),
+        replication: this.replication,
       })
       if (request.operation === 'append') return reply(true, await this.append(request.stream, request.event))
       if (request.operation === 'list') return reply(true, await this.list(request.stream, request.cursor ?? 'v2:begin', request.limit ?? 100))

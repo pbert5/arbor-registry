@@ -62,6 +62,19 @@ async function waitForRecords(socketPath, ids) {
   throw new Error(`records did not arrive at ${socketPath}: ${ids.join(', ')}`)
 }
 
+async function waitForSemanticReplication(socketPath, ids, predicate) {
+  let evidence
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const status = await request(socketPath, { operation: 'status' })
+    const page = await request(socketPath, { operation: 'list', stream: 'registry', cursor: 'v1:0', limit: 20 })
+    evidence = { status, page }
+    const records = page.ok ? page.records.map(item => item.event) : []
+    if (ids.every(id => records.some(event => event.recordId === id)) && predicate(status, records)) return evidence
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  throw new Error(`semantic replication did not converge: ${JSON.stringify(evidence)}`)
+}
+
 test('separate daemon processes preserve the typed append/list transport', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-'))
   const socketPath = path.join(root, 'registry.sock')
@@ -190,6 +203,52 @@ test('two daemons replicate an OrbitDB event over a bootstrapped libp2p peer', a
     await stop(second)
     await stop(first)
     await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('two peers converge through join/update evidence across partition and restart', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-acceptance-'))
+  const portA = await freeTcpPort(); const portB = await freeTcpPort()
+  const stateA = path.join(root, 'a'); const stateB = path.join(root, 'b')
+  const socketA = path.join(root, 'a.sock'); const socketB = path.join(root, 'b.sock')
+  const base = { ...process.env, ARBOR_REGISTRY_SOCKET_TOKEN: 'test-token', ARBOR_REGISTRY_REALM_ID: 'acceptance-realm' }
+  let first; let second
+  const envFor = (stateDir, socketPath, port, peerId) => ({
+    ...base,
+    ARBOR_REGISTRY_STATE_DIR: stateDir,
+    ARBOR_REGISTRY_SOCKET: socketPath,
+    ARBOR_REGISTRY_LISTEN: `/ip4/127.0.0.1/tcp/${port}`,
+    ...(peerId ? { ARBOR_REGISTRY_BOOTSTRAP_PEERS: `/ip4/127.0.0.1/tcp/${portA}/p2p/${peerId}` } : {}),
+  })
+  const start = (stateDir, socketPath, port, peerId) => spawn(process.execPath, [daemon], { env: envFor(stateDir, socketPath, port, peerId), stdio: ['ignore', 'ignore', 'pipe'] })
+  const stop = async child => {
+    if (!child || child.exitCode !== null) return
+    child.kill('SIGTERM'); await new Promise(resolve => child.once('exit', resolve))
+  }
+  try {
+    first = start(stateA, socketA, portA); await waitForStatus(socketA)
+    const firstStatus = await request(socketA, { operation: 'status' })
+    second = start(stateB, socketB, portB, firstStatus.peerId); const secondStatus = await waitForStatus(socketB)
+
+    const fromA = { recordId: 'acceptance-a', recordVersion: 1, payload: { source: 'a' } }
+    const fromB = { recordId: 'acceptance-b', recordVersion: 1, payload: { source: 'b' } }
+    const partitioned = { recordId: 'acceptance-partition', recordVersion: 1, payload: { source: 'partition' } }
+    assert.equal((await request(socketA, { operation: 'append', stream: 'registry', event: fromA })).ok, true)
+    await waitForSemanticReplication(socketB, ['acceptance-a'], status => status.replication.registry.joins > 0 && status.replication.registry.updates > 0)
+    assert.equal((await request(socketB, { operation: 'append', stream: 'registry', event: fromB })).ok, true)
+    await waitForSemanticReplication(socketA, ['acceptance-b'], status => status.replication.registry.joins > 0 && status.replication.registry.updates > 0)
+
+    await stop(second)
+    assert.equal((await request(socketA, { operation: 'append', stream: 'registry', event: partitioned })).ok, true)
+    second = start(stateB, socketB, portB, firstStatus.peerId); await waitForStatus(socketB)
+    const replay = await waitForSemanticReplication(socketB, ['acceptance-a', 'acceptance-b', 'acceptance-partition'], status => status.replication.registry.joins > 0 && status.replication.registry.updates > 0)
+    assert.equal(replay.status.peerId, secondStatus.peerId, 'restart should retain the transport identity')
+
+    const afterRestart = { recordId: 'acceptance-after-restart', recordVersion: 1, payload: { source: 'a-after-restart' } }
+    assert.equal((await request(socketA, { operation: 'append', stream: 'registry', event: afterRestart })).ok, true)
+    await waitForSemanticReplication(socketB, ['acceptance-after-restart'], status => status.replication.registry.updates > 0)
+  } finally {
+    await stop(second); await stop(first); await fs.rm(root, { recursive: true, force: true })
   }
 })
 
