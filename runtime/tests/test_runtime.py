@@ -295,6 +295,52 @@ class RuntimeTests(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_local_genesis_rejects_signed_variants_and_unrelated_self_roots(self):
+        node = RuntimeKey("node", SigningKey.generate())
+        foreign = RuntimeKey("foreign", SigningKey.generate())
+        runtime = Runtime(Path(self.temp.name) / "genesis-variants", FileProvider(Path(self.temp.name) / "genesis-variants-raw" / "history.jsonl"), {}, node_key=node)
+        try:
+            runtime.local_genesis("node", "example.internal")
+            variant = make_local_genesis(node, "node", "example.internal", platform="other")
+            self.assertEqual(runtime.ingest([variant])[0]["reason"], "conflicting-record-key")
+            unrelated = make_local_genesis(foreign, "foreign", "example.internal")
+            runtime.public_keys["foreign"] = foreign.public_key
+            self.assertEqual(runtime.ingest([unrelated])[0]["reason"], "unauthorized-authority")
+        finally:
+            runtime.close()
+
+    def test_lineage_invalid_relationship_cannot_authorize_identity_or_capability(self):
+        child = RuntimeKey("child", SigningKey.generate())
+
+        def signed(key, record_id, issuer, schema, payload, predecessor=None):
+            record = {"protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                      "recordVersion": 1, "recordId": record_id, "generation": 2 if predecessor else 1,
+                      "predecessor": predecessor, "issuer": issuer, "schema": schema, "payload": payload}
+            record["signature"] = key.sign(record)
+            return record
+
+        self.runtime.public_keys["child"] = child.public_key
+        forged_edge = signed(self.key, "forged-edge", "root", "relationship", {
+            "relationshipId": "forged-edge", "from": "root", "to": "child",
+            "kind": "parent", "status": "active", "authorityRoot": "root",
+        }, predecessor="missing")
+        identity = signed(child, "child", "child", "node-identity", {"id": "child", "authorityRoot": "root"})
+        self.assertEqual(self.runtime.ingest([forged_edge, identity])[-1]["reason"], "unauthorized-authority")
+
+    def test_capability_delegation_requires_active_issuer_subject_edge(self):
+        child = RuntimeKey("child", SigningKey.generate())
+        self.runtime.public_keys["child"] = child.public_key
+
+        def signed(key, record_id, issuer, payload):
+            record = {"protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                      "recordVersion": 1, "recordId": record_id, "generation": 1,
+                      "predecessor": None, "issuer": issuer, "schema": "capability", "payload": payload}
+            record["signature"] = key.sign(record)
+            return record
+
+        grant = signed(child, "grant", "child", {"subject": "grandchild", "authorityRoot": "root", "capabilities": ["observe"]})
+        self.assertEqual(self.runtime.ingest([grant])[0]["reason"], "unauthorized-capability")
+
     def test_authority_is_graph_derived_and_roots_compose(self):
         child = RuntimeKey("child", SigningKey.generate())
         foreign = RuntimeKey("foreign", SigningKey.generate())

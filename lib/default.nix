@@ -595,6 +595,15 @@ let
       authorizedIssuers,
     }:
     let
+      isSelfGenesis =
+        record:
+        record.schema == "node-identity"
+        && record.issuer == rootOf record
+        && record.generation == 1
+        && record.predecessor == null
+        && (get "genesis" false record.payload)
+        && get "identity" null record.payload == record.issuer
+        && get "approvedBy" null record.payload == record.issuer;
       relationshipPayloadOK =
         record:
         isAttrs record.payload
@@ -616,6 +625,11 @@ let
         && isList (get "capabilities" [ ] record.payload)
         && lib.all isString (get "capabilities" [ ] record.payload);
       rootOf = record: get "authorityRoot" (get "issuer" null record) record.payload;
+      rootEstablished =
+        accepted: root:
+        (authorizedIssuers != null && elem root authorizedIssuers)
+        || (authorizedIssuers == null && root == "root")
+        || lib.any (record: isSelfGenesis record && rootOf record == root) accepted;
       issuerHasPath =
         accepted: record: root:
         let
@@ -625,7 +639,7 @@ let
             map (edge: edge.to) (
               filter (
                 edge:
-                (edgeActive edge || record.schema == "node-identity")
+                edgeActive edge
                 && edgeKind edge == "parent"
                 && edge.from == node
                 && get "authorityRoot" root edge == root
@@ -665,7 +679,7 @@ let
           && relationshipIssuerOK record
           && isString record.issuer
           && isString root
-          && (authorizedIssuers == null || elem root authorizedIssuers)
+          && (rootEstablished accepted root || isSelfGenesis record)
           && issuerHasPath accepted record root
         else if record.schema == "capability" then
           let
@@ -675,8 +689,19 @@ let
           in
           capabilityPayloadOK record
           && isString record.issuer
-          && (authorizedIssuers == null || elem root authorizedIssuers)
+          && (rootEstablished accepted root || isSelfGenesis record)
           && issuerHasPath accepted record root
+          && (
+            record.issuer == root
+            || lib.any (
+              edge:
+              edgeActive edge
+              && edgeKind edge == "parent"
+              && edge.from == record.issuer
+              && edge.to == record.payload.subject
+              && get "authorityRoot" root edge == root
+            ) (relationshipRecords accepted)
+          )
           && (record.issuer == root || lib.all (capability: elem capability inherited) requested)
         else
           let
@@ -694,7 +719,7 @@ let
           || (
             isString record.issuer
             && isString root
-            && (authorizedIssuers == null || elem root authorizedIssuers)
+            && (rootEstablished accepted root || isSelfGenesis record)
             && issuerHasPath accepted record root
           );
       resolve =

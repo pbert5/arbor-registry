@@ -138,6 +138,21 @@ let
     (relationship "b" "two" "one" "parent" "active")
   ];
   selfCycle = [ (relationship "self" "one" "one" "parent" "active") ];
+  inactiveCycle = [
+    (relationship "inactive-a" "one" "two" "parent" "suspended")
+    (relationship "inactive-b" "two" "one" "parent" "suspended")
+  ];
+  omittedForeignRoot = registry.makeEnvelope childSigner {
+    recordId = "foreign-root";
+    generation = 1;
+    issuer = "child";
+    subject = "foreign-root";
+    schema = "node-identity";
+    payload = {
+      identity = "foreign-root";
+      authorityRoot = "child";
+    };
+  };
   oldIdentity = record {
     schema = "node-identity";
     generation = 1;
@@ -541,6 +556,16 @@ assert
     "one"
     "two"
   ];
+assert
+  (registry.reconcile {
+    raw = inactiveCycle;
+    signers.root = signer;
+  }).accepted == inactiveCycle;
+assert
+  (registry.reconcile {
+    raw = [ omittedForeignRoot ];
+    signers.child = childSigner;
+  }).accepted == [ ];
 assert
   (registry.reconcile {
     raw = [

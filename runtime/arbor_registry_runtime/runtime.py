@@ -675,6 +675,30 @@ class Runtime:
             self.db.commit()
         return self.ingest([record])[0]
 
+    def _is_exact_local_genesis(self, record: dict[str, Any]) -> bool:
+        """Whether a record is the exact persisted local root assertion."""
+        identity = record.get("issuer")
+        stored = self.local_authorities.get(identity)
+        if stored is None or record.get("schema") != "node-identity":
+            return False
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            return False
+        domain, public_key = stored
+        return (
+            record.get("recordId") == identity and record.get("generation") == 1
+            and record.get("predecessor") is None
+            and payload.get("identity") == identity
+            and payload.get("publicKey") == public_key
+            and payload.get("domain") == domain
+            and payload.get("genesis") is True
+            and payload.get("approvedBy") == identity
+            and payload.get("authorityRoot") == identity
+            and self.db.execute(
+                "SELECT record_digest FROM local_genesis WHERE identity = ?", (identity,)
+            ).fetchone() == (_digest(record),)
+        )
+
     _SENSITIVE_SCHEMAS = {
         "node-identity", "identity-generation", "enrollment", "revocation",
         "recovery-authorization", "receipt", "relationship", "capability",
@@ -690,7 +714,9 @@ class Runtime:
         return (payload["from"], payload["to"], payload.get("kind", "peer"),
                 payload.get("authorityRoot", record.get("issuer", "")))
 
-    def _authority_boundary(self, records: list[dict[str, Any]]) -> dict[int, str]:
+    def _authority_boundary(
+        self, records: list[dict[str, Any]], historical_identities: set[str] | None = None,
+    ) -> dict[int, str]:
         """Return record indexes whose authority is not graph-derived.
 
         ``authority_issuers`` identifies local roots and recovery principals;
@@ -699,6 +725,7 @@ class Runtime:
         """
         accepted: list[dict[str, Any]] = []
         rejected: dict[int, str] = {}
+        historical_identities = historical_identities or set()
 
         def root_of(record: dict[str, Any]) -> str:
             payload = record.get("payload", {})
@@ -733,6 +760,18 @@ class Runtime:
             root = root_of(record)
             if not isinstance(root, str) or root not in self.authority_issuers:
                 return False
+            root_genesis = any(
+                candidate.get("issuer") == root and self._is_exact_local_genesis(candidate)
+                for candidate in accepted
+            )
+            explicit_root = root in self.authority_issuers and root not in self.local_authorities
+            if record.get("issuer") == root:
+                if root in self.local_authorities and not self._is_exact_local_genesis(record):
+                    return False
+                if root not in self.local_authorities and not explicit_root and not root_genesis:
+                    return False
+            elif not explicit_root and not root_genesis:
+                return False
             if record.get("schema") in {"relationship", "peer-relationship"}:
                 edge = self._edge(record)
                 if edge is None or issuer not in {root, edge[0]}:
@@ -748,13 +787,34 @@ class Runtime:
                         and self._edge(candidate)[2] == "parent"
                         and self._edge(candidate)[3] == root)
                 ]
-                if issuer != root and not any(self._edge(edge)[1] == issuer for edge in identity_edges):
+                exact_historical = _digest(record) in historical_identities
+                has_active_identity_edge = any(
+                    self._edge(edge)[1] == issuer
+                    and self._edge(edge)[3] == root
+                    and edge.get("payload", {}).get("status") == "active"
+                    for edge in identity_edges
+                )
+                has_historical_identity_edge = any(
+                    self._edge(edge)[1] == issuer and self._edge(edge)[3] == root
+                    for edge in identity_edges
+                )
+                if issuer != root and not has_active_identity_edge and not (
+                    exact_historical and has_historical_identity_edge
+                ):
                     return False
             elif not reachable(issuer, root):
                 return False
             if record.get("schema") == "capability" and issuer != root:
                 payload = record.get("payload", {})
                 requested = payload.get("capabilities", []) if isinstance(payload, dict) else []
+                if not any(
+                    (edge := self._edge(candidate)) is not None
+                    and edge[0] == issuer and edge[1] == payload.get("subject")
+                    and edge[2] == "parent" and edge[3] == root
+                    and candidate.get("payload", {}).get("status") == "active"
+                    for candidate in accepted
+                ):
+                    return False
                 inherited = {
                     capability
                     for grant in accepted
@@ -997,16 +1057,6 @@ class Runtime:
                     if reasons[rowid] is None:
                         reasons[rowid] = "conflicting-record-key"
         candidates = [entry for entry in valid if reasons[entry[0]] is None]
-        cycle_indexes = self._cycle_indexes([record for _, _, record in candidates])
-        for candidate_index, (rowid, _, _) in enumerate(candidates):
-            if candidate_index in cycle_indexes:
-                reasons[rowid] = "parent-cycle"
-        candidates = [entry for entry in candidates if reasons[entry[0]] is None]
-        authority_rejected = self._authority_boundary([record for _, _, record in candidates])
-        for candidate_index, (rowid, _, _) in enumerate(candidates):
-            if candidate_index in authority_rejected:
-                reasons[rowid] = authority_rejected[candidate_index]
-        candidates = [entry for entry in candidates if reasons[entry[0]] is None]
         # Lifecycle records form a small, signed state machine layered over
         # ordinary lineage.  A revocation is authoritative for every record
         # carrying the same identity/generation, including materialization.
@@ -1105,6 +1155,29 @@ class Runtime:
             if not ((record["generation"] == 1 and predecessor is None)
                     or (predecessor, record["generation"] - 1) in available):
                 reasons[rowid] = "missing-predecessor"
+
+        # Only lineage-valid records may provide graph evidence.  This also
+        # keeps forged/forked relationships from authorizing other records.
+        candidates = [entry for entry in candidates if reasons[entry[0]] is None]
+        cycle_indexes = self._cycle_indexes([record for _, _, record in candidates])
+        for candidate_index, (rowid, _, _) in enumerate(candidates):
+            if candidate_index in cycle_indexes:
+                reasons[rowid] = "parent-cycle"
+        candidates = [entry for entry in candidates if reasons[entry[0]] is None]
+        historical_identities = {
+            _digest(json.loads(raw))
+            for (raw,) in self.db.execute(
+                "SELECT envelope FROM records WHERE status = 'accepted'"
+            )
+            if json.loads(raw).get("schema") == "node-identity"
+        }
+        authority_rejected = self._authority_boundary(
+            [record for _, _, record in candidates], historical_identities
+        )
+        for candidate_index, (rowid, _, _) in enumerate(candidates):
+            if candidate_index in authority_rejected:
+                reasons[rowid] = authority_rejected[candidate_index]
+        candidates = [entry for entry in candidates if reasons[entry[0]] is None]
         with self.db:
             for rowid, _, _, _, _, _ in rows:
                 status = "accepted" if reasons[rowid] is None else "quarantined"
