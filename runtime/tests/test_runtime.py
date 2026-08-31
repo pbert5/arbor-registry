@@ -84,6 +84,90 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             provider.fetch(0, 1001)
 
+    def test_sync_catches_up_and_resumes_from_durable_cursor(self):
+        provider = FileProvider(Path(self.temp.name) / "consumer-raw" / "history.jsonl")
+        state = Path(self.temp.name) / "consumer-state"
+        first, second = self.envelope("consumer-one"), self.envelope("consumer-two")
+        provider.append(first); provider.append(second)
+        runtime = Runtime(state, provider, {"root": self.key.public_key})
+        try:
+            self.assertEqual(runtime.sync(max_pages=1, page_size=1)["records"], 1)
+            self.assertEqual(runtime.status()["providerCursor"], 1)
+            runtime.close()
+            runtime = Runtime(state, provider, {"root": self.key.public_key})
+            self.assertEqual(runtime.sync(page_size=1)["records"], 1)
+            self.assertEqual(runtime.status()["providerCursor"], 2)
+            self.assertEqual(len(runtime.accepted()), 2)
+        finally:
+            runtime.close()
+
+    def test_sync_is_idempotent_and_quarantines_malformed_records(self):
+        provider = FileProvider(Path(self.temp.name) / "malformed-raw" / "history.jsonl")
+        state = Path(self.temp.name) / "malformed-state"
+        provider.append({"not": "an envelope"})
+        provider.append(self.envelope("valid-after-malformed"))
+        runtime = Runtime(state, provider, {"root": self.key.public_key})
+        try:
+            result = runtime.sync(page_size=2)
+            self.assertEqual(result["records"], 2)
+            self.assertEqual(runtime.status()["providerCursor"], 2)
+            self.assertEqual(runtime.quarantine()[0]["reason"], "malformed-record")
+            self.assertEqual(len(runtime.accepted()), 1)
+            self.assertEqual(runtime.sync()["records"], 0)
+            self.assertEqual(len(runtime.accepted()), 1)
+        finally:
+            runtime.close()
+
+    def test_sync_degrades_on_outage_without_losing_accepted_state(self):
+        class OutageProvider(Provider):
+            def __init__(self, record):
+                self.record = record
+                self.failed = False
+
+            def append(self, record):
+                return 0
+
+            def fetch(self, cursor=0, limit=100):
+                if self.failed:
+                    raise OSError("transport unavailable")
+                self.failed = True
+                return [(0, self.record)]
+
+        provider = OutageProvider(self.envelope("outage-record"))
+        runtime = Runtime(Path(self.temp.name) / "outage-state", provider, {"root": self.key.public_key})
+        try:
+            self.assertEqual(runtime.sync()["state"], "idle")
+            self.assertEqual(len(runtime.accepted()), 1)
+            self.assertEqual(runtime.sync()["state"], "degraded")
+            self.assertEqual(len(runtime.accepted()), 1)
+            self.assertEqual(runtime.status()["providerCursor"], 1)
+        finally:
+            runtime.close()
+
+    def test_daemon_exposes_explicit_transport_update_trigger(self):
+        from arbor_registry_runtime.daemon import RegistryServer
+
+        calls = []
+        server = RegistryServer.__new__(RegistryServer)
+        server.token = "x" * 32
+
+        class StubRuntime:
+            def sync(self, **kwargs):
+                calls.append(kwargs)
+                return {"state": "idle", "pages": 1, "records": 1, "lastError": None}
+
+            def status(self):
+                return {"providerCursor": 1, "sync": {"state": "idle"}}
+
+        server.runtime = StubRuntime()
+        result = server.handle({
+            "token": server.token, "operation": "transport-update",
+            "maxPages": 2, "pageSize": 3,
+        })
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls, [{"max_pages": 2, "page_size": 3}])
+        self.assertEqual(result["runtime"]["providerCursor"], 1)
+
     def test_public_state_has_no_private_key_material(self):
         self.runtime.ingest([self.envelope("one")])
         files = list(Path(self.temp.name, "state").rglob("*"))
