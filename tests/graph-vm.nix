@@ -39,7 +39,7 @@ let
         transportListen = [ "/ip4/0.0.0.0/tcp/4001" ];
         socket = "/run/arbor-registry/registry.sock";
         transportSocket = "/run/arbor-registry-transport/transport.sock";
-        tokenFile = "/run/arbor-registry/socket-token";
+        tokenFile = "/run/arbor-test/runtime/socket-token";
         bootstrapAuthoritiesFile = "/run/arbor-test/bootstrap-authorities.json";
         authorityIssuers = [ "root-a" ];
       };
@@ -50,6 +50,10 @@ let
         "arbor-registry-transport.service"
       ];
       systemd.services.arbor-registry.wantedBy = pkgs.lib.mkForce [ ];
+      systemd.tmpfiles.rules = [
+        "d /run/arbor-test 0755 root root -"
+        "d /run/arbor-test/runtime 0750 arbor-registry arbor-registry -"
+      ];
     };
 in
 pkgs.testers.nixosTest {

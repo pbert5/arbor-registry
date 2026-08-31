@@ -1,6 +1,8 @@
 import json
 import sys
 
+TOKEN_FILE = "/run/arbor-test/runtime/socket-token"
+
 sys.path.insert(0, "/run/current-system/sw/lib/python3.14/site-packages")
 
 start_all()
@@ -8,14 +10,14 @@ nodes = (root_a, root_b, child, grandchild)
 def wait_for_health(node):
     node.wait_until_succeeds("python3 -c %r" % (
         "import json,socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/arbor-registry/registry.sock'); "
-        "s.sendall((json.dumps({'operation':'health','token':open('/run/arbor-registry/socket-token').read().strip()})+'\\n').encode()); "
+        f"s.sendall((json.dumps({{'operation':'health','token':open('{TOKEN_FILE}').read().strip()}})+'\\n').encode()); "
         "v=json.loads(s.recv(65536)); assert v.get('ok') is True and v.get('status') == 'ok', v;"
     ), timeout=120)
 
 for node in nodes:
     node.wait_for_unit("arbor-registry-transport.service", timeout=120)
     node.wait_until_succeeds("test -S /run/arbor-registry-transport/transport.sock", timeout=120)
-    node.wait_until_succeeds("test -s /run/arbor-registry/socket-token", timeout=120)
+    node.wait_until_succeeds(f"test -s {TOKEN_FILE}", timeout=120)
 
 root_a.succeed("python3 /etc/arbor-test/graph.py")
 authorities = root_a.succeed("cat /run/arbor-test/bootstrap-authorities.json").strip()
@@ -34,14 +36,14 @@ wait_for_health(root_a)
 
 def request(node, operation, **extra):
     script = ("import json,socket; value=" + repr({"operation": operation, **extra}) + "; "
-              "value['token']=open('/run/arbor-registry/socket-token').read().strip(); "
+              f"value['token']=open('{TOKEN_FILE}').read().strip(); "
               "s=socket.socket(socket.AF_UNIX); s.connect('/run/arbor-registry/registry.sock'); "
               "s.sendall((json.dumps(value)+'\\n').encode()); print(s.recv(1048576).decode())")
     return json.loads(node.succeed("python3 -c %r" % script))
 
 def transport_request(node, operation, **extra):
     script = ("import json,socket; value=" + repr({"operation": operation, **extra}) + "; "
-              "value['token']=open('/run/arbor-registry/socket-token').read().strip(); "
+              f"value['token']=open('{TOKEN_FILE}').read().strip(); "
               "s=socket.socket(socket.AF_UNIX); s.connect('/run/arbor-registry-transport/transport.sock'); "
               "s.sendall((json.dumps(value)+'\\n').encode()); print(s.recv(1048576).decode())")
     return json.loads(node.succeed("python3 -c %r" % script))
@@ -65,7 +67,7 @@ for node in nodes[1:]:
 for node in nodes[1:]:
     node.wait_until_succeeds("python3 -c %r" % (
         "import json,socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/arbor-registry-transport/transport.sock'); "
-        "s.sendall((json.dumps({'operation':'list','stream':'registry','token':open('/run/arbor-registry/socket-token').read().strip()})+'\\n').encode()); "
+        f"s.sendall((json.dumps({{'operation':'list','stream':'registry','token':open('{TOKEN_FILE}').read().strip()}})+'\\n').encode()); "
         "x=json.loads(s.recv(1048576)); assert x.get('ok') and x.get('records')",), timeout=120)
 print("MATRIX cross-node-transport-convergence: PASS")
 
@@ -93,3 +95,4 @@ root_a.wait_until_succeeds("! systemctl is-active --quiet arbor-registry-transpo
 root_a.succeed("systemctl start arbor-registry-transport.service")
 root_a.wait_for_unit("arbor-registry-transport.service", timeout=120)
 print("MATRIX transport-service-failure-recovery: PASS")
+TOKEN_FILE = "/run/arbor-test/runtime/socket-token"
