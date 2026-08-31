@@ -109,6 +109,7 @@ in
         User = "arbor-registry";
         Group = "arbor-registry";
         StateDirectory = cfg.transportStateDirectory;
+        StateDirectoryMode = "0700";
         RuntimeDirectory = [
           "arbor-registry-transport"
           "arbor-registry"
@@ -133,6 +134,7 @@ in
         User = "arbor-registry";
         Group = "arbor-registry";
         StateDirectory = cfg.stateDirectory;
+        StateDirectoryMode = "0700";
         RuntimeDirectory = "arbor-registry";
         Restart = "on-failure";
         RestartSec = 2;
