@@ -2,7 +2,10 @@
 let
   runtime = pkgs.callPackage ../runtime/package.nix { };
   transport = pkgs.callPackage ../transport/package.nix { };
-  python = pkgs.python3.withPackages (ps: [ ps.pynacl ]);
+  python = pkgs.python3.withPackages (ps: [
+    ps.pynacl
+    runtime
+  ]);
   realm = "arbor-graph-acceptance-v1";
   node =
     { hostname, address }:
