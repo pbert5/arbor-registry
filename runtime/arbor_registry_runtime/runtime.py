@@ -1359,9 +1359,20 @@ class Runtime:
             and isinstance(record["payload"].get("identity"), str)
             and isinstance(record["payload"].get("generation"), int)
         }
+        # Keep valid authorization evidence available even if a later
+        # reconciliation marks its approver generation stale.  A recovery
+        # already used to activate a replacement must not disappear merely
+        # because that approver subsequently rotates; the authorization is
+        # itself the durable, signed transition record.
+        valid_authorizations = [
+            (rowid, record_key, record)
+            for rowid, record_key, record in records
+            if isinstance(record, dict) and record.get("schema") == "recovery-authorization"
+            and self._validate(record)[0] == "accepted"
+        ]
         authorizations = {
             (record["payload"]["identity"], record["payload"]["newGeneration"]): record
-            for _, _, record in candidates
+            for _, _, record in valid_authorizations
             if record["schema"] == "recovery-authorization"
             and isinstance(record.get("payload"), dict)
             and isinstance(record["payload"].get("identity"), str)
@@ -1376,15 +1387,6 @@ class Runtime:
                     and payload.get("status", "active") == "active"):
                 identity = payload["identity"]
                 active_generations[identity] = max(active_generations.get(identity, 0), payload["generation"])
-        for rowid, _, record in candidates:
-            if record["schema"] != "recovery-authorization" or reasons[rowid] is not None:
-                continue
-            for approval in record.get("payload", {}).get("approvals", []):
-                approver = approval.get("approver") if isinstance(approval, dict) else None
-                generation = approval.get("approverGeneration") if isinstance(approval, dict) else None
-                if approver not in self.authority_issuers and active_generations.get(approver) != generation:
-                    reasons[rowid] = "stale-approver-generation"
-                    break
         for rowid, _, record in candidates:
             payload = record.get("payload", {})
             identity = payload.get("identity") if isinstance(payload, dict) else None
@@ -1518,7 +1520,8 @@ class Runtime:
                                       if candidate[2]["schema"] == "recovery-authorization"
                                       and candidate[2].get("payload", {}).get("identity") == identity
                                       and candidate[2].get("payload", {}).get("newGeneration") == generation), None)
-            if authorization_row is None or reasons[authorization_row[0]] is not None:
+            if (authorization_row is None
+                    or reasons[authorization_row[0]] not in {None, "stale-approver-generation"}):
                 reasons[rowid] = "missing-recovery-authorization"
 
         # Authority is a prerequisite for graph evidence. In particular, an

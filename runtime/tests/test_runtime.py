@@ -185,6 +185,34 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(private.read_text(), old_private)
         self.assertEqual(public.read_text(), old_public)
 
+    def test_keypair_recovery_rejects_journal_path_escape(self):
+        key_dir = Path(self.temp.name) / "escaped-journal"
+        generate_keypair(key_dir, "operator")
+        journal = key_dir / ".operator.keypair-transaction"
+        journal.write_text(json.dumps({
+            "phase": "prepared",
+            "temporary": {"private": "../outside", "public": ".missing-public"},
+            "destinations": {"private": "operator.private", "public": "operator.public"},
+            "backups": {"private": None, "public": None},
+        }), encoding="ascii")
+        journal.chmod(0o600)
+        with self.assertRaises(RuntimeError):
+            generate_keypair(key_dir, "operator")
+
+    def test_recovery_authorization_rejects_unbound_approval_fields(self):
+        approval = make_recovery_approval(
+            self.key, "node", 1, role="operator", approver_generation=1,
+            new_public_key="replacement", new_generation=2,
+        )
+        approval.pop("proposalDigest")
+        authorization = make_recovery_authorization(
+            self.key, "node", 1, "replacement", [approval],
+        )
+        self.assertEqual(
+            self.runtime.ingest([authorization])[0]["reason"],
+            "invalid-recovery-approval",
+        )
+
     def test_projection_records_require_graph_authority_but_local_domain_is_allowed(self):
         child = RuntimeKey("child", SigningKey.generate())
         self.runtime.public_keys["child"] = child.public_key
@@ -607,7 +635,8 @@ class RuntimeTests(unittest.TestCase):
 
         authorization = make_recovery_authorization(
             self.key, "node", 1, "new-key",
-            [make_recovery_approval(self.key, "node", 1, role="operator", approver_generation=1)],
+            [make_recovery_approval(self.key, "node", 1, role="operator", approver_generation=1,
+                                    new_public_key="new-key", new_generation=2)],
         )
         generation_two = make_identity_generation(
             self.key, "node", 2, "new-key", predecessor="node:1", recovery_authorization=authorization,
@@ -632,7 +661,10 @@ class RuntimeTests(unittest.TestCase):
             operator_generation = make_identity_generation(self.key, "operator", 1, operator.public_key)
             lost = make_identity_generation(self.key, "node", 1, "old-key")
             revoked = make_revocation(self.key, "node", 1, "lost-key")
-            approval = make_recovery_approval(operator, "node", 1, role="operator", approver_generation=1)
+            approval = make_recovery_approval(
+                operator, "node", 1, role="operator", approver_generation=1,
+                new_public_key=replacement.public_key, new_generation=2,
+            )
             authorization = make_recovery_authorization(self.key, "node", 1, replacement.public_key, [approval])
             recovered = make_identity_generation(
                 self.key, "node", 2, replacement.public_key,
@@ -661,17 +693,21 @@ class RuntimeTests(unittest.TestCase):
             runtime.close()
 
     def test_recovery_approvals_are_signed_and_bound_to_lost_generation(self):
-        approval = make_recovery_approval(self.key, "node", 1, role="operator", approver_generation=1)
+        approval = make_recovery_approval(
+            self.key, "node", 1, role="operator", approver_generation=1,
+            new_public_key="new-key", new_generation=2,
+        )
         authorization = make_recovery_authorization(self.key, "node", 1, "new-key", [approval])
         self.assertEqual(self.runtime.ingest([authorization])[0]["status"], "accepted")
         tampered = dict(approval, subject="other")
         bad = make_recovery_authorization(self.key, "other", 1, "new-key", [tampered])
-        self.assertEqual(self.runtime.ingest([bad])[0]["reason"], "invalid-recovery-approval-signature")
+        self.assertEqual(self.runtime.ingest([bad])[0]["reason"], "unbound-recovery-approval")
 
     def test_lifecycle_families_require_shapes_and_recovery_provenance(self):
         identity = make_identity_generation(self.key, "node", 1, self.key.public_key)
         approval = make_recovery_approval(
             self.key, "node", 1, role="operator", approver_generation=1,
+            new_public_key=self.key.public_key, new_generation=2,
         )
         authorization = make_recovery_authorization(
             self.key, "node", 1, self.key.public_key, [approval],
@@ -692,7 +728,10 @@ class RuntimeTests(unittest.TestCase):
 
     def test_recovery_generation_must_use_authorized_replacement_key(self):
         identity = make_identity_generation(self.key, "node", 1, self.key.public_key)
-        approval = make_recovery_approval(self.key, "node", 1, role="operator", approver_generation=1)
+        approval = make_recovery_approval(
+            self.key, "node", 1, role="operator", approver_generation=1,
+            new_public_key="authorized-key", new_generation=2,
+        )
         authorization = make_recovery_authorization(self.key, "node", 1, "authorized-key", [approval])
         replacement = make_identity_generation(
             self.key, "node", 2, "different-key", predecessor="node:1",
