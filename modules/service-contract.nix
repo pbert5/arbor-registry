@@ -1,4 +1,9 @@
-{ config, lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 let
   cfg = config.cluster.registry.runtime;
   tokenInit = pkgs.writeShellScript "arbor-registry-token-init" ''
@@ -9,15 +14,15 @@ let
     fi
   '';
   readyProbe = pkgs.writeShellScript "arbor-registry-ready" ''
-    set -eu
-    token=$(${pkgs.coreutils}/bin/cat ${lib.escapeShellArg cfg.tokenFile})
-    ${pkgs.python3}/bin/python3 -c '
-import json, socket, sys
-s = socket.socket(socket.AF_UNIX); s.settimeout(1); s.connect(sys.argv[1])
-s.sendall((json.dumps({"operation":"health","token":sys.argv[2]}) + "\\n").encode())
-v = json.loads(s.recv(65536)); s.close()
-raise SystemExit(0 if v.get("ok") is True and v.get("status") == "ok" else 1)
-' ${lib.escapeShellArg cfg.socket} "$token"
+        set -eu
+        token=$(${pkgs.coreutils}/bin/cat ${lib.escapeShellArg cfg.tokenFile})
+        ${pkgs.python3}/bin/python3 -c '
+    import json, socket, sys
+    s = socket.socket(socket.AF_UNIX); s.settimeout(1); s.connect(sys.argv[1])
+    s.sendall((json.dumps({"operation":"health","token":sys.argv[2]}) + "\\n").encode())
+    v = json.loads(s.recv(65536)); s.close()
+    raise SystemExit(0 if v.get("ok") is True and v.get("status") == "ok" else 1)
+    ' ${lib.escapeShellArg cfg.socket} "$token"
   '';
   serviceState = name: ''
     enabled=0; running=0
@@ -42,33 +47,78 @@ in
 {
   options.cluster.registry.runtime = {
     enable = lib.mkEnableOption "the Arbor participant runtime";
-    registryService = lib.mkOption { type = lib.types.str; default = "arbor-registry.service"; };
-    transportService = lib.mkOption { type = lib.types.str; default = "arbor-registry-transport.service"; };
-    statusPath = lib.mkOption { type = lib.types.str; default = "/run/arbor/doctor/status.json"; };
-    stateDirectory = lib.mkOption { type = lib.types.str; default = "arbor-registry"; };
-    transportStateDirectory = lib.mkOption { type = lib.types.str; default = "arbor-registry-transport"; };
-    socket = lib.mkOption { type = lib.types.str; default = "/run/arbor-registry/registry.sock"; };
-    transportSocket = lib.mkOption { type = lib.types.str; default = "/run/arbor-registry-transport/transport.sock"; };
-    tokenFile = lib.mkOption { type = lib.types.str; default = "/run/arbor-registry/socket-token"; };
-    runtimePackage = lib.mkOption { type = lib.types.package; default = pkgs.callPackage ../runtime/package.nix { }; };
-    transportPackage = lib.mkOption { type = lib.types.package; default = pkgs.callPackage ../transport/package.nix { }; };
+    registryService = lib.mkOption {
+      type = lib.types.str;
+      default = "arbor-registry.service";
+    };
+    transportService = lib.mkOption {
+      type = lib.types.str;
+      default = "arbor-registry-transport.service";
+    };
+    statusPath = lib.mkOption {
+      type = lib.types.str;
+      default = "/run/arbor/doctor/status.json";
+    };
+    stateDirectory = lib.mkOption {
+      type = lib.types.str;
+      default = "arbor-registry";
+    };
+    transportStateDirectory = lib.mkOption {
+      type = lib.types.str;
+      default = "arbor-registry-transport";
+    };
+    socket = lib.mkOption {
+      type = lib.types.str;
+      default = "/run/arbor-registry/registry.sock";
+    };
+    transportSocket = lib.mkOption {
+      type = lib.types.str;
+      default = "/run/arbor-registry-transport/transport.sock";
+    };
+    tokenFile = lib.mkOption {
+      type = lib.types.str;
+      default = "/run/arbor-registry/socket-token";
+    };
+    runtimePackage = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.callPackage ../runtime/package.nix { };
+    };
+    transportPackage = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.callPackage ../transport/package.nix { };
+    };
   };
   config = lib.mkIf cfg.enable {
     users.groups.arbor-registry = { };
-    users.users.arbor-registry = { isSystemUser = true; group = "arbor-registry"; };
+    users.users.arbor-registry = {
+      isSystemUser = true;
+      group = "arbor-registry";
+    };
     systemd.targets.arbor-participant = {
       description = "Arbor participant runtime services";
       wantedBy = [ "multi-user.target" ];
-      wants = [ "arbor-registry.service" "arbor-registry-transport.service" ];
+      wants = [
+        "arbor-registry.service"
+        "arbor-registry-transport.service"
+      ];
     };
     systemd.services.arbor-registry-transport = {
       wantedBy = [ "arbor-participant.target" ];
       serviceConfig = {
-        Type = "simple"; User = "arbor-registry"; Group = "arbor-registry";
-        StateDirectory = cfg.transportStateDirectory; RuntimeDirectory = "arbor-registry-transport";
-        Restart = "on-failure"; RestartSec = 2; ExecStartPre = tokenInit;
+        Type = "simple";
+        User = "arbor-registry";
+        Group = "arbor-registry";
+        StateDirectory = cfg.transportStateDirectory;
+        RuntimeDirectory = "arbor-registry-transport";
+        Restart = "on-failure";
+        RestartSec = 2;
+        ExecStartPre = tokenInit;
         ExecStart = "${cfg.transportPackage}/bin/arbor-registry-transport";
-        Environment = [ "ARBOR_REGISTRY_STATE_DIR=/var/lib/${cfg.transportStateDirectory}" "ARBOR_REGISTRY_SOCKET=${cfg.transportSocket}" "ARBOR_REGISTRY_SOCKET_TOKEN_FILE=${cfg.tokenFile}" ];
+        Environment = [
+          "ARBOR_REGISTRY_STATE_DIR=/var/lib/${cfg.transportStateDirectory}"
+          "ARBOR_REGISTRY_SOCKET=${cfg.transportSocket}"
+          "ARBOR_REGISTRY_SOCKET_TOKEN_FILE=${cfg.tokenFile}"
+        ];
       };
     };
     systemd.services.arbor-registry = {
@@ -76,17 +126,41 @@ in
       after = [ "arbor-registry-transport.service" ];
       requires = [ "arbor-registry-transport.service" ];
       serviceConfig = {
-        Type = "simple"; User = "arbor-registry"; Group = "arbor-registry";
-        StateDirectory = cfg.stateDirectory; RuntimeDirectory = "arbor-registry";
-        Restart = "on-failure"; RestartSec = 2;
+        Type = "simple";
+        User = "arbor-registry";
+        Group = "arbor-registry";
+        StateDirectory = cfg.stateDirectory;
+        RuntimeDirectory = "arbor-registry";
+        Restart = "on-failure";
+        RestartSec = 2;
         ExecStart = "${cfg.runtimePackage}/bin/arbor-registryd --config=/etc/arbor-registry/config.json";
         Environment = [ "ARBOR_REGISTRY_CONFIG=/etc/arbor-registry/config.json" ];
       };
     };
     environment.etc."arbor-registry/config.json".text = builtins.toJSON {
-      stateDir = "/var/lib/${cfg.stateDirectory}"; socket = cfg.socket; transportSocket = cfg.transportSocket; tokenFile = cfg.tokenFile;
+      stateDir = "/var/lib/${cfg.stateDirectory}";
+      socket = cfg.socket;
+      transportSocket = cfg.transportSocket;
+      tokenFile = cfg.tokenFile;
     };
-    systemd.services.arbor-runtime-status = { wantedBy = [ "arbor-participant.target" ]; after = [ "arbor-registry.service" "arbor-registry-transport.service" ]; serviceConfig = { Type = "oneshot"; ExecStart = statusScript; }; };
-    systemd.timers.arbor-runtime-status = { wantedBy = [ "timers.target" ]; timerConfig = { OnBootSec = "10s"; OnUnitActiveSec = "30s"; Unit = "arbor-runtime-status.service"; }; };
+    systemd.services.arbor-runtime-status = {
+      wantedBy = [ "arbor-participant.target" ];
+      after = [
+        "arbor-registry.service"
+        "arbor-registry-transport.service"
+      ];
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = statusScript;
+      };
+    };
+    systemd.timers.arbor-runtime-status = {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = "10s";
+        OnUnitActiveSec = "30s";
+        Unit = "arbor-runtime-status.service";
+      };
+    };
   };
 }
