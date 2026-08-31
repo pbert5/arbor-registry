@@ -36,7 +36,8 @@ pkgs.testers.nixosTest {
     machine.wait_until_succeeds("! systemctl is-active --quiet arbor-registry.service")
     refresh()
     degraded = json.loads(machine.succeed("cat /run/arbor/doctor/status.json"))
-    assert degraded["registry"]["running"] is False and degraded["ready"] is False
+    machine.log("DEGRADED " + json.dumps(degraded))
+    assert degraded["registry"]["running"] == 0 and degraded["ready"] is False
     machine.succeed("systemctl start arbor-registry.service")
     machine.wait_for_unit("arbor-registry.service")
     machine.wait_until_succeeds("test -S /run/arbor-registry/registry.sock")

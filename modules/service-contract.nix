@@ -138,6 +138,7 @@ in
         RuntimeDirectory = "arbor-registry";
         Restart = "on-failure";
         RestartSec = 2;
+        ExecStartPre = tokenInit;
         ExecStart = "${cfg.runtimePackage}/bin/arbor-registryd --config=/etc/arbor-registry/config.json";
         Environment = [ "ARBOR_REGISTRY_CONFIG=/etc/arbor-registry/config.json" ];
       };
