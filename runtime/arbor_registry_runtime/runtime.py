@@ -951,16 +951,18 @@ class Runtime:
                     for grant in accepted
                     if grant.get("schema") == "capability"
                     and isinstance(grant.get("payload"), dict)
-                    and grant["payload"].get("subject") in {
-                        edge[0] for candidate in accepted
-                        if (edge := self._edge(candidate)) is not None
-                        and edge[1] == payload.get("subject")
-                        and edge[2] == "parent"
-                        and edge[3] == root
-                    }
+                    and grant["payload"].get("subject") == issuer
                     and root_of(grant) == root
                     for capability in grant.get("payload", {}).get("capabilities", [])
                 }
+                inherited.update(
+                    capability
+                    for candidate in accepted
+                    if (edge := self._edge(candidate)) is not None
+                    and edge[1] == issuer and edge[2] == "parent" and edge[3] == root
+                    and candidate.get("payload", {}).get("status") == "active"
+                    for capability in candidate.get("payload", {}).get("scope", [])
+                )
                 if not isinstance(requested, list) or not all(item in inherited for item in requested):
                     return False
             return True
