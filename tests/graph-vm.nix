@@ -39,6 +39,13 @@ let
         bootstrapAuthoritiesFile = "/run/arbor-test/bootstrap-authorities.json";
         authorityIssuers = [ "root-a" ];
       };
+      # The graph test creates the authority key at runtime. Keep the
+      # production target from starting Registry until that public key map
+      # has been installed by the test harness.
+      systemd.targets.arbor-participant.wants = pkgs.lib.mkForce [
+        "arbor-registry-transport.service"
+      ];
+      systemd.services.arbor-registry.wantedBy = pkgs.lib.mkForce [ ];
     };
 in
 pkgs.testers.nixosTest {

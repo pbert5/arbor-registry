@@ -12,7 +12,7 @@ def wait_for_health(node):
 for node in nodes:
     node.wait_for_unit("arbor-registry-transport.service", timeout=120)
     node.wait_until_succeeds("test -S /run/arbor-registry-transport/transport.sock", timeout=120)
-    node.succeed("systemctl stop arbor-registry.service")
+    node.wait_until_succeeds("test -s /run/arbor-registry/socket-token", timeout=120)
 
 root_a.succeed("python3 /etc/arbor-test/graph.py")
 authorities = root_a.succeed("cat /run/arbor-test/bootstrap-authorities.json").strip()

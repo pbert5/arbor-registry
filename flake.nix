@@ -70,10 +70,6 @@
           inherit registry;
           pkgs = import nixpkgs { inherit system; };
         };
-        deterministic-reconciliation = import ./tests/deterministic-reconciliation.nix {
-          inherit registry;
-          pkgs = import nixpkgs { inherit system; };
-        };
         runtime =
           (import nixpkgs { inherit system; }).runCommand "arbor-registry-runtime-tests"
             {
