@@ -60,7 +60,7 @@ for node in nodes[1:]:
     peer = transport_status["peerId"]
     address = transport_status["databaseAddresses"]["registry"]
     node.succeed("mkdir -p /run/systemd/system/arbor-registry-transport.service.d")
-    env = "Environment=ARBOR_REGISTRY_DATABASE_ADDRESSES=%s Environment=ARBOR_REGISTRY_BOOTSTRAP_PEERS=/ip4/10.42.0.10/tcp/4001/p2p/%s" % (address, peer)
+    env = "Environment=ARBOR_REGISTRY_DATABASE_ADDRESSES=%s Environment=ARBOR_REGISTRY_BOOTSTRAP_PEERS=/ip4/10.42.0.10/tcp/4001/p2p/%s" % (json.dumps({"registry": address}), peer)
     node.succeed("printf '%%s\\n' '[Service]' '%s' > /run/systemd/system/arbor-registry-transport.service.d/graph.conf" % env)
     node.succeed("systemctl daemon-reload; systemctl restart arbor-registry-transport.service")
     node.wait_for_unit("arbor-registry-transport.service", timeout=120)
