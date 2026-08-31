@@ -22,8 +22,11 @@ authorities = root_a.succeed("cat /run/arbor-test/bootstrap-authorities.json").s
 for node in nodes:
     node.succeed("mkdir -p /run/arbor-test; printf '%%s\\n' %r > /run/arbor-test/bootstrap-authorities.json" % authorities)
     node.succeed("chmod 0755 /run/arbor-test; chmod 0644 /run/arbor-test/bootstrap-authorities.json")
+    node.succeed("systemctl stop arbor-registry-transport.service")
     node.succeed("systemctl start arbor-registry.service")
     node.wait_for_unit("arbor-registry.service", timeout=120)
+    node.succeed("systemctl start arbor-registry-transport.service")
+    node.wait_for_unit("arbor-registry-transport.service", timeout=120)
     wait_for_health(node)
 root_a.succeed("systemctl restart arbor-registry.service")
 root_a.wait_for_unit("arbor-registry.service", timeout=120)
