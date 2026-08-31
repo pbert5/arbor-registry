@@ -3,6 +3,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -169,6 +171,40 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(calls, [{"max_pages": 2, "page_size": 3}])
         self.assertEqual(result["runtime"]["providerCursor"], 1)
+
+    def test_daemon_sync_worker_triggers_without_rpc(self):
+        from arbor_registry_runtime.daemon import SyncWorker
+
+        called = threading.Event()
+        calls = []
+
+        def sync(**kwargs):
+            calls.append(kwargs)
+            called.set()
+            return {"state": "idle", "pages": 1, "records": 1}
+
+        worker = SyncWorker(sync, interval=60, max_backoff=60, max_pages=2, page_size=3)
+        worker.start()
+        try:
+            self.assertTrue(called.wait(1), "automatic consumer did not run")
+            self.assertEqual(calls, [{"max_pages": 2, "page_size": 3}])
+            deadline = time.monotonic() + 1
+            while worker.status()["state"] != "ok" and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(worker.status()["state"], "ok")
+        finally:
+            worker.stop()
+
+    def test_daemon_sync_worker_stops_cleanly_while_waiting(self):
+        from arbor_registry_runtime.daemon import SyncWorker
+
+        worker = SyncWorker(lambda **_: {"state": "idle"}, interval=60, max_backoff=60,
+                            max_pages=1, page_size=1)
+        worker.start()
+        worker.stop()
+        thread = worker._thread
+        self.assertIsNotNone(thread)
+        self.assertFalse(thread.is_alive())
 
     def test_public_state_has_no_private_key_material(self):
         self.runtime.ingest([self.envelope("one")])
