@@ -80,7 +80,11 @@ let
     "seed"
   ];
   normalizeUnsafeKey = name: lib.replaceStrings [ "_" "-" ] [ "" "" ] (lib.toLower name);
-  unsafeKey = name: elem (normalizeUnsafeKey name) unsafeKeys;
+  unsafeKey =
+    name:
+    let normalized = normalizeUnsafeKey name;
+    in elem normalized unsafeKeys
+      || lib.any (suffix: lib.hasSuffix suffix normalized) [ "secret" "password" "passphrase" "token" "credential" "authorization" "apikey" "accesskey" "privatekey" "signingkey" "seed" ];
   unsafeString =
     value:
     typeOf value == "string"

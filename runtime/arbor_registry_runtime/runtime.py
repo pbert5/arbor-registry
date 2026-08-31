@@ -32,6 +32,12 @@ ProviderCursor: TypeAlias = int | str
 _SECRET_NAMES = {"secret", "clientsecret", "password", "passphrase", "token", "authtoken", "credential", "authorization", "private", "privatekey", "signingkey", "apikey", "accesskey", "accesstoken", "seed"}
 
 
+def _unsafe_key(name: Any) -> bool:
+    normalized = re.sub(r"[-_]", "", str(name)).lower()
+    words = re.findall(r"[a-z]+|[0-9]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", str(name)))
+    return normalized in _SECRET_NAMES or any(word.lower() in _SECRET_NAMES for word in words)
+
+
 def _unsafe_value(value: Any) -> bool:
     if isinstance(value, str):
         return (
@@ -41,7 +47,7 @@ def _unsafe_value(value: Any) -> bool:
         )
     if isinstance(value, dict):
         return any(
-            re.sub(r"[-_]", "", str(key)).lower() in _SECRET_NAMES or _unsafe_value(item)
+            _unsafe_key(key) or _unsafe_value(item)
             for key, item in value.items()
         )
     if isinstance(value, list):
@@ -912,6 +918,12 @@ class Runtime:
             # already established identity. Other sensitive records require
             # an active graph path.
             if record.get("schema") == "node-identity":
+                payload_identity = payload.get("identity") if isinstance(payload, dict) else None
+                # A delegated issuer may assert only its own identity.  A root
+                # may establish a child identity through an approved
+                # enrollment, but that exception must not extend to children.
+                if issuer != root and payload_identity is not None and payload_identity != issuer:
+                    return False
                 identity_edges = [
                     candidate for candidate in accepted
                     if (self._edge(candidate) is not None
@@ -1258,6 +1270,8 @@ class Runtime:
                     payload_digest = payload.get("recoveryAuthorizationDigest")
                     if payload_digest != _digest(authorization):
                         reasons[rowid] = "recovery-provenance-mismatch"
+                    elif payload.get("publicKey") != authorization["payload"].get("newPublicKey"):
+                        reasons[rowid] = "recovery-key-mismatch"
         by_id: dict[str, list[dict[str, Any]]] = {}
         for _, _, record in candidates:
             by_id.setdefault(record["recordId"], []).append(record)

@@ -424,6 +424,23 @@ class RuntimeTests(unittest.TestCase):
         identity = signed(child, "child", "child", "node-identity", {"id": "child", "authorityRoot": "root"})
         self.assertEqual(self.runtime.ingest([forged_edge, identity])[-1]["reason"], "unauthorized-authority")
 
+    def test_delegated_issuer_cannot_claim_a_foreign_node_identity(self):
+        child = RuntimeKey("child", SigningKey.generate())
+        self.runtime.public_keys["child"] = child.public_key
+        edge = self.envelope("root-child", schema="relationship", payload={
+            "relationshipId": "root-child", "from": "root", "to": "child",
+            "kind": "parent", "status": "active", "authorityRoot": "root",
+        })
+        forged = {
+            "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+            "recordVersion": 1, "recordId": "victim", "generation": 1,
+            "predecessor": None, "issuer": "child", "schema": "node-identity",
+            "payload": {"identity": "victim", "publicKey": child.public_key,
+                        "authorityRoot": "root"},
+        }
+        forged["signature"] = child.sign(forged)
+        self.assertEqual(self.runtime.ingest([edge, forged])[-1]["reason"], "unauthorized-authority")
+
     def test_capability_delegation_requires_active_issuer_subject_edge(self):
         child = RuntimeKey("child", SigningKey.generate())
         self.runtime.public_keys["child"] = child.public_key
@@ -672,6 +689,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.projection()["node"]["generation"], 2)
         self.assertEqual(self.runtime.projection()["node"]["payload"]["provenance"],
                          [{"source": "operator", "reason": "lost-key"}])
+
+    def test_recovery_generation_must_use_authorized_replacement_key(self):
+        identity = make_identity_generation(self.key, "node", 1, self.key.public_key)
+        approval = make_recovery_approval(self.key, "node", 1, role="operator", approver_generation=1)
+        authorization = make_recovery_authorization(self.key, "node", 1, "authorized-key", [approval])
+        replacement = make_identity_generation(
+            self.key, "node", 2, "different-key", predecessor="node:1",
+            recovery_authorization=authorization,
+        )
+        self.runtime.ingest([identity, authorization, replacement])
+        self.assertIn("recovery-key-mismatch", {item["reason"] for item in self.runtime.quarantine()})
 
     def test_revoked_generation_cannot_materialize_or_be_rebound_without_signed_approval(self):
         identity = make_identity_generation(self.key, "node", 1, self.key.public_key)
