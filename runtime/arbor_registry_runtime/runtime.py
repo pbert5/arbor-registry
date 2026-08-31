@@ -675,6 +675,144 @@ class Runtime:
             self.db.commit()
         return self.ingest([record])[0]
 
+    _SENSITIVE_SCHEMAS = {
+        "node-identity", "identity-generation", "enrollment", "revocation",
+        "recovery-authorization", "receipt", "relationship", "capability",
+    }
+
+    @staticmethod
+    def _edge(record: dict[str, Any]) -> tuple[str, str, str, str] | None:
+        payload = record.get("payload", {})
+        if (record.get("schema") not in {"relationship", "peer-relationship"}
+                or not isinstance(payload, dict)
+                or not all(isinstance(payload.get(key), str) for key in ("from", "to"))):
+            return None
+        return (payload["from"], payload["to"], payload.get("kind", "peer"),
+                payload.get("authorityRoot", record.get("issuer", "")))
+
+    def _authority_boundary(self, records: list[dict[str, Any]]) -> dict[int, str]:
+        """Return record indexes whose authority is not graph-derived.
+
+        ``authority_issuers`` identifies local roots and recovery principals;
+        it is deliberately not consulted as a global issuer allowlist here.
+        Delegation is only through active parent edges in the same root.
+        """
+        accepted: list[dict[str, Any]] = []
+        rejected: dict[int, str] = {}
+
+        def root_of(record: dict[str, Any]) -> str:
+            payload = record.get("payload", {})
+            return payload.get("authorityRoot", record.get("issuer", "")) if isinstance(payload, dict) else ""
+
+        def reachable(issuer: str, root: str) -> bool:
+            if issuer == root and root in self.authority_issuers:
+                return True
+            frontier = [root]
+            seen: set[str] = set()
+            while frontier:
+                node = frontier.pop(0)
+                if node in seen:
+                    continue
+                seen.add(node)
+                if node == issuer:
+                    return True
+                for candidate in accepted:
+                    edge = self._edge(candidate)
+                    if (edge is not None and edge[0] == node and edge[2] == "parent"
+                            and edge[3] == root
+                            and candidate.get("payload", {}).get("status") == "active"):
+                        frontier.append(edge[1])
+            return False
+
+        def authorized(record: dict[str, Any]) -> bool:
+            issuer = record.get("issuer")
+            if record.get("schema") not in self._SENSITIVE_SCHEMAS:
+                return True
+            if not isinstance(issuer, str):
+                return False
+            root = root_of(record)
+            if not isinstance(root, str) or root not in self.authority_issuers:
+                return False
+            if record.get("schema") in {"relationship", "peer-relationship"}:
+                edge = self._edge(record)
+                if edge is None or issuer not in {root, edge[0]}:
+                    return False
+            # A node identity is durable identity evidence: a severed parent
+            # edge stops delegated authority, but does not erase the child's
+            # already established identity. Other sensitive records require
+            # an active graph path.
+            if record.get("schema") == "node-identity":
+                identity_edges = [
+                    candidate for candidate in accepted
+                    if (self._edge(candidate) is not None
+                        and self._edge(candidate)[2] == "parent"
+                        and self._edge(candidate)[3] == root)
+                ]
+                if issuer != root and not any(self._edge(edge)[1] == issuer for edge in identity_edges):
+                    return False
+            elif not reachable(issuer, root):
+                return False
+            if record.get("schema") == "capability" and issuer != root:
+                payload = record.get("payload", {})
+                requested = payload.get("capabilities", []) if isinstance(payload, dict) else []
+                inherited = {
+                    capability
+                    for grant in accepted
+                    if grant.get("schema") == "capability"
+                    and isinstance(grant.get("payload"), dict)
+                    and grant["payload"].get("subject") in {
+                        edge[0] for candidate in accepted
+                        if (edge := self._edge(candidate)) is not None
+                        and edge[1] == payload.get("subject")
+                        and edge[2] == "parent"
+                        and edge[3] == root
+                    }
+                    and root_of(grant) == root
+                    for capability in grant.get("payload", {}).get("capabilities", [])
+                }
+                if not isinstance(requested, list) or not all(item in inherited for item in requested):
+                    return False
+            return True
+
+        pending = list(enumerate(records))
+        while pending:
+            admitted = [(index, record) for index, record in pending if authorized(record)]
+            if not admitted:
+                break
+            accepted.extend(record for _, record in admitted)
+            admitted_indexes = {index for index, _ in admitted}
+            pending = [(index, record) for index, record in pending if index not in admitted_indexes]
+        for index, record in pending:
+            rejected[index] = "unauthorized-capability" if record.get("schema") == "capability" else (
+                "unauthorized-relationship" if record.get("schema") in {"relationship", "peer-relationship"}
+                else "unauthorized-authority")
+        return rejected
+
+    @classmethod
+    def _cycle_indexes(cls, records: list[dict[str, Any]]) -> set[int]:
+        edges = [(index, cls._edge(record)) for index, record in enumerate(records)]
+        edges = [(index, edge) for index, edge in edges
+                 if edge is not None and edge[2] == "parent"
+                 and records[index].get("payload", {}).get("status") == "active"]
+        adjacency: dict[str, set[str]] = {}
+        for _, (source, target, _, _) in edges:
+            adjacency.setdefault(source, set()).add(target)
+
+        def reaches(source: str, target: str) -> bool:
+            frontier = [source]
+            seen: set[str] = set()
+            while frontier:
+                node = frontier.pop()
+                if node == target:
+                    return True
+                if node in seen:
+                    continue
+                seen.add(node)
+                frontier.extend(adjacency.get(node, ()))
+            return False
+
+        return {index for index, (source, target, _, _) in edges if reaches(target, source)}
+
     def _validate(self, record: dict[str, Any]) -> tuple[str, str | None]:
         if isinstance(record, dict) and record.get("quarantined") is True and record.get("reason") == "unsafe-value":
             return "quarantined", "unsafe-value"
@@ -718,21 +856,12 @@ class Runtime:
         except (KeyError, ValueError, TypeError, binascii.Error, BadSignatureError):
             return "quarantined", "invalid-signature"
         payload = record["payload"]
-        sensitive_schemas = {
-            "node-identity", "identity-generation", "enrollment", "revocation",
-            "recovery-authorization", "receipt", "relationship", "capability",
-        }
-        if record["schema"] in sensitive_schemas and record["issuer"] not in self.authority_issuers:
-            return "quarantined", "unauthorized-authority"
         local_scope = self.local_authorities.get(record["issuer"])
         if local_scope is not None:
             domain, public_key = local_scope
             if (payload.get("identity") != record["issuer"] or payload.get("domain") != domain
                     or payload.get("publicKey") != public_key):
                 return "quarantined", "unauthorized-local-authority-scope"
-        authority_root = payload.get("authorityRoot")
-        if authority_root is not None and authority_root not in self.authority_issuers:
-            return "quarantined", "unauthorized-authority-root"
         if record["schema"] == "enrollment":
             if (not isinstance(payload.get("identity"), str) or not isinstance(payload.get("publicKey"), str)
                     or not isinstance(payload.get("requestDigest"), str)
@@ -868,6 +997,16 @@ class Runtime:
                     if reasons[rowid] is None:
                         reasons[rowid] = "conflicting-record-key"
         candidates = [entry for entry in valid if reasons[entry[0]] is None]
+        cycle_indexes = self._cycle_indexes([record for _, _, record in candidates])
+        for candidate_index, (rowid, _, _) in enumerate(candidates):
+            if candidate_index in cycle_indexes:
+                reasons[rowid] = "parent-cycle"
+        candidates = [entry for entry in candidates if reasons[entry[0]] is None]
+        authority_rejected = self._authority_boundary([record for _, _, record in candidates])
+        for candidate_index, (rowid, _, _) in enumerate(candidates):
+            if candidate_index in authority_rejected:
+                reasons[rowid] = authority_rejected[candidate_index]
+        candidates = [entry for entry in candidates if reasons[entry[0]] is None]
         # Lifecycle records form a small, signed state machine layered over
         # ordinary lineage.  A revocation is authoritative for every record
         # carrying the same identity/generation, including materialization.

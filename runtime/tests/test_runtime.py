@@ -295,6 +295,87 @@ class RuntimeTests(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_authority_is_graph_derived_and_roots_compose(self):
+        child = RuntimeKey("child", SigningKey.generate())
+        foreign = RuntimeKey("foreign", SigningKey.generate())
+
+        def signed(key, record_id, issuer, schema, payload):
+            record = {
+                "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                "recordVersion": 1, "recordId": record_id, "generation": 1,
+                "predecessor": None, "issuer": issuer, "schema": schema,
+                "payload": payload,
+            }
+            record["signature"] = key.sign(record)
+            return record
+
+        parent_edge = signed(self.key, "root-child", "root", "relationship", {
+            "relationshipId": "root-child", "from": "root", "to": "child",
+            "kind": "parent", "status": "active", "authorityRoot": "root",
+        })
+        child_identity = signed(child, "child", "child", "node-identity", {
+            "id": "child", "authorityRoot": "root",
+        })
+        unrelated = signed(foreign, "foreign", "foreign", "node-identity", {
+            "id": "foreign", "authorityRoot": "root",
+        })
+        self.runtime.public_keys.update({"child": child.public_key, "foreign": foreign.public_key})
+        outcomes = self.runtime.ingest([child_identity, unrelated, parent_edge])
+        self.assertEqual(outcomes[0]["status"], "accepted")
+        self.assertEqual(outcomes[1]["reason"], "unauthorized-authority")
+        self.assertIn("child", self.runtime.projection())
+
+        root_grant = signed(self.key, "grant-child", "root", "capability", {
+            "subject": "child", "authorityRoot": "root", "capabilities": ["observe"],
+        })
+        child_edge = signed(child, "child-grandchild", "child", "relationship", {
+            "relationshipId": "child-grandchild", "from": "child", "to": "grandchild",
+            "kind": "parent", "status": "active", "authorityRoot": "root",
+        })
+        amplification = signed(child, "grant-grandchild", "child", "capability", {
+            "subject": "grandchild", "authorityRoot": "root", "capabilities": ["admin"],
+        })
+        self.assertEqual(self.runtime.ingest([root_grant, child_edge, amplification])[-1]["reason"],
+                         "unauthorized-capability")
+
+        root_b = RuntimeKey("root-b", SigningKey.generate())
+        runtime = Runtime(
+            Path(self.temp.name) / "composed-state",
+            FileProvider(Path(self.temp.name) / "composed-raw" / "history.jsonl"),
+            {"root": self.key.public_key, "root-b": root_b.public_key},
+            authority_issuers={"root", "root-b"},
+        )
+        try:
+            root_b_record = signed(root_b, "root-b", "root-b", "node-identity", {"id": "root-b"})
+            self.assertEqual(runtime.ingest([self.envelope("root-a"), root_b_record])[1]["status"], "accepted")
+        finally:
+            runtime.close()
+
+    def test_graph_cycles_are_rejected_after_delegation_resolution(self):
+        a = RuntimeKey("a", SigningKey.generate())
+        b = RuntimeKey("b", SigningKey.generate())
+
+        def edge(key, record_id, issuer, source, target):
+            record = {
+                "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                "recordVersion": 1, "recordId": record_id, "generation": 1,
+                "predecessor": None, "issuer": issuer, "schema": "relationship",
+                "payload": {"relationshipId": record_id, "from": source, "to": target,
+                            "kind": "parent", "status": "active", "authorityRoot": "root"},
+            }
+            record["signature"] = key.sign(record)
+            return record
+
+        self.runtime.public_keys.update({"a": a.public_key, "b": b.public_key})
+        records = [
+            edge(self.key, "root-a", "root", "root", "a"),
+            edge(a, "a-b", "a", "a", "b"),
+            edge(b, "b-a", "b", "b", "a"),
+        ]
+        self.runtime.ingest(records)
+        self.assertEqual([record["recordId"] for record in self.runtime.accepted()], ["root-a"])
+        self.assertEqual({item["reason"] for item in self.runtime.quarantine()}, {"parent-cycle"})
+
     def test_active_generation_and_revocation_gate_validation_and_projection(self):
         generation_one = make_identity_generation(self.key, "node", 1, "old-key")
         generation_two = make_identity_generation(

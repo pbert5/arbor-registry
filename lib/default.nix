@@ -625,7 +625,7 @@ let
             map (edge: edge.to) (
               filter (
                 edge:
-                edgeActive edge
+                (edgeActive edge || record.schema == "node-identity")
                 && edgeKind edge == "parent"
                 && edge.from == node
                 && get "authorityRoot" root edge == root
@@ -679,7 +679,24 @@ let
           && issuerHasPath accepted record root
           && (record.issuer == root || lib.all (capability: elem capability inherited) requested)
         else
-          authorizedIssuers == null || elem record.issuer authorizedIssuers;
+          let
+            sensitive = elem record.schema [
+              "node-identity"
+              "identity-generation"
+              "enrollment"
+              "revocation"
+              "recovery-authorization"
+              "receipt"
+            ];
+            root = rootOf record;
+          in
+          !sensitive
+          || (
+            isString record.issuer
+            && isString root
+            && (authorizedIssuers == null || elem root authorizedIssuers)
+            && issuerHasPath accepted record root
+          );
       resolve =
         accepted: pending:
         let
