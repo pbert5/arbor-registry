@@ -577,7 +577,9 @@ class Runtime:
         self.max_bytes = max_bytes
         self.max_quarantine_records = 10000
         database_path = self.state_dir / "registry.sqlite3"
-        self.db = sqlite3.connect(database_path, timeout=30)
+        # The daemon's consumer runs in its own thread; RegistryServer
+        # serializes access around this connection.
+        self.db = sqlite3.connect(database_path, timeout=30, check_same_thread=False)
         if database_path.exists():
             os.chmod(database_path, 0o600)
         _secure_file(self.state_dir / "registry.sqlite3")
