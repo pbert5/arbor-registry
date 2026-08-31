@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from nacl.signing import SigningKey
@@ -129,6 +130,41 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             generate_keypair(key_dir, "operator", rotation=True)
         self.assertEqual(private.read_text(encoding="ascii"), "old")
+
+    def test_keypair_rotation_recovers_as_a_pair_after_install_failure(self):
+        key_dir = Path(self.temp.name) / "atomic-identity"
+        first = generate_keypair(key_dir, "operator")
+        private = key_dir / "operator.private"
+        public = key_dir / "operator.public"
+        old_private = private.read_text(encoding="ascii")
+        old_public = public.read_text(encoding="ascii")
+
+        import arbor_registry_runtime.runtime as runtime_module
+        original_replace = runtime_module._replace_keypair
+        calls = 0
+
+        def fail_on_second_install(source, destination):
+            nonlocal calls
+            calls += 1
+            if calls == 4:  # two backups, then the private and public installs
+                raise OSError("injected key-pair install failure")
+            return original_replace(source, destination)
+
+        with patch.object(runtime_module, "_replace_keypair", fail_on_second_install):
+            with self.assertRaises(OSError):
+                generate_keypair(key_dir, "operator", rotation=True)
+
+        # Recovery occurs before the next operation and restores the old pair,
+        # rather than leaving a private key paired with a different public key.
+        with self.assertRaises(FileExistsError):
+            generate_keypair(key_dir, "operator")
+        self.assertEqual(old_private, private.read_text(encoding="ascii"))
+        self.assertEqual(old_public, public.read_text(encoding="ascii"))
+        self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(public.stat().st_mode), 0o644)
+        recovered = generate_keypair(key_dir, "operator", rotation=True)
+        self.assertNotEqual(first.public_key, recovered.public_key)
+        self.assertFalse((key_dir / ".operator.keypair-transaction").exists())
 
     def test_orbitdb_provider_maps_bounded_socket_contract(self):
         import socketserver
@@ -437,6 +473,28 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.ingest(records)
         self.assertEqual([record["recordId"] for record in self.runtime.accepted()], ["root-a"])
         self.assertEqual({item["reason"] for item in self.runtime.quarantine()}, {"parent-cycle"})
+
+    def test_unauthorized_reverse_edge_cannot_poison_authorized_path(self):
+        foreign = RuntimeKey("foreign", SigningKey.generate())
+
+        def edge(key, record_id, issuer, source, target):
+            record = {
+                "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                "recordVersion": 1, "recordId": record_id, "generation": 1,
+                "predecessor": None, "issuer": issuer, "schema": "relationship",
+                "payload": {"relationshipId": record_id, "from": source, "to": target,
+                            "kind": "parent", "status": "active", "authorityRoot": "root"},
+            }
+            record["signature"] = key.sign(record)
+            return record
+
+        self.runtime.public_keys["foreign"] = foreign.public_key
+        authorized = edge(self.key, "root-a", "root", "root", "a")
+        unauthorized_reverse = edge(foreign, "a-root-forged", "foreign", "a", "root")
+        outcomes = self.runtime.ingest([authorized, unauthorized_reverse])
+        self.assertEqual([outcome["status"] for outcome in outcomes], ["accepted", "quarantined"])
+        self.assertEqual(outcomes[1]["reason"], "unauthorized-relationship")
+        self.assertEqual([record["recordId"] for record in self.runtime.accepted()], ["root-a"])
 
     def test_cycles_are_scoped_to_authority_root(self):
         def edge(record_id, source, target, root):

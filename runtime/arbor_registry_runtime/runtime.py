@@ -79,6 +79,19 @@ def _secure_public_file(path: Path) -> None:
         raise ValueError(f"runtime file has unexpected owner: {path}")
 
 
+def _replace_keypair(source: str, destination: Path) -> None:
+    """Replace one key-pair transaction member (kept injectable for tests)."""
+    os.replace(source, destination)
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def canonical_json(value: Any) -> bytes:
     """The wire canonical form: UTF-8, sorted keys, no insignificant whitespace."""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -400,40 +413,88 @@ def generate_keypair(
     suffix = f".g{generation}" if generation is not None else ""
     private_path = key_dir / f"{issuer}{suffix}.private"
     public_path = key_dir / f"{issuer}{suffix}.public"
-    # Validate every pre-existing target before generating or writing anything.
-    # In particular, rotation must never replace a private file whose mode or
-    # ownership has been weakened by an operator or another process.
-    _secure_file(private_path)
-    _secure_public_file(public_path)
-    if not rotation and (private_path.exists() or public_path.exists()):
-        raise FileExistsError(f"key material already exists for {issuer}{suffix}; use rotation=True or a new generation")
-    key = RuntimeKey(issuer, SigningKey.generate())
-    values = ((private_path, _b64(bytes(key.signing_key)), 0o600),
-              (public_path, key.public_key + "\n", 0o644))
-    temporary: list[tuple[str, Path]] = []
-    try:
-        # Prepare and fsync both files first. No destination is touched until
-        # all content has been safely written, avoiding half-written pairs.
-        for destination, value, mode in values:
-            fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=key_dir)
-            temporary.append((name, destination))
-            os.fchmod(fd, mode)
-            with os.fdopen(fd, "w", encoding="ascii") as stream:
-                stream.write(value)
-                stream.flush()
-                os.fsync(stream.fileno())
-        for name, destination in temporary:
-            os.replace(name, destination)
-        directory_fd = os.open(key_dir, os.O_DIRECTORY)
+    journal_path = key_dir / f".{issuer}{suffix}.keypair-transaction"
+    lock_path = key_dir / f".{issuer}{suffix}.keypair-lock"
+
+    def recover() -> None:
+        if not journal_path.exists():
+            return
         try:
-            os.fsync(directory_fd)
+            transaction = json.loads(journal_path.read_text(encoding="ascii"))
+            if transaction.get("phase") == "installed":
+                for name in transaction["backups"].values():
+                    if name:
+                        (key_dir / name).unlink(missing_ok=True)
+            else:
+                for name in transaction["destinations"].values():
+                    (key_dir / name).unlink(missing_ok=True)
+                for kind, name in transaction["backups"].items():
+                    if name:
+                        backup = key_dir / name
+                        if backup.exists():
+                            os.replace(backup, private_path if kind == "private" else public_path)
+            for name in transaction["temporary"].values():
+                (key_dir / name).unlink(missing_ok=True)
+            journal_path.unlink(missing_ok=True)
+            _fsync_directory(key_dir)
+        except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as error:
+            raise RuntimeError("key-pair transaction recovery failed") from error
+
+    # The lock makes pair recovery and replacement mutually exclusive with
+    # readers/writers that use this API. The journal makes an interrupted pair
+    # recoverable without putting private key material in the journal itself.
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        recover()
+        lock_path.chmod(0o600)
+        _secure_file(private_path)
+        _secure_public_file(public_path)
+        if not rotation and (private_path.exists() or public_path.exists()):
+            raise FileExistsError(f"key material already exists for {issuer}{suffix}; use rotation=True or a new generation")
+        key = RuntimeKey(issuer, SigningKey.generate())
+        values = ((private_path, _b64(bytes(key.signing_key)), 0o600),
+                  (public_path, key.public_key + "\n", 0o644))
+        temporary: dict[str, str] = {}
+        backups: dict[str, str | None] = {}
+        try:
+            for kind, (destination, value, mode) in zip(("private", "public"), values):
+                fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=key_dir)
+                temporary[kind] = Path(name).name
+                os.fchmod(fd, mode)
+                with os.fdopen(fd, "w", encoding="ascii") as stream:
+                    stream.write(value)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                backups[kind] = None
+                if destination.exists():
+                    backup = key_dir / f".{destination.name}.backup"
+                    backup.unlink(missing_ok=True)
+                    backups[kind] = backup.name
+            transaction = {"phase": "prepared", "temporary": temporary,
+                           "destinations": {kind: path.name for kind, (path, _, _) in zip(("private", "public"), values)},
+                           "backups": backups}
+            journal_path.write_text(json.dumps(transaction, sort_keys=True), encoding="ascii")
+            os.chmod(journal_path, 0o600)
+            _fsync_directory(key_dir)
+            transaction["phase"] = "backed-up"
+            journal_path.write_text(json.dumps(transaction, sort_keys=True), encoding="ascii")
+            _fsync_directory(key_dir)
+            for kind, (destination, _, _) in zip(("private", "public"), values):
+                if backups[kind]:
+                    _replace_keypair(str(destination), key_dir / backups[kind])
+            # The phase is already durable before either old file moves, so a
+            # crash during the backup sequence can restore whichever moved.
+            _fsync_directory(key_dir)
+            for kind, (destination, _, _) in zip(("private", "public"), values):
+                _replace_keypair(str(key_dir / temporary[kind]), destination)
+            transaction["phase"] = "installed"
+            journal_path.write_text(json.dumps(transaction, sort_keys=True), encoding="ascii")
+            _fsync_directory(key_dir)
+            recover()
+            return key
         finally:
-            os.close(directory_fd)
-    finally:
-        for name, _ in temporary:
-            if os.path.exists(name):
-                os.unlink(name)
-    return key
+            for name in temporary.values():
+                (key_dir / name).unlink(missing_ok=True)
 
 
 class Provider(ABC):
@@ -1198,11 +1259,6 @@ class Runtime:
         # Only lineage-valid records may provide graph evidence.  This also
         # keeps forged/forked relationships from authorizing other records.
         candidates = [entry for entry in candidates if reasons[entry[0]] is None]
-        cycle_indexes = self._cycle_indexes([record for _, _, record in candidates])
-        for candidate_index, (rowid, _, _) in enumerate(candidates):
-            if candidate_index in cycle_indexes:
-                reasons[rowid] = "parent-cycle"
-        candidates = [entry for entry in candidates if reasons[entry[0]] is None]
         historical_identities = {
             _digest(json.loads(raw))
             for (raw,) in self.db.execute(
@@ -1217,6 +1273,14 @@ class Runtime:
             if candidate_index in authority_rejected:
                 reasons[rowid] = authority_rejected[candidate_index]
         candidates = [entry for entry in candidates if reasons[entry[0]] is None]
+        # Authority is a prerequisite for graph evidence. In particular, an
+        # unauthorized reverse edge must not turn an otherwise valid path into
+        # a cycle. Genuine cycles among authorized, active parent edges remain
+        # quarantined, and _cycle_indexes keeps each authorityRoot separate.
+        cycle_indexes = self._cycle_indexes([record for _, _, record in candidates])
+        for candidate_index, (rowid, _, _) in enumerate(candidates):
+            if candidate_index in cycle_indexes:
+                reasons[rowid] = "parent-cycle"
         with self.db:
             for rowid, _, _, _, _, _ in rows:
                 status = "accepted" if reasons[rowid] is None else "quarantined"

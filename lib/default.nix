@@ -380,11 +380,19 @@ let
         records = filter (
           record:
           (record.schema != "relationship" && record.schema != "peer-relationship")
-          || (relationshipEvidenceOK record && !elem record.recordId cycleRecordIds)
+          || relationshipEvidenceOK record
         ) historyAccepted;
         inherit authorizedIssuers signers;
       };
       accepted = authority.accepted;
+      authorizedGraphRecords = filter (
+        record: elem record.recordId (map (item: item.recordId) accepted)
+      ) historyAccepted;
+      authorizedRelationships = filter (
+        record:
+        (record.schema == "relationship" || record.schema == "peer-relationship")
+        && relationshipEvidenceOK record
+      ) authorizedGraphRecords;
       quarantined =
         (map (result: result.record // { quarantine = result.quarantine; }) (
           filter (result: !result.accepted) envelopeResults
@@ -407,20 +415,39 @@ let
           )
         )
         ++ authority.quarantined;
-      graph = validateGraph { relationships = relationshipRecordsForGraph; };
+      graph = validateGraph {
+        relationships = map (
+          record:
+          record.payload
+          // {
+            kind = if record.schema == "peer-relationship" then "peer" else record.payload.kind;
+            authorityRoot = get "authorityRoot" record.issuer record.payload;
+          }
+        ) authorizedRelationships;
+      };
       cycleRecords = filter (
         record:
         (record.schema == "relationship" || record.schema == "peer-relationship")
+        && elem record.recordId (map (item: item.recordId) authorizedGraphRecords)
         && relationshipEvidenceOK record
         && (
           let
             root = get "authorityRoot" (get "issuer" null record) record.payload;
-            scoped = filter (candidate: get "authorityRoot" null candidate == root) relationshipRecordsForGraph;
+            scoped = filter (candidate: get "authorityRoot" null candidate == root) (
+              map (
+                candidate:
+                candidate.payload
+                // {
+                  kind = if candidate.schema == "peer-relationship" then "peer" else candidate.payload.kind;
+                  authorityRoot = get "authorityRoot" candidate.issuer candidate.payload;
+                }
+              ) authorizedRelationships
+            );
           in
           elem record.payload.from (validateGraph { relationships = scoped; }).cycles
           && elem record.payload.to (validateGraph { relationships = scoped; }).cycles
         )
-      ) historyAccepted;
+      ) authorizedGraphRecords;
       cycleRecordIds = map (record: record.recordId) cycleRecords;
       graphAccepted = filter (record: !elem record.recordId cycleRecordIds) accepted;
       cycleQuarantined = map (
