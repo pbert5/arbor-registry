@@ -24,7 +24,7 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("arbor-registry-transport.service")
     machine.wait_for_unit("arbor-registry.service")
     machine.succeed("test -S /run/arbor-registry/registry.sock")
-    machine.succeed("test -S /run/arbor-registry-transport/transport.sock")
+    machine.wait_until_succeeds("test -S /run/arbor-registry-transport/transport.sock")
     machine.succeed("systemctl is-enabled arbor-participant.target arbor-registry.service arbor-registry-transport.service")
     refresh()
     healthy = json.loads(machine.succeed("cat /run/arbor/doctor/status.json"))
