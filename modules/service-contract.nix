@@ -75,6 +75,35 @@ in
       type = lib.types.str;
       default = "/run/arbor-registry-transport/transport.sock";
     };
+    transportRealmId = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Shared public transport realm identifier for isolated integration tests.";
+    };
+    transportProtocolEpoch = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 1;
+    };
+    transportListen = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+    };
+    transportBootstrapPeers = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+    };
+    transportDatabaseAddresses = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+    };
+    bootstrapAuthoritiesFile = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/lib/arbor-registry/bootstrap-authorities.json";
+    };
+    authorityIssuers = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+    };
     tokenFile = lib.mkOption {
       type = lib.types.str;
       default = "/run/arbor-registry/socket-token";
@@ -122,6 +151,11 @@ in
           "ARBOR_REGISTRY_STATE_DIR=/var/lib/${cfg.transportStateDirectory}"
           "ARBOR_REGISTRY_SOCKET=${cfg.transportSocket}"
           "ARBOR_REGISTRY_SOCKET_TOKEN_FILE=${cfg.tokenFile}"
+          "ARBOR_REGISTRY_REALM_ID=${lib.optionalString (cfg.transportRealmId != null) cfg.transportRealmId}"
+          "ARBOR_REGISTRY_PROTOCOL_EPOCH=${toString cfg.transportProtocolEpoch}"
+          "ARBOR_REGISTRY_LISTEN=${lib.concatStringsSep "," cfg.transportListen}"
+          "ARBOR_REGISTRY_BOOTSTRAP_PEERS=${lib.concatStringsSep "," cfg.transportBootstrapPeers}"
+          "ARBOR_REGISTRY_DATABASE_ADDRESSES=${builtins.toJSON cfg.transportDatabaseAddresses}"
         ];
       };
     };
@@ -148,6 +182,8 @@ in
       socket = cfg.socket;
       transportSocket = cfg.transportSocket;
       tokenFile = cfg.tokenFile;
+      bootstrapAuthoritiesFile = cfg.bootstrapAuthoritiesFile;
+      authorityIssuers = cfg.authorityIssuers;
     };
     systemd.services.arbor-runtime-status = {
       wantedBy = [ "arbor-participant.target" ];
