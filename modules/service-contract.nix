@@ -104,6 +104,26 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ ];
     };
+    syncInterval = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 5;
+      description = "Seconds between automatic bounded registry consumer runs.";
+    };
+    syncMaxBackoff = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 60;
+      description = "Maximum seconds between retries after a provider outage.";
+    };
+    syncMaxPages = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 4;
+      description = "Maximum provider pages consumed by one automatic run.";
+    };
+    syncPageSize = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 100;
+      description = "Maximum records fetched in one automatic provider page.";
+    };
     tokenFile = lib.mkOption {
       type = lib.types.str;
       default = "/run/arbor-registry/socket-token";
@@ -184,6 +204,10 @@ in
       tokenFile = cfg.tokenFile;
       bootstrapAuthoritiesFile = cfg.bootstrapAuthoritiesFile;
       authorityIssuers = cfg.authorityIssuers;
+      syncInterval = cfg.syncInterval;
+      syncMaxBackoff = cfg.syncMaxBackoff;
+      syncMaxPages = cfg.syncMaxPages;
+      syncPageSize = cfg.syncPageSize;
     };
     systemd.services.arbor-runtime-status = {
       wantedBy = [ "arbor-participant.target" ];
