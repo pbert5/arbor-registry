@@ -33,7 +33,7 @@ pkgs.testers.nixosTest {
     assert healthy["registry"]["installed"] and healthy["registry"]["running"] and healthy["registry"]["ready"]
     assert healthy["transport"]["installed"] and healthy["transport"]["running"]
     machine.succeed("systemctl stop arbor-registry.service")
-    machine.wait_until_succeeds("systemctl is-inactive arbor-registry.service")
+    machine.wait_until_succeeds("! systemctl is-active --quiet arbor-registry.service")
     refresh()
     degraded = json.loads(machine.succeed("cat /run/arbor/doctor/status.json"))
     assert degraded["registry"]["running"] is False and degraded["ready"] is False
