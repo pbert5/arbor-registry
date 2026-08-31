@@ -346,9 +346,43 @@ let
       historyResults = validateHistory envelopeAccepted;
       historyAccepted = map (result: result.record) (filter (result: result.accepted) historyResults);
       rejectedHistory = filter (result: !result.accepted) historyResults;
+      relationshipEvidenceOK =
+        record:
+        let
+          payload = get "payload" { } record;
+          root = get "authorityRoot" (get "issuer" null record) payload;
+          kind = get "kind" null payload;
+        in
+        isAttrs payload
+        && isString (get "from" null payload)
+        && isString (get "to" null payload)
+        && (record.schema == "peer-relationship" || isString kind);
+      relationshipRecordsForGraph =
+        map
+          (
+            record:
+            (
+              record.payload
+              // {
+                kind = if record.schema == "peer-relationship" then "peer" else record.payload.kind;
+                authorityRoot = get "authorityRoot" record.issuer record.payload;
+              }
+            )
+          )
+          (
+            filter (
+              record:
+              (record.schema == "relationship" || record.schema == "peer-relationship")
+              && relationshipEvidenceOK record
+            ) historyAccepted
+          );
       authority = authorityBoundary {
-        records = historyAccepted;
-        inherit authorizedIssuers;
+        records = filter (
+          record:
+          (record.schema != "relationship" && record.schema != "peer-relationship")
+          || (relationshipEvidenceOK record && !elem record.recordId cycleRecordIds)
+        ) historyAccepted;
+        inherit authorizedIssuers signers;
       };
       accepted = authority.accepted;
       quarantined =
@@ -356,14 +390,37 @@ let
           filter (result: !result.accepted) envelopeResults
         ))
         ++ (map (result: result.record // { quarantine = result.quarantine; }) rejectedHistory)
+        ++ (map
+          (
+            record:
+            record
+            // {
+              quarantine = reason "invalid-relationship" "relationship is not valid authority evidence";
+            }
+          )
+          (
+            filter (
+              record:
+              (record.schema == "relationship" || record.schema == "peer-relationship")
+              && !relationshipEvidenceOK record
+            ) historyAccepted
+          )
+        )
         ++ authority.quarantined;
-      graph = validateGraph { relationships = relationshipRecords accepted; };
+      graph = validateGraph { relationships = relationshipRecordsForGraph; };
       cycleRecords = filter (
         record:
-        record.schema == "relationship"
-        && elem record.payload.from graph.cycles
-        && elem record.payload.to graph.cycles
-      ) accepted;
+        (record.schema == "relationship" || record.schema == "peer-relationship")
+        && relationshipEvidenceOK record
+        && (
+          let
+            root = get "authorityRoot" (get "issuer" null record) record.payload;
+            scoped = filter (candidate: get "authorityRoot" null candidate == root) relationshipRecordsForGraph;
+          in
+          elem record.payload.from (validateGraph { relationships = scoped; }).cycles
+          && elem record.payload.to (validateGraph { relationships = scoped; }).cycles
+        )
+      ) historyAccepted;
       cycleRecordIds = map (record: record.recordId) cycleRecords;
       graphAccepted = filter (record: !elem record.recordId cycleRecordIds) accepted;
       cycleQuarantined = map (
@@ -451,23 +508,31 @@ let
   hasParentCycle =
     relationships:
     let
-      graph = parentGraph relationships;
-      nodes = unique (
-        concatLists (
-          map (edge: [
-            edge.from
-            edge.to
-          ]) (parentEdges relationships)
-        )
-      );
+      rootOf = edge: get "authorityRoot" (get "issuer" null edge) edge;
+      roots = unique (map rootOf (parentEdges relationships));
       visit =
-        node: path:
+        graph: node: path:
         if elem node path then
           [ node ]
         else
-          concatLists (map (neighbor: visit neighbor (path ++ [ node ])) (get node [ ] graph));
+          concatLists (map (neighbor: visit graph neighbor (path ++ [ node ])) (get node [ ] graph));
+      cyclesFor =
+        root:
+        let
+          scoped = filter (edge: rootOf edge == root) (parentEdges relationships);
+          graph = parentGraph scoped;
+          nodes = unique (
+            concatLists (
+              map (edge: [
+                edge.from
+                edge.to
+              ]) scoped
+            )
+          );
+        in
+        concatLists (map (node: visit graph node [ ]) nodes);
     in
-    unique (concatLists (map (node: visit node [ ]) nodes));
+    unique (concatLists (map cyclesFor roots));
   graphQuery =
     {
       relationships,
@@ -593,6 +658,7 @@ let
     {
       records,
       authorizedIssuers,
+      signers ? { },
     }:
     let
       isSelfGenesis =
@@ -600,10 +666,16 @@ let
         record.schema == "node-identity"
         && record.issuer == rootOf record
         && record.generation == 1
+        && record.recordVersion == 1
         && record.predecessor == null
-        && (get "genesis" false record.payload)
+        && get "genesis" false record.payload == true
         && get "identity" null record.payload == record.issuer
-        && get "approvedBy" null record.payload == record.issuer;
+        && isString (get "publicKey" null record.payload)
+        && (signerFor signers record.issuer) != null
+        && get "publicKey" null record.payload == get "publicKey" null (signerFor signers record.issuer)
+        && isString (get "domain" null record.payload)
+        && get "approvedBy" null record.payload == record.issuer
+        && get "authorityRoot" null record.payload == record.issuer;
       relationshipPayloadOK =
         record:
         isAttrs record.payload
@@ -617,6 +689,7 @@ let
           from = get "from" null record.payload;
         in
         record.issuer == root || record.issuer == from;
+      relationshipEvidenceOK = record: relationshipPayloadOK record && relationshipIssuerOK record;
       capabilityPayloadOK =
         record:
         isAttrs record.payload
@@ -714,13 +787,18 @@ let
               "receipt"
             ];
             root = rootOf record;
+            establishedIdentity =
+              record.schema == "node-identity"
+              && lib.any (edge: edge.to == record.issuer && get "authorityRoot" root edge == root) (
+                relationshipRecords accepted
+              );
           in
           !sensitive
           || (
             isString record.issuer
             && isString root
             && (rootEstablished accepted root || isSelfGenesis record)
-            && issuerHasPath accepted record root
+            && (issuerHasPath accepted record root || establishedIdentity)
           );
       resolve =
         accepted: pending:
@@ -817,6 +895,7 @@ in
     ;
   testSigner = issuer: token: {
     inherit issuer;
+    publicKey = token;
     sign = bytes: "${token}:${bytes}";
     verify = bytes: signature: signature == "${token}:${bytes}";
   };

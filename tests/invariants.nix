@@ -142,6 +142,42 @@ let
     (relationship "inactive-a" "one" "two" "parent" "suspended")
     (relationship "inactive-b" "two" "one" "parent" "suspended")
   ];
+  rootScopedCrossCycle = [
+    (
+      (relationship "root-a-one-two" "one" "two" "parent" "active").payload
+      // {
+        authorityRoot = "root-a";
+      }
+    )
+    (
+      (relationship "root-b-two-one" "two" "one" "parent" "active").payload
+      // {
+        authorityRoot = "root-b";
+      }
+    )
+  ];
+  localGenesis = registry.makeEnvelope signer {
+    recordId = "root";
+    recordVersion = 1;
+    generation = 1;
+    predecessor = null;
+    issuer = "root";
+    schema = "node-identity";
+    payload = {
+      identity = "root";
+      publicKey = signer.publicKey;
+      domain = "example.internal";
+      genesis = true;
+      approvedBy = "root";
+      authorityRoot = "root";
+    };
+  };
+  localGenesisVariant = localGenesis // {
+    recordVersion = 2;
+    signature = signer.sign (
+      registry.canonical (registry.unsigned (localGenesis // { recordVersion = 2; }))
+    );
+  };
   omittedForeignRoot = registry.makeEnvelope childSigner {
     recordId = "foreign-root";
     generation = 1;
@@ -488,6 +524,18 @@ assert
     }).quarantine.code
   )).value == "malformed-record";
 assert graph.valid;
+assert (registry.validateGraph { relationships = rootScopedCrossCycle; }).cycles == [ ];
+assert
+  (registry.reconcile {
+    raw = [ localGenesis ];
+    signers.root = signer;
+  }).accepted == [ localGenesis ];
+assert
+  (registry.reconcile {
+    raw = [ localGenesisVariant ];
+    signers.root = signer;
+    authorizedIssuers = [ "other" ];
+  }).accepted == [ ];
 assert peerChecked.accepted == [ peer ];
 assert
   registry.peerRelationshipRecords peerChecked.accepted == [

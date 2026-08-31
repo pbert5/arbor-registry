@@ -114,6 +114,22 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 generate_keypair(key_dir, issuer)
 
+    def test_generate_keypair_validates_permissions_before_writing(self):
+        key_dir = Path(self.temp.name) / "permissioned-identity"
+        key_dir.mkdir(mode=0o700)
+        key_dir.chmod(0o755)
+        with self.assertRaises(ValueError):
+            generate_keypair(key_dir, "operator")
+        self.assertEqual(list(key_dir.iterdir()), [])
+
+        key_dir.chmod(0o700)
+        private = key_dir / "operator.private"
+        private.write_text("old", encoding="ascii")
+        private.chmod(0o644)
+        with self.assertRaises(ValueError):
+            generate_keypair(key_dir, "operator", rotation=True)
+        self.assertEqual(private.read_text(encoding="ascii"), "old")
+
     def test_orbitdb_provider_maps_bounded_socket_contract(self):
         import socketserver
         import threading
@@ -421,6 +437,42 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.ingest(records)
         self.assertEqual([record["recordId"] for record in self.runtime.accepted()], ["root-a"])
         self.assertEqual({item["reason"] for item in self.runtime.quarantine()}, {"parent-cycle"})
+
+    def test_cycles_are_scoped_to_authority_root(self):
+        def edge(record_id, source, target, root):
+            record = {
+                "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                "recordVersion": 1, "recordId": record_id, "generation": 1,
+                "predecessor": None, "issuer": "root", "schema": "relationship",
+                "payload": {"relationshipId": record_id, "from": source, "to": target,
+                            "kind": "parent", "status": "active", "authorityRoot": root},
+            }
+            record["signature"] = self.key.sign(record)
+            return record
+
+        records = [edge("a", "one", "two", "root-a"), edge("b", "two", "one", "root-b")]
+        self.assertEqual(Runtime._cycle_indexes(records), set())
+
+    def test_severed_parent_edge_preserves_established_child_identity(self):
+        child = RuntimeKey("child", SigningKey.generate())
+        self.runtime.public_keys["child"] = child.public_key
+        edge = {
+            "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+            "recordVersion": 1, "recordId": "severed-edge", "generation": 1,
+            "predecessor": None, "issuer": "root", "schema": "relationship",
+            "payload": {"relationshipId": "severed-edge", "from": "root", "to": "child",
+                        "kind": "parent", "status": "severed", "authorityRoot": "root"},
+        }
+        edge["signature"] = self.key.sign(edge)
+        identity = {
+            "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+            "recordVersion": 1, "recordId": "child", "generation": 1,
+            "predecessor": None, "issuer": "child", "schema": "node-identity",
+            "payload": {"identity": "child", "publicKey": child.public_key, "authorityRoot": "root"},
+        }
+        identity["signature"] = child.sign(identity)
+        self.assertEqual([item["status"] for item in self.runtime.ingest([identity, edge])], ["accepted", "accepted"])
+        self.assertIn("child", self.runtime.projection())
 
     def test_active_generation_and_revocation_gate_validation_and_projection(self):
         generation_one = make_identity_generation(self.key, "node", 1, "old-key")

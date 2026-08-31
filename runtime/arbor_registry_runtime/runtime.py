@@ -13,6 +13,7 @@ import sqlite3
 import fcntl
 import socket
 import stat
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -64,6 +65,16 @@ def _secure_file(path: Path) -> None:
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
         raise ValueError(f"runtime file is not private: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError(f"runtime file has unexpected owner: {path}")
+
+
+def _secure_public_file(path: Path) -> None:
+    if not path.exists():
+        return
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o022:
+        raise ValueError(f"runtime public file is not a safe regular file: {path}")
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise ValueError(f"runtime file has unexpected owner: {path}")
 
@@ -384,16 +395,44 @@ def generate_keypair(
         raise ValueError("issuer must be a single safe path component")
     if generation is not None and (isinstance(generation, bool) or not isinstance(generation, int) or generation < 1):
         raise ValueError("generation must be a positive integer")
-    key_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    key = RuntimeKey(issuer, SigningKey.generate())
+    key_dir = Path(key_dir)
+    _secure_directory(key_dir)
     suffix = f".g{generation}" if generation is not None else ""
     private_path = key_dir / f"{issuer}{suffix}.private"
     public_path = key_dir / f"{issuer}{suffix}.public"
+    # Validate every pre-existing target before generating or writing anything.
+    # In particular, rotation must never replace a private file whose mode or
+    # ownership has been weakened by an operator or another process.
+    _secure_file(private_path)
+    _secure_public_file(public_path)
     if not rotation and (private_path.exists() or public_path.exists()):
         raise FileExistsError(f"key material already exists for {issuer}{suffix}; use rotation=True or a new generation")
-    private_path.write_text(_b64(bytes(key.signing_key)), encoding="ascii")
-    os.chmod(private_path, 0o600)
-    public_path.write_text(key.public_key + "\n", encoding="ascii")
+    key = RuntimeKey(issuer, SigningKey.generate())
+    values = ((private_path, _b64(bytes(key.signing_key)), 0o600),
+              (public_path, key.public_key + "\n", 0o644))
+    temporary: list[tuple[str, Path]] = []
+    try:
+        # Prepare and fsync both files first. No destination is touched until
+        # all content has been safely written, avoiding half-written pairs.
+        for destination, value, mode in values:
+            fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=key_dir)
+            temporary.append((name, destination))
+            os.fchmod(fd, mode)
+            with os.fdopen(fd, "w", encoding="ascii") as stream:
+                stream.write(value)
+                stream.flush()
+                os.fsync(stream.fileno())
+        for name, destination in temporary:
+            os.replace(name, destination)
+        directory_fd = os.open(key_dir, os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        for name, _ in temporary:
+            if os.path.exists(name):
+                os.unlink(name)
     return key
 
 
@@ -854,11 +893,11 @@ class Runtime:
         edges = [(index, edge) for index, edge in edges
                  if edge is not None and edge[2] == "parent"
                  and records[index].get("payload", {}).get("status") == "active"]
-        adjacency: dict[str, set[str]] = {}
-        for _, (source, target, _, _) in edges:
-            adjacency.setdefault(source, set()).add(target)
+        adjacency: dict[str, dict[str, set[str]]] = {}
+        for _, (source, target, _, root) in edges:
+            adjacency.setdefault(root, {}).setdefault(source, set()).add(target)
 
-        def reaches(source: str, target: str) -> bool:
+        def reaches(root: str, source: str, target: str) -> bool:
             frontier = [source]
             seen: set[str] = set()
             while frontier:
@@ -868,10 +907,10 @@ class Runtime:
                 if node in seen:
                     continue
                 seen.add(node)
-                frontier.extend(adjacency.get(node, ()))
+                frontier.extend(adjacency.get(root, {}).get(node, ()))
             return False
 
-        return {index for index, (source, target, _, _) in edges if reaches(target, source)}
+        return {index for index, (source, target, _, root) in edges if reaches(root, target, source)}
 
     def _validate(self, record: dict[str, Any]) -> tuple[str, str | None]:
         if isinstance(record, dict) and record.get("quarantined") is True and record.get("reason") == "unsafe-value":
