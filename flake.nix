@@ -97,6 +97,10 @@
           module = vaultRuntimeModule;
           pkgs = import nixpkgs { inherit system; };
         };
+        registry-runtime-vm = import ./tests/registry-runtime-vm.nix {
+          module = serviceContractModule;
+          pkgs = import nixpkgs { inherit system; };
+        };
         vault-upstream = import ./tests/vault-upstream.nix {
           inherit nixpkgs system;
           pkgs = import nixpkgs { inherit system; };
