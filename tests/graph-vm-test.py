@@ -1,4 +1,7 @@
 import json
+import sys
+
+sys.path.insert(0, "/run/current-system/sw/lib/python3.14/site-packages")
 
 start_all()
 nodes = (root_a, root_b, child, grandchild)
