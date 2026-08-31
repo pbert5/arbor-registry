@@ -19,11 +19,17 @@ def identity(name):
     return make_identity_generation(authority, name, 1, authority.public_key)
 
 def relationship(record_id, source, target, kind="parent", status="active"):
-    return make_lifecycle_record(authority, "relationship", record_id, {
-        "relationshipId": record_id, "from": source, "to": target, "kind": kind,
-        "status": status, "scope": ["observe"], "autonomy": "dependent",
-        "authorityRoot": "root-a",
-    })
+    record = {
+        "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+        "recordVersion": 1, "recordId": record_id, "generation": 1,
+        "predecessor": None, "issuer": authority.issuer, "schema": "relationship",
+        "payload": {
+            "relationshipId": record_id, "from": source, "to": target, "kind": kind,
+            "status": status, "scope": ["observe"], "autonomy": "dependent",
+            "authorityRoot": "root-a",
+        },
+    }
+    return {**record, "signature": authority.sign(record)}
 
 records = [
     identity("root-a"), identity("root-b"), identity("child"), identity("grandchild"),
