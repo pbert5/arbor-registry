@@ -1,6 +1,10 @@
 import json
 import os
+import sys
 from pathlib import Path
+
+runtime_bin = Path(os.path.realpath("/run/current-system/sw/bin/arbor-registryd"))
+sys.path.insert(0, str(runtime_bin.parents[1] / "lib/python3.14/site-packages"))
 
 from arbor_registry_runtime import RuntimeKey, generate_keypair, make_identity_generation, make_lifecycle_record
 
