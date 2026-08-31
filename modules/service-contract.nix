@@ -135,7 +135,6 @@ in
         Group = "arbor-registry";
         StateDirectory = cfg.stateDirectory;
         StateDirectoryMode = "0700";
-        RuntimeDirectory = "arbor-registry";
         Restart = "on-failure";
         RestartSec = 2;
         ExecStart = "${cfg.runtimePackage}/bin/arbor-registryd --config=/etc/arbor-registry/config.json";
