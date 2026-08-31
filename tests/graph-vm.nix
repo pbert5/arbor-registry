@@ -28,6 +28,7 @@ let
         runtime
         transport
       ];
+      environment.variables.PYTHONPATH = "${runtime}/lib/${pkgs.python3.sitePackages}";
       environment.etc."arbor-test/graph.py".source = ./graph-vm.py;
       cluster.registry.runtime = {
         enable = true;
