@@ -454,7 +454,9 @@ async function main() {
   const addresses = process.env.ARBOR_REGISTRY_DATABASE_ADDRESSES ? JSON.parse(process.env.ARBOR_REGISTRY_DATABASE_ADDRESSES) : {}
   const protocolEpoch = process.env.ARBOR_REGISTRY_PROTOCOL_EPOCH == null ? 1 : Number(process.env.ARBOR_REGISTRY_PROTOCOL_EPOCH)
   const daemon = new TransportDaemon({ stateDir, streams, databaseAddresses: addresses, listen: (process.env.ARBOR_REGISTRY_LISTEN ?? '').split(',').filter(Boolean), bootstrapPeers: (process.env.ARBOR_REGISTRY_BOOTSTRAP_PEERS ?? '').split(',').filter(Boolean), realmId: process.env.ARBOR_REGISTRY_REALM_ID || null, protocolEpoch })
-  const token = process.env.ARBOR_REGISTRY_SOCKET_TOKEN
+  const token = process.env.ARBOR_REGISTRY_SOCKET_TOKEN_FILE
+    ? (await fs.readFile(process.env.ARBOR_REGISTRY_SOCKET_TOKEN_FILE, 'utf8')).trim()
+    : process.env.ARBOR_REGISTRY_SOCKET_TOKEN
   if (!token) throw new Error('ARBOR_REGISTRY_SOCKET_TOKEN is required')
   await daemon.start()
   const server = await startSocketServer(daemon, socketPath, { token })

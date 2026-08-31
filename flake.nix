@@ -18,6 +18,7 @@
       registry = import ./lib { lib = nixpkgs.lib; };
       nixosModule = import ./modules/nixos.nix;
       vaultRuntimeModule = import ./modules/vault-runtime.nix;
+      serviceContractModule = import ./modules/service-contract.nix;
     in
     {
       lib = registry;
@@ -36,6 +37,7 @@
       );
       nixosModules = {
         default = nixosModule;
+        service-contract = serviceContractModule;
         vault-runtime = vaultRuntimeModule;
         vault-runtime-upstream = {
           imports = [
