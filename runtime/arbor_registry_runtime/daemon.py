@@ -57,6 +57,15 @@ class RegistryServer:
             return {"ok": True, "status": "ok"}
         if operation == "status":
             return {"ok": True, "status": "ok", "runtime": self.runtime.status()}
+        if operation in {"sync", "transport-update"}:
+            try:
+                result = self.runtime.sync(
+                    max_pages=request.get("maxPages", 8),
+                    page_size=request.get("pageSize", 100),
+                )
+            except (TypeError, ValueError):
+                return {"ok": False, "code": "invalid_sync_bounds"}
+            return {"ok": True, "sync": result, "runtime": self.runtime.status()}
         if operation == "accepted":
             return {"ok": True, "records": self.runtime.accepted()}
         if operation == "projection":

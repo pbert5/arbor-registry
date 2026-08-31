@@ -14,6 +14,7 @@ import fcntl
 import socket
 import stat
 import tempfile
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -828,6 +829,10 @@ class Runtime:
             raise ValueError("authority issuers must have configured public keys")
         self.max_bytes = max_bytes
         self.max_quarantine_records = 10000
+        self._sync_lock = threading.Lock()
+        self._sync_status: dict[str, Any] = {
+            "state": "idle", "lastError": None, "pages": 0, "records": 0,
+        }
         database_path = self.state_dir / "registry.sqlite3"
         self.db = sqlite3.connect(database_path, timeout=30)
         if database_path.exists():
@@ -845,6 +850,9 @@ class Runtime:
           CREATE TABLE IF NOT EXISTS local_genesis (
             identity TEXT PRIMARY KEY, domain TEXT NOT NULL, public_key TEXT NOT NULL,
             record_digest TEXT NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS provider_cursors (
+            stream TEXT PRIMARY KEY, cursor TEXT NOT NULL
           );
         """)
         self.local_authorities: dict[str, tuple[str, str]] = {
@@ -1280,7 +1288,15 @@ class Runtime:
             return "recovery-quorum-not-met"
         return None
 
-    def ingest(self, records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    def ingest(self, records: Iterable[dict[str, Any]], *, retain: bool = True,
+               commit: bool = True) -> list[dict[str, Any]]:
+        """Ingest raw records; provider retention is only for local writes.
+
+        Consumer reads set ``retain=False`` so a record fetched from transport
+        is not appended back to that same transport. ``commit=False`` is used
+        by the consumer to commit records, reconciliation, projection, and
+        its cursor in one SQLite transaction.
+        """
         outcomes = []
         for record in records:
             if isinstance(record, dict) and "recordId" in record and "recordVersion" in record:
@@ -1311,16 +1327,19 @@ class Runtime:
             else:
                 if existing:
                     record_key = f"{record_key}#conflict:{hashlib.sha256(envelope.encode()).hexdigest()}"
-                if not unsafe:
+                if retain and not unsafe:
                     self.provider.append(record)
                 self.db.execute("INSERT INTO records VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (record_key, record.get("recordId"), record.get("generation"), record.get("predecessor"),
                      status, reason, envelope))
             outcomes.append({"recordKey": record_key, "status": status, "reason": reason})
         self.db.execute("DELETE FROM records WHERE status = 'quarantined' AND rowid NOT IN (SELECT rowid FROM records WHERE status = 'quarantined' ORDER BY rowid DESC LIMIT ?)", (self.max_quarantine_records,))
-        self.db.commit()
+        if commit:
+            self.db.commit()
         self._reconcile()
         self._materialize()
+        if commit:
+            self.db.commit()
         for outcome in outcomes:
             row = self.db.execute("SELECT status, reason FROM records WHERE record_key = ?", (outcome["recordKey"],)).fetchone()
             if row:
@@ -1532,10 +1551,9 @@ class Runtime:
         for candidate_index, (rowid, _, _) in enumerate(candidates):
             if candidate_index in cycle_indexes:
                 reasons[rowid] = "parent-cycle"
-        with self.db:
-            for rowid, _, _, _, _, _ in rows:
-                status = "accepted" if reasons[rowid] is None else "quarantined"
-                self.db.execute("UPDATE records SET status = ?, reason = ? WHERE rowid = ?", (status, reasons[rowid], rowid))
+        for rowid, _, _, _, _, _ in rows:
+            status = "accepted" if reasons[rowid] is None else "quarantined"
+            self.db.execute("UPDATE records SET status = ?, reason = ? WHERE rowid = ?", (status, reasons[rowid], rowid))
 
     def _materialize(self) -> None:
         accepted = self.db.execute("SELECT record_key, record_id, generation, predecessor, status, reason, envelope FROM records WHERE status = 'accepted' OR reason IN ('anti-rollback', 'revoked-generation') ORDER BY generation, record_key").fetchall()
@@ -1557,11 +1575,105 @@ class Runtime:
             current = latest.get(record["recordId"])
             if current is None or record["generation"] >= current[0]:
                 latest[record["recordId"]] = (record["generation"], record)
-        with self.db:
-            self.db.execute("DELETE FROM projection")
-            self.db.executemany("INSERT INTO projection VALUES (?, ?, ?, ?)",
-                [(record_id, record["schema"], json.dumps(record["payload"], sort_keys=True), generation)
-                 for record_id, (generation, record) in latest.items()])
+        self.db.execute("DELETE FROM projection")
+        self.db.executemany("INSERT INTO projection VALUES (?, ?, ?, ?)",
+            [(record_id, record["schema"], json.dumps(record["payload"], sort_keys=True), generation)
+             for record_id, (generation, record) in latest.items()])
+
+    @staticmethod
+    def _valid_cursor(cursor: ProviderCursor) -> bool:
+        return ((isinstance(cursor, int) and not isinstance(cursor, bool) and cursor >= 0)
+                or (isinstance(cursor, str) and 0 < len(cursor) <= 1024))
+
+    def _provider_cursor(self) -> ProviderCursor:
+        row = self.db.execute(
+            "SELECT cursor FROM provider_cursors WHERE stream = ?",
+            (getattr(self.provider, "stream", "default"),),
+        ).fetchone()
+        if row is None:
+            return 0
+        value: Any = json.loads(row[0])
+        if not self._valid_cursor(value):
+            raise ValueError("persisted provider cursor is invalid")
+        return value
+
+    def _save_provider_cursor(self, cursor: ProviderCursor) -> None:
+        if not self._valid_cursor(cursor):
+            raise ValueError("provider cursor is invalid")
+        self.db.execute(
+            "INSERT INTO provider_cursors(stream, cursor) VALUES (?, ?) "
+            "ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor",
+            (getattr(self.provider, "stream", "default"), json.dumps(cursor)),
+        )
+
+    @staticmethod
+    def _cursor_advanced(previous: ProviderCursor, current: ProviderCursor) -> bool:
+        if isinstance(previous, int) and isinstance(current, int):
+            return current > previous
+        if isinstance(previous, str) and isinstance(current, str):
+            return current != previous
+        return True
+
+    def sync(self, *, max_pages: int = 8, page_size: int = 100) -> dict[str, Any]:
+        """Consume at most ``max_pages`` bounded provider pages.
+
+        A trigger can be delivered by transport notification or an operator;
+        callers choose their own retry schedule, so this method never polls.
+        """
+        if max_pages < 1 or max_pages > 64 or page_size < 1 or page_size > 500:
+            raise ValueError("sync bounds are invalid")
+        if not self._sync_lock.acquire(blocking=False):
+            return {"state": "busy", "pages": 0, "records": 0}
+        pages = records = 0
+        try:
+            self._sync_status = {"state": "syncing", "lastError": None, "pages": 0, "records": 0}
+            cursor = self._provider_cursor()
+            for _ in range(max_pages):
+                # Adapters may retain their last response cursor for
+                # observability; it must never be mistaken for this fetch's
+                # cursor if the fetch itself fails or omits one.
+                if hasattr(self.provider, "next_cursor"):
+                    self.provider.next_cursor = None
+                page = self.provider.fetch(cursor, page_size)
+                previous: ProviderCursor | None = None
+                for item_cursor, record in page:
+                    if not self._valid_cursor(item_cursor):
+                        raise ValueError("provider returned an invalid record cursor")
+                    if isinstance(cursor, int) and isinstance(item_cursor, int) and item_cursor < cursor:
+                        raise ValueError("provider returned a cursor before the requested cursor")
+                    if isinstance(cursor, str) and isinstance(item_cursor, str) and item_cursor == cursor:
+                        raise ValueError("provider returned the requested cursor again")
+                    if previous is not None:
+                        if isinstance(previous, int) and isinstance(item_cursor, int) and item_cursor <= previous:
+                            raise ValueError("provider returned non-increasing cursors")
+                        if isinstance(previous, str) and isinstance(item_cursor, str) and item_cursor == previous:
+                            raise ValueError("provider returned duplicate cursors")
+                    previous = item_cursor
+                next_cursor = getattr(self.provider, "next_cursor", None)
+                if page:
+                    if next_cursor is None:
+                        last = page[-1][0]
+                        next_cursor = last + 1 if isinstance(last, int) else last
+                    if not self._valid_cursor(next_cursor) or not self._cursor_advanced(cursor, next_cursor):
+                        raise ValueError("provider did not advance its cursor")
+                    self.ingest((record for _, record in page), retain=False, commit=False)
+                    self._save_provider_cursor(next_cursor)
+                    self.db.commit()
+                    cursor = next_cursor
+                    pages += 1
+                    records += len(page)
+                else:
+                    break
+                if len(page) < page_size:
+                    break
+            self._sync_status = {"state": "idle", "lastError": None, "pages": pages, "records": records}
+            return dict(self._sync_status)
+        except (OSError, RuntimeError, TimeoutError, TypeError, ValueError) as error:
+            self.db.rollback()
+            self._sync_status = {"state": "degraded", "lastError": str(error), "pages": pages, "records": records}
+            return dict(self._sync_status)
+        finally:
+            self._sync_lock.release()
 
     def accepted(self, cursor: int = 0, limit: int = 100) -> list[dict[str, Any]]:
         if limit < 1 or limit > 1000 or cursor < 0:
@@ -1582,13 +1694,19 @@ class Runtime:
         return {record_id: {"schema": schema, "payload": json.loads(payload), "generation": generation}
                 for record_id, schema, payload, generation in self.db.execute("SELECT record_id, schema, payload, generation FROM projection")}
 
-    def status(self) -> dict[str, int]:
-        return {
+    def status(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
             "records": self.db.execute("SELECT COUNT(*) FROM records").fetchone()[0],
             "accepted": self.db.execute("SELECT COUNT(*) FROM records WHERE status = 'accepted'").fetchone()[0],
             "quarantined": self.db.execute("SELECT COUNT(*) FROM records WHERE status = 'quarantined'").fetchone()[0],
             "projected": self.db.execute("SELECT COUNT(*) FROM projection").fetchone()[0],
         }
+        try:
+            result["providerCursor"] = self._provider_cursor()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result["providerCursor"] = None
+        result["sync"] = dict(self._sync_status)
+        return result
 
     def state_summary(self, node_id: str) -> dict[str, Any]:
         """Return bounded state classification without raw payloads or secrets."""
