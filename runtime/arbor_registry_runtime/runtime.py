@@ -29,7 +29,7 @@ SCHEMAS = frozenset({
     "enrollment", "revocation", "recovery-authorization", "receipt",
 })
 ProviderCursor: TypeAlias = int | str
-_SECRET_NAMES = {"secret", "password", "passphrase", "token", "credential", "private", "privatekey", "signingkey", "apikey", "accesskey", "accesstoken", "seed"}
+_SECRET_NAMES = {"secret", "clientsecret", "password", "passphrase", "token", "authtoken", "credential", "authorization", "private", "privatekey", "signingkey", "apikey", "accesskey", "accesstoken", "seed"}
 
 
 def _unsafe_value(value: Any) -> bool:
@@ -1358,3 +1358,47 @@ class Runtime:
     def projection(self) -> dict[str, dict[str, Any]]:
         return {record_id: {"schema": schema, "payload": json.loads(payload), "generation": generation}
                 for record_id, schema, payload, generation in self.db.execute("SELECT record_id, schema, payload, generation FROM projection")}
+
+    def status(self) -> dict[str, int]:
+        return {
+            "records": self.db.execute("SELECT COUNT(*) FROM records").fetchone()[0],
+            "accepted": self.db.execute("SELECT COUNT(*) FROM records WHERE status = 'accepted'").fetchone()[0],
+            "quarantined": self.db.execute("SELECT COUNT(*) FROM records WHERE status = 'quarantined'").fetchone()[0],
+            "projected": self.db.execute("SELECT COUNT(*) FROM projection").fetchone()[0],
+        }
+
+    def state_summary(self, node_id: str) -> dict[str, Any]:
+        """Return bounded state classification without raw payloads or secrets."""
+        if not isinstance(node_id, str) or not node_id:
+            raise ValueError("node_id is required")
+        totals = self.status()
+        schemas = dict(self.db.execute(
+            "SELECT schema, COUNT(*) FROM records GROUP BY schema ORDER BY schema"
+        ).fetchall())
+        local = self.local_authorities.get(node_id)
+        rows = self.db.execute(
+            "SELECT generation, status, reason FROM records WHERE record_id = ? "
+            "OR json_extract(envelope, '$.payload.identity') = ? ORDER BY generation",
+            (node_id, node_id),
+        ).fetchall()
+        accepted = [row for row in rows if row[1] == "accepted"]
+        generations = sorted({row[0] for row in accepted if isinstance(row[0], int)})
+        conflict = any(row[2] in {"conflicting-record-key", "unauthorized-local-authority-scope"} for row in rows)
+        accepted_records = self.accepted(0, 1000)
+        parents = sum(1 for record in accepted_records if record.get("schema") == "relationship"
+                      and record.get("payload", {}).get("to") == node_id
+                      and record.get("payload", {}).get("kind") == "parent")
+        peers = sum(1 for record in accepted_records if record.get("schema") == "peer-relationship"
+                    and node_id in {record.get("payload", {}).get("from"), record.get("payload", {}).get("to")})
+        return {
+            "records": {key: totals[key] for key in ("records", "accepted", "quarantined")},
+            "projection": {"total": totals["projected"]},
+            "schemas": schemas,
+            "localIdentity": {
+                "nodeId": node_id, "initialized": local is not None,
+                "generation": generations[-1] if generations else None,
+                "selfRooted": local is not None and node_id in self.authority_issuers,
+                "localGenesis": local is not None, "conflict": conflict,
+                "parentCount": parents, "peerCount": peers,
+            },
+        }

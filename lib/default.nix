@@ -63,10 +63,13 @@ let
 
   unsafeKeys = [
     "secret"
+    "clientsecret"
     "password"
     "passphrase"
     "token"
+    "authtoken"
     "credential"
+    "authorization"
     "privatekey"
     "private-key"
     "signingkey"
