@@ -7,6 +7,7 @@ pkgs.testers.nixosTest {
       imports = [ module ];
       system.stateVersion = "25.05";
       virtualisation.memorySize = 1536;
+      cluster.registry.runtime.enable = true;
       environment.systemPackages = [
         pkgs.jq
         pkgs.python3
@@ -18,6 +19,7 @@ pkgs.testers.nixosTest {
     def refresh():
         machine.succeed("systemctl reset-failed arbor-runtime-status.service; systemctl start arbor-runtime-status.service")
 
+    machine.succeed("systemctl start arbor-participant.target")
     machine.wait_for_unit("arbor-participant.target")
     machine.wait_for_unit("arbor-registry-transport.service")
     machine.wait_for_unit("arbor-registry.service")

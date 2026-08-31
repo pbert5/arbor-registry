@@ -109,7 +109,10 @@ in
         User = "arbor-registry";
         Group = "arbor-registry";
         StateDirectory = cfg.transportStateDirectory;
-        RuntimeDirectory = "arbor-registry-transport";
+        RuntimeDirectory = [
+          "arbor-registry-transport"
+          "arbor-registry"
+        ];
         Restart = "on-failure";
         RestartSec = 2;
         ExecStartPre = tokenInit;
