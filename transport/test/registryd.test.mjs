@@ -363,3 +363,47 @@ test('malformed replicated entries are quarantined and skipped', async () => {
     assert.match(await fs.readFile(path.join(root, 'transport-quarantine.jsonl'), 'utf8'), /malformed-replicated-entry/)
   } finally { await fs.rm(root, { recursive: true, force: true }) }
 })
+
+test('v2-after preserves a late earlier-clock event across restart', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-late-cursor-'))
+  const entries = [{ hash: 'hash-a', value: { id: 'a' }, clock: { time: 20, id: 'a' } }]
+  const open = async () => ({ iterator: async function * () { yield * entries }, get: async hash => entries.find(entry => entry.hash === hash).value })
+  const first = new TransportDaemon({ stateDir: root }); first.open = open
+  try {
+    await first.withIndexLock(async () => { await first.refreshIndex('registry'); await first.saveIndex() })
+    const saved = await first.list('registry', 'v2:begin', 10)
+    entries.push({ hash: 'hash-b', value: { id: 'b' }, clock: { time: 10, id: 'b' } })
+    assert.deepEqual((await first.list('registry', saved.nextCursor, 10)).records.map(item => item.hash), ['hash-b'])
+    assert.deepEqual(first.index.streams.registry.map(item => item.hash), ['hash-b', 'hash-a'])
+
+    const restarted = new TransportDaemon({ stateDir: root }); restarted.open = open
+    assert.deepEqual((await restarted.list('registry', saved.nextCursor, 10)).records.map(item => item.hash), ['hash-b'])
+  } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+test('healing observation subsets converges deterministic order and duplicate winner', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-healing-'))
+  const entries = [
+    { hash: 'late', value: { id: 'late' }, clock: { time: 2, id: 'b' } },
+    { hash: 'loser', value: { id: 'same' }, clock: { time: 4, id: 'z' } },
+    { hash: 'early', value: { id: 'early' }, clock: { time: 1, id: 'a' } },
+    { hash: 'winner', value: { id: 'same' }, clock: { time: 3, id: 'a' } },
+  ]
+  const makeDaemon = (stateDir, observed) => {
+    const daemon = new TransportDaemon({ stateDir })
+    daemon.open = async () => ({ iterator: async function * () { yield * observed }, get: async hash => entries.find(entry => entry.hash === hash)?.value })
+    return daemon
+  }
+  const first = makeDaemon(path.join(root, 'first'), entries)
+  const second = makeDaemon(path.join(root, 'second'), [...entries].reverse())
+  try {
+    await fs.mkdir(path.join(root, 'first'), { recursive: true }); await fs.mkdir(path.join(root, 'second'), { recursive: true })
+    first.index.streams.registry = [{ key: 'late', hash: 'late', order: '1:late' }]
+    second.index.streams.registry = [{ key: 'early', hash: 'early', order: '1:early' }]
+    await first.refreshIndex('registry'); await second.refreshIndex('registry')
+    assert.deepEqual(first.index.streams.registry.map(item => item.hash), ['early', 'late', 'winner'])
+    assert.deepEqual(second.index.streams.registry.map(item => item.hash), first.index.streams.registry.map(item => item.hash))
+    assert.equal(first.index.streams.registry.some(item => item.hash === 'loser'), false)
+    await assert.rejects(() => first.list('registry', 'v2-after:loser', 10), /invalid cursor/)
+  } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
