@@ -28,6 +28,8 @@ pkgs.testers.nixosTest {
     machine.succeed("systemctl is-enabled arbor-participant.target arbor-registry.service arbor-registry-transport.service")
     refresh()
     healthy = json.loads(machine.succeed("cat /run/arbor/doctor/status.json"))
+    machine.log("STATUS " + json.dumps(healthy))
+    machine.succeed("cat /run/arbor/doctor/status.json")
     assert healthy["registry"]["installed"] and healthy["registry"]["running"] and healthy["registry"]["ready"]
     assert healthy["transport"]["installed"] and healthy["transport"]["running"]
     machine.succeed("systemctl stop arbor-registry.service")

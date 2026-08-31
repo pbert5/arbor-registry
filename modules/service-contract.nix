@@ -19,7 +19,7 @@ let
         ${pkgs.python3}/bin/python3 -c '
     import json, socket, sys
     s = socket.socket(socket.AF_UNIX); s.settimeout(1); s.connect(sys.argv[1])
-    s.sendall((json.dumps({"operation":"health","token":sys.argv[2]}) + "\\n").encode())
+    s.sendall((json.dumps({"operation":"health","token":sys.argv[2]}) + "\n").encode())
     v = json.loads(s.recv(65536)); s.close()
     raise SystemExit(0 if v.get("ok") is True and v.get("status") == "ok" else 1)
     ' ${lib.escapeShellArg cfg.socket} "$token"
