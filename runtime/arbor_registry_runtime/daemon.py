@@ -28,6 +28,7 @@ class SyncWorker:
         self.stop_event = threading.Event()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        self._backoff = interval
         self._status: dict[str, Any] = {"state": "idle", "lastError": None}
 
     def start(self) -> None:
@@ -35,6 +36,7 @@ class SyncWorker:
             if self._thread is not None and self._thread.is_alive():
                 return
             self.stop_event.clear()
+            self._backoff = self.interval
             self._thread = threading.Thread(target=self._run, name="arbor-registry-sync", daemon=True)
             self._thread.start()
 
@@ -48,23 +50,33 @@ class SyncWorker:
                     self._status = {"state": "error" if state == "degraded" else "ok",
                                     "lastError": result.get("lastError") if isinstance(result, dict) else None,
                                     "lastResult": result, "lastSyncAt": time.time()}
-                delay = self.interval if state != "degraded" else min(self.max_backoff, self.interval * 2)
+                if state == "degraded":
+                    delay = self._backoff
+                    self._backoff = min(self.max_backoff, self._backoff * 2)
+                elif isinstance(result, dict) and result.get("backlog"):
+                    self._backoff = self.interval
+                    delay = 0.0
+                else:
+                    self._backoff = self.interval
+                    delay = self.interval
             except Exception as error:  # provider outages are expected and retried
                 with self._lock:
                     self._status = {"state": "error", "lastError": f"{type(error).__name__}: {error}",
                                     "lastSyncAt": time.time()}
-                delay = min(self.max_backoff, max(self.interval, delay * 2 or self.interval))
+                delay = self._backoff
+                self._backoff = min(self.max_backoff, self._backoff * 2)
 
     def status(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._status)
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self.stop_event.set()
         with self._lock:
             thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(1.0, self.max_backoff + 1.0))
+        return thread is None or not thread.is_alive()
 
 
 def _config(path: Path) -> dict[str, Any]:
@@ -186,7 +198,9 @@ class RegistryServer:
             self.socket_path.unlink()
         except FileNotFoundError:
             pass
-        self.runtime.close()
+        # Do not close SQLite while a worker still owns a runtime operation.
+        with self._runtime_lock:
+            self.runtime.close()
 
 
 def main(argv: list[str] | None = None) -> int:

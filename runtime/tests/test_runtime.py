@@ -148,6 +148,55 @@ class RuntimeTests(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_sync_does_not_advance_cursor_when_page_commit_fails(self):
+        class FailingRuntime(Runtime):
+            def _save_provider_cursor(self, cursor):
+                raise OSError("cursor journal unavailable")
+
+        provider = FileProvider(Path(self.temp.name) / "crash-raw" / "history.jsonl")
+        provider.append(self.envelope("not-committed"))
+        runtime = FailingRuntime(Path(self.temp.name) / "crash-state", provider, {"root": self.key.public_key})
+        try:
+            self.assertEqual(runtime.sync()["state"], "degraded")
+            self.assertEqual(runtime.status()["providerCursor"], 0)
+            self.assertEqual(runtime.accepted(), [])
+        finally:
+            runtime.close()
+
+    def test_sync_reports_backlog_when_window_is_full(self):
+        provider = FileProvider(Path(self.temp.name) / "backlog-raw" / "history.jsonl")
+        provider.append(self.envelope("backlog-one"))
+        provider.append(self.envelope("backlog-two"))
+        runtime = Runtime(Path(self.temp.name) / "backlog-state", provider, {"root": self.key.public_key})
+        try:
+            result = runtime.sync(max_pages=1, page_size=1)
+            self.assertTrue(result["backlog"])
+            self.assertEqual(runtime.sync(max_pages=1, page_size=1)["records"], 1)
+        finally:
+            runtime.close()
+
+    def test_sync_worker_exponentially_backs_off_and_resets_after_success(self):
+        from arbor_registry_runtime.daemon import SyncWorker
+
+        calls = []
+        completed = threading.Event()
+
+        def sync(**_):
+            calls.append(time.monotonic())
+            result = {"state": "degraded" if len(calls) < 3 else "idle"}
+            if len(calls) >= 4:
+                completed.set()
+            return result
+
+        worker = SyncWorker(sync, interval=0.01, max_backoff=0.04, max_pages=1, page_size=1)
+        worker.start()
+        try:
+            self.assertTrue(completed.wait(1), "worker did not reset after recovery")
+            self.assertEqual(worker.status()["state"], "ok")
+            self.assertGreaterEqual(calls[2] - calls[1], calls[1] - calls[0])
+        finally:
+            worker.stop()
+
     def test_daemon_exposes_explicit_transport_update_trigger(self):
         from arbor_registry_runtime.daemon import RegistryServer
 
