@@ -290,6 +290,95 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(promoted.public_key, candidate.public_key)
         self.assertEqual(promoted.public_key, (key_dir / "operator.public").read_text().strip())
 
+    def test_recovery_activation_requires_accepted_matching_registry_proposal(self):
+        key_dir = Path(self.temp.name) / "gated-identity"
+        first = generate_keypair(key_dir, "operator")
+        candidate = stage_keypair(key_dir, "operator", 2)
+        approval = make_recovery_approval(
+            self.key, "operator", 1, role="operator", approver_generation=1,
+            new_public_key=candidate.public_key, new_generation=2,
+        )
+        authorization = make_recovery_authorization(
+            self.key, "operator", 1, candidate.public_key, [approval]
+        )
+        with self.assertRaises(ValueError):
+            self.runtime.activate_recovery_keypair(key_dir, "operator", 2, authorization)
+        self.assertEqual(first.public_key, (key_dir / "operator.public").read_text().strip())
+        self.assertEqual(self.runtime.ingest([authorization])[0]["status"], "accepted")
+        activated = self.runtime.activate_recovery_keypair(key_dir, "operator", 2, authorization)
+        self.assertEqual(activated.public_key, candidate.public_key)
+
+    def test_recovery_activation_failure_preserves_old_active_pair(self):
+        key_dir = Path(self.temp.name) / "gated-failure-identity"
+        first = generate_keypair(key_dir, "operator")
+        candidate = stage_keypair(key_dir, "operator", 2)
+        authorization = make_recovery_authorization(
+            self.key, "operator", 1, candidate.public_key, [
+                make_recovery_approval(
+                    self.key, "operator", 1, role="operator", approver_generation=1,
+                    new_public_key=candidate.public_key, new_generation=2,
+                )
+            ]
+        )
+        self.assertEqual(self.runtime.ingest([authorization])[0]["status"], "accepted")
+        private = key_dir / "operator.private"
+        public = key_dir / "operator.public"
+        old_private, old_public = private.read_text(), public.read_text()
+        import arbor_registry_runtime.runtime as runtime_module
+        original_replace = runtime_module._replace_keypair
+        calls = 0
+
+        def fail_on_install(source, destination):
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                raise OSError("injected recovery activation failure")
+            return original_replace(source, destination)
+
+        with patch.object(runtime_module, "_replace_keypair", fail_on_install):
+            with self.assertRaises(OSError):
+                self.runtime.activate_recovery_keypair(key_dir, "operator", 2, authorization)
+        self.assertEqual(private.read_text(), old_private)
+        self.assertEqual(public.read_text(), old_public)
+        self.assertEqual(first.public_key, old_public.strip())
+        self.assertFalse((key_dir / ".operator.keypair-transaction").exists())
+
+    def test_legacy_node_identity_cannot_replay_static_key_after_generation_change(self):
+        operator = RuntimeKey("operator", SigningKey.generate())
+        replacement = RuntimeKey("operator-new", SigningKey.generate())
+        runtime = Runtime(
+            Path(self.temp.name) / "legacy-replay-state",
+            FileProvider(Path(self.temp.name) / "legacy-replay-raw" / "history.jsonl"),
+            {"root": self.key.public_key, "operator": operator.public_key},
+            approver_roles={"operator": {"root"}, "parent": set(), "peer": set()},
+        )
+        try:
+            operator_one = make_identity_generation(self.key, "operator", 1, operator.public_key)
+            approval = make_recovery_approval(
+                self.key, "operator", 1, role="operator", approver_generation=1,
+                new_public_key=replacement.public_key, new_generation=2,
+            )
+            authorization = make_recovery_authorization(
+                self.key, "operator", 1, replacement.public_key, [approval]
+            )
+            operator_two = make_identity_generation(
+                self.key, "operator", 2, replacement.public_key,
+                predecessor="operator:1", recovery_authorization=authorization,
+            )
+            legacy = {
+                "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                "recordVersion": 1, "recordId": "operator-legacy", "generation": 1,
+                "predecessor": None, "issuer": "root", "schema": "node-identity",
+                "payload": {"identity": "operator", "publicKey": operator.public_key,
+                            "approvedBy": "root"},
+            }
+            legacy["signature"] = self.key.sign(legacy)
+            outcomes = runtime.ingest([operator_one, authorization, operator_two, legacy])
+            self.assertEqual(outcomes[-1]["reason"], "stale-generation")
+            self.assertNotIn("operator-legacy", {record["recordId"] for record in runtime.accepted()})
+        finally:
+            runtime.close()
+
     def test_default_policy_rejects_lost_identity_self_recovery(self):
         identity = make_identity_generation(self.key, "root", 1, self.key.public_key)
         approval = make_recovery_approval(
