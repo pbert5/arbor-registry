@@ -136,6 +136,7 @@ wait_until(node_b, lambda: has_record(node_b, "live-outage"), "Registry outage c
 before = registry(node_b, "status")["runtime"]["providerCursor"]
 node_b.succeed("systemctl restart arbor-registry.service")
 node_b.wait_for_unit("arbor-registry.service", timeout=120)
+node_b.wait_until_succeeds("test -S /run/arbor-registry/registry.sock", timeout=120)
 assert registry(node_a, "ingest", records=[by_id["live-after-restart"]])["outcomes"][0]["status"] == "accepted"
 wait_until(node_b, lambda: has_record(node_b, "live-after-restart"), "restart cursor did not resume")
 after = registry(node_b, "status")["runtime"]["providerCursor"]
