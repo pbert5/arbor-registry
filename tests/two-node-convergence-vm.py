@@ -1,11 +1,20 @@
 import json
+import base64
 
 TOKEN = "/run/arbor-test/socket-token"
 start_all()
-for node in (node_a, node_b):
-    node.wait_for_unit("arbor-registry-transport.service", timeout=120)
-    node.wait_until_succeeds("test -S /run/arbor-registry-transport/transport.sock", timeout=120)
-    node.wait_until_succeeds("test -s " + TOKEN, timeout=120)
+
+# B has no participant target wants.  Assert this startup gate before any
+# convergence activity: neither transport nor Registry may have opened.
+node_b.succeed("! systemctl is-active --quiet arbor-registry-transport.service")
+node_b.succeed("! systemctl is-active --quiet arbor-registry.service")
+node_b.succeed("test ! -e /run/arbor-registry-transport/transport.sock")
+node_b.succeed("test ! -e /run/arbor-registry/registry.sock")
+print("STARTUP B-held-before-A-readiness: PASS")
+
+node_a.wait_for_unit("arbor-registry-transport.service", timeout=120)
+node_a.wait_until_succeeds("test -S /run/arbor-registry-transport/transport.sock", timeout=120)
+node_a.wait_until_succeeds("test -s " + TOKEN, timeout=120)
 
 def call(node, socket_path, operation, **extra):
     value = {"operation": operation, **extra}
@@ -24,19 +33,55 @@ def registry(node, operation, **extra):
 node_a.succeed("python3 /etc/arbor-test/fixture.py")
 authorities = node_a.succeed("cat /run/arbor-test/bootstrap-authorities.json").strip()
 for node in (node_a, node_b):
+    node.succeed("mkdir -p /run/arbor-test")
     node.succeed("printf '%%s\\n' %r > /run/arbor-test/bootstrap-authorities.json" % authorities)
     node.succeed("chmod 0644 /run/arbor-test/bootstrap-authorities.json")
 
 status_a = transport(node_a, "status")
-assert status_a["ok"] and status_a["databaseAddresses"]["registry"]
-address = json.dumps({"registry": status_a["databaseAddresses"]["registry"]}).replace('"', '\\"')
-dropin = ('[Service]\\nEnvironment="ARBOR_REGISTRY_DATABASE_ADDRESSES=%s" '
-          'Environment="ARBOR_REGISTRY_BOOTSTRAP_PEERS=/ip4/10.42.0.10/tcp/4001/p2p/%s"'
-          % (address, status_a["peerId"]))
+assert status_a.get("ok") is True, status_a
+assert status_a.get("peerId"), status_a
+assert status_a.get("databaseAddresses", {}).get("registry"), status_a
+address = status_a["databaseAddresses"]["registry"]
+database_addresses = json.dumps({"registry": address}, separators=(",", ":"))
+# systemd parses the outer quotes and the escaped JSON quotes into the exact
+# compact JSON object expected by transport/registryd.mjs.
+systemd_database_addresses = database_addresses.replace('"', '\\"')
+dropin = (
+    "[Service]\n"
+    'Environment="ARBOR_REGISTRY_DATABASE_ADDRESSES=%s"\n'
+    'Environment="ARBOR_REGISTRY_BOOTSTRAP_PEERS=/ip4/10.42.0.10/tcp/4001/p2p/%s"\n'
+    % (systemd_database_addresses, status_a["peerId"])
+)
+
+def write_text_deterministically(node, path, value):
+    encoded = base64.b64encode(value.encode()).decode()
+    node.succeed("echo %s | base64 -d > %s" % (encoded, path))
+
 node_b.succeed("mkdir -p /run/systemd/system/arbor-registry-transport.service.d")
-node_b.succeed("printf '%%s\\n' %r > /run/systemd/system/arbor-registry-transport.service.d/acceptance.conf" % dropin)
-node_b.succeed("systemctl daemon-reload; systemctl restart arbor-registry-transport.service")
+write_text_deterministically(node_b, "/run/systemd/system/arbor-registry-transport.service.d/acceptance.conf", dropin)
+node_b.succeed("systemctl daemon-reload")
+node_b.succeed("systemctl cat arbor-registry-transport.service | grep -F 'ARBOR_REGISTRY_DATABASE_ADDRESSES=' >/dev/null")
+node_b.succeed("systemctl show arbor-registry-transport.service -p Environment --value | grep -F 'ARBOR_REGISTRY_DATABASE_ADDRESSES=' >/dev/null")
+node_b.succeed("systemd-analyze verify arbor-registry-transport.service")
+print("STARTUP B-drop-in-real-newlines-and-systemd-verify: PASS")
+
+# This is B's first transport start/open, and it happens only after the
+# complete A status gate and configuration verification above.
+node_b.succeed("systemctl start arbor-registry-transport.service")
 node_b.wait_for_unit("arbor-registry-transport.service", timeout=120)
+node_b.wait_until_succeeds("test -S /run/arbor-registry-transport/transport.sock", timeout=120)
+status_b = transport(node_b, "status")
+assert status_b.get("ok") is True and status_b.get("peerId"), status_b
+assert status_b.get("databaseAddresses") == status_a["databaseAddresses"], (status_a, status_b)
+print("STARTUP B-configured-and-actual-DB-equals-A: PASS")
+node_b.succeed("systemctl restart arbor-registry-transport.service")
+node_b.wait_for_unit("arbor-registry-transport.service", timeout=120)
+node_b.wait_until_succeeds("test -S /run/arbor-registry-transport/transport.sock", timeout=120)
+status_b_after_transport_restart = transport(node_b, "status")
+assert status_b_after_transport_restart["databaseAddresses"] == status_a["databaseAddresses"]
+node_b.succeed("test -s /var/lib/arbor-registry-transport/transport-bootstrap.json")
+print("STARTUP B-DB-address-persistence-after-restart: PASS")
+
 for node in (node_a, node_b):
     node.succeed("systemctl start arbor-registry.service")
     node.wait_for_unit("arbor-registry.service", timeout=120)
@@ -85,6 +130,7 @@ node_b.succeed("systemctl stop arbor-registry.service")
 assert registry(node_a, "ingest", records=[by_id["live-outage"]])["outcomes"][0]["status"] == "accepted"
 node_b.succeed("systemctl start arbor-registry.service")
 node_b.wait_for_unit("arbor-registry.service", timeout=120)
+node_b.wait_until_succeeds("test -S /run/arbor-registry/registry.sock", timeout=120)
 wait_until(node_b, lambda: has_record(node_b, "live-outage"), "Registry outage catch-up failed")
 
 before = registry(node_b, "status")["runtime"]["providerCursor"]
@@ -94,6 +140,8 @@ assert registry(node_a, "ingest", records=[by_id["live-after-restart"]])["outcom
 wait_until(node_b, lambda: has_record(node_b, "live-after-restart"), "restart cursor did not resume")
 after = registry(node_b, "status")["runtime"]["providerCursor"]
 assert before != after, (before, after)
+status_b_after_restart = transport(node_b, "status")
+assert status_b_after_restart["databaseAddresses"] == status_a["databaseAddresses"]
 assert len([item for item in accepted(node_a) if item["recordId"] == "live-a"]) == 1
 assert len([item for item in accepted(node_b) if item["recordId"] == "live-a"]) == 1
 print("LIVE Registry A/B ingest -> remote automatic consumption: PASS")
