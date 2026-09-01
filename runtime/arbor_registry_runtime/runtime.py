@@ -1622,11 +1622,15 @@ class Runtime:
         A trigger can be delivered by transport notification or an operator;
         callers choose their own retry schedule, so this method never polls.
         """
-        if max_pages < 1 or max_pages > 64 or page_size < 1 or page_size > 500:
+        if (isinstance(max_pages, bool) or not isinstance(max_pages, int)
+                or max_pages < 1 or max_pages > 64
+                or isinstance(page_size, bool) or not isinstance(page_size, int)
+                or page_size < 1 or page_size > 500):
             raise ValueError("sync bounds are invalid")
         if not self._sync_lock.acquire(blocking=False):
             return {"state": "busy", "pages": 0, "records": 0}
         pages = records = 0
+        backlog = False
         try:
             self._sync_status = {"state": "syncing", "lastError": None, "pages": 0, "records": 0}
             cursor = self._provider_cursor()
@@ -1637,6 +1641,8 @@ class Runtime:
                 if hasattr(self.provider, "next_cursor"):
                     self.provider.next_cursor = None
                 page = self.provider.fetch(cursor, page_size)
+                if not isinstance(page, list):
+                    raise ValueError("provider returned a non-list page")
                 previous: ProviderCursor | None = None
                 for item_cursor, record in page:
                     if not self._valid_cursor(item_cursor):
@@ -1655,7 +1661,7 @@ class Runtime:
                 if page:
                     if next_cursor is None:
                         last = page[-1][0]
-                        next_cursor = last + 1 if isinstance(last, int) else last
+                        next_cursor = last + 1 if isinstance(last, int) else None
                     if not self._valid_cursor(next_cursor) or not self._cursor_advanced(cursor, next_cursor):
                         raise ValueError("provider did not advance its cursor")
                     self.ingest((record for _, record in page), retain=False, commit=False)
@@ -1668,9 +1674,11 @@ class Runtime:
                     break
                 if len(page) < page_size:
                     break
-            self._sync_status = {"state": "idle", "lastError": None, "pages": pages, "records": records}
+                backlog = pages >= max_pages
+            self._sync_status = {"state": "idle", "lastError": None, "pages": pages,
+                                 "records": records, "backlog": backlog}
             return dict(self._sync_status)
-        except (OSError, RuntimeError, TimeoutError, TypeError, ValueError) as error:
+        except (OSError, RuntimeError, TimeoutError, TypeError, ValueError, sqlite3.Error) as error:
             self.db.rollback()
             self._sync_status = {"state": "degraded", "lastError": str(error), "pages": pages, "records": records}
             return dict(self._sync_status)
