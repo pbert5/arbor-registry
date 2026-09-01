@@ -41,14 +41,17 @@ let
         transportSocket = "/run/arbor-registry-transport/transport.sock";
         tokenFile = "/run/arbor-test/runtime/socket-token";
         bootstrapAuthoritiesFile = "/run/arbor-test/bootstrap-authorities.json";
-        authorityIssuers = [ "root-a" ];
+        authorityIssuers = [
+          "root-a"
+          "root-b"
+          "child"
+          "grandchild"
+        ];
       };
       # The graph test creates the authority key at runtime. Keep the
       # production target from starting Registry until that public key map
       # has been installed by the test harness.
-      systemd.targets.arbor-participant.wants = pkgs.lib.mkForce [
-        "arbor-registry-transport.service"
-      ];
+      systemd.targets.arbor-participant.wants = pkgs.lib.mkForce [ ];
       systemd.services.arbor-registry.wantedBy = pkgs.lib.mkForce [ ];
       systemd.tmpfiles.rules = [
         "d /run/arbor-test 0755 root root -"
