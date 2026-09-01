@@ -109,6 +109,10 @@
           module = serviceContractModule;
           pkgs = import nixpkgs { inherit system; };
         };
+        two-node-convergence-vm = import ./tests/two-node-convergence-vm.nix {
+          module = serviceContractModule;
+          pkgs = import nixpkgs { inherit system; };
+        };
         vault-upstream = import ./tests/vault-upstream.nix {
           inherit nixpkgs system;
           pkgs = import nixpkgs { inherit system; };
