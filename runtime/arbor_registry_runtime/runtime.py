@@ -550,7 +550,14 @@ def generate_keypair(
                     if name:
                         backup = confined(name)
                         destination = confined(destinations[kind], expected=expected_destinations[kind])
+                        # Once the durable phase says the old pair was backed
+                        # up, any destination is untrusted (it may be a
+                        # partially installed candidate). Remove it before
+                        # restoring the old member, so a failed transition
+                        # cannot leave a mixed key pair behind.
                         if backup.exists() and (phase == "backed-up" or not destination.exists()):
+                            if phase == "backed-up":
+                                destination.unlink(missing_ok=True)
                             os.replace(backup, private_path if kind == "private" else public_path)
             else:
                 raise ValueError("unknown key-pair transaction phase")
@@ -613,9 +620,93 @@ def generate_keypair(
             _write_durable(journal_path, json.dumps(transaction, sort_keys=True))
             recover()
             return key
+        except BaseException:
+            # Do not expose a partially installed pair to the caller or to a
+            # subsequent transition attempt.
+            if journal_path.exists():
+                recover()
+            raise
         finally:
             for name in temporary.values():
                 (key_dir / name).unlink(missing_ok=True)
+
+
+def stage_keypair(key_dir: Path, issuer: str, generation: int) -> RuntimeKey:
+    """Create a numbered candidate without changing the active key pair."""
+    return generate_keypair(key_dir, issuer, generation=generation)
+
+
+def activate_keypair(key_dir: Path, issuer: str, generation: int) -> RuntimeKey:
+    """Atomically promote a staged numbered pair to the active pair.
+
+    The staged pair is copied into the existing journaled pair transaction;
+    the active pair is not touched until both candidate members have been
+    validated and durably prepared.  A failed promotion restores both old
+    members before returning the error.
+    """
+    if (not isinstance(issuer, str) or not issuer or issuer in {".", ".."}
+            or issuer != Path(issuer).name or "/" in issuer or "\\" in issuer or "\x00" in issuer):
+        raise ValueError("issuer must be a single safe path component")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise ValueError("generation must be a positive integer")
+    key_dir = Path(key_dir)
+    candidate_private = key_dir / f"{issuer}.g{generation}.private"
+    candidate_public = key_dir / f"{issuer}.g{generation}.public"
+    if not candidate_private.exists() or not candidate_public.exists():
+        raise FileNotFoundError("staged key pair does not exist")
+    _secure_directory(key_dir)
+    _secure_file(candidate_private)
+    _secure_public_file(candidate_public)
+    seed = SigningKey(_unb64(candidate_private.read_text(encoding="ascii").strip()))
+    if seed.verify_key != VerifyKey(_unb64(candidate_public.read_text(encoding="ascii").strip())):
+        raise ValueError("staged key pair members do not match")
+    # Reuse the proven pair transaction by writing the candidate bytes to
+    # temporary active members, then replacing the active destinations.
+    active_private, active_public = key_dir / f"{issuer}.private", key_dir / f"{issuer}.public"
+    journal = key_dir / f".{issuer}.keypair-transaction"
+    lock_path = key_dir / f".{issuer}.keypair-lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(lock_fd, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        temporary = {}
+        backups = {}
+        try:
+            for kind, source, mode in (("private", candidate_private, 0o600), ("public", candidate_public, 0o644)):
+                fd, name = tempfile.mkstemp(prefix=f".{issuer}.{kind}.", dir=key_dir)
+                temporary[kind] = Path(name).name
+                os.fchmod(fd, mode)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(source.read_bytes())
+                    stream.flush(); os.fsync(stream.fileno())
+                destination = active_private if kind == "private" else active_public
+                backup = key_dir / f".{destination.name}.backup"
+                backups[kind] = backup.name if destination.exists() else None
+            transaction = {"phase": "prepared", "temporary": temporary,
+                           "destinations": {"private": active_private.name, "public": active_public.name},
+                           "backups": backups}
+            _write_durable(journal, json.dumps(transaction, sort_keys=True))
+            transaction["phase"] = "backed-up"; _write_durable(journal, json.dumps(transaction, sort_keys=True))
+            for kind, destination in (("private", active_private), ("public", active_public)):
+                if backups[kind]:
+                    os.replace(destination, key_dir / backups[kind])
+            for kind, destination in (("private", active_private), ("public", active_public)):
+                os.replace(key_dir / temporary[kind], destination)
+            transaction["phase"] = "installed"; _write_durable(journal, json.dumps(transaction, sort_keys=True))
+            for name in backups.values():
+                if name: (key_dir / name).unlink(missing_ok=True)
+            journal.unlink(missing_ok=True); _fsync_directory(key_dir)
+            return RuntimeKey(issuer, seed)
+        except BaseException:
+            # Restore synchronously; the next invocation's recovery remains a
+            # second line of defence for process death.
+            for kind, destination in (("private", active_private), ("public", active_public)):
+                backup = backups.get(kind)
+                if backup and (key_dir / backup).exists():
+                    destination.unlink(missing_ok=True)
+                    os.replace(key_dir / backup, destination)
+            raise
+        finally:
+            for name in temporary.values(): (key_dir / name).unlink(missing_ok=True)
 
 
 class Provider(ABC):
@@ -812,12 +903,14 @@ class Runtime:
         approver_roles: dict[str, set[str]] | None = None,
         recovery_thresholds: dict[str, int] | None = None,
         node_key: RuntimeKey | None = None,
+        allow_self_recovery: bool = False,
     ):
         self.state_dir = Path(state_dir)
         _secure_directory(self.state_dir)
         self.provider = provider
         self.public_keys = dict(public_keys)
         self.node_key = node_key
+        self.allow_self_recovery = allow_self_recovery
         if node_key is not None:
             self.public_keys.setdefault(node_key.issuer, node_key.public_key)
         self.authority_issuers = set(authority_issuers) if authority_issuers is not None else (
@@ -1189,8 +1282,12 @@ class Runtime:
                     or not payload["reason"]):
                 return "quarantined", "malformed-revocation"
         if record["schema"] == "recovery-authorization":
-            if self._recovery_approval_reason(payload) is not None:
-                return "quarantined", self._recovery_approval_reason(payload)
+            # Full authorization depends on the complete reconciled history
+            # (published approver generations and graph roles), so it is
+            # checked below by _reconcile rather than against bootstrap state.
+            if (not isinstance(payload.get("identity"), str)
+                    or not isinstance(payload.get("approvals"), list)):
+                return "quarantined", "malformed-recovery-authorization"
         if record["schema"] == "receipt":
             if not isinstance(payload.get("subject"), str) or not isinstance(payload.get("digest"), str):
                 return "quarantined", "malformed-receipt"
@@ -1205,6 +1302,7 @@ class Runtime:
         revoked_generations: set[tuple[str, int]] | None = None,
         graph_records: list[dict[str, Any]] | None = None,
         authority_root: str | None = None,
+        outer_issuer: str | None = None,
     ) -> str | None:
         identity = payload.get("identity")
         lost = payload.get("lostGeneration")
@@ -1241,6 +1339,11 @@ class Runtime:
                 return "unbound-recovery-approval"
             approver = approval["approver"]
             role = approval["role"]
+            if approver == identity and not self.allow_self_recovery:
+                return "self-recovery-not-authorized"
+            if (not isinstance(outer_issuer, str) or not outer_issuer
+                    or outer_issuer == identity or outer_issuer not in self.authority_issuers):
+                return "non-independent-recovery-issuer"
             if approver not in self.approver_roles.get(role, set()):
                 return "untrusted-recovery-approver"
             if graph_records is not None and role in {"parent", "peer"}:
@@ -1271,14 +1374,16 @@ class Runtime:
                 if generation_keys is not None:
                     if revoked_generations and (approver, approval["approverGeneration"]) in revoked_generations:
                         return "revoked-approver-generation"
-                    if approver in self.authority_issuers and (approver, approval["approverGeneration"]) not in generation_keys:
-                        public_key = self.public_keys[approver]
-                    else:
-                        if current_generations and current_generations.get(approver) != approval["approverGeneration"]:
-                            return "stale-approver-generation"
-                        public_key = generation_keys.get((approver, approval["approverGeneration"]))
-                        if public_key is None:
-                            return "unknown-approver-generation"
+                    if approver in current_generations and current_generations[approver] != approval["approverGeneration"]:
+                        return "stale-approver-generation"
+                    public_key = generation_keys.get((approver, approval["approverGeneration"]))
+                    # A bootstrap authority is valid only as its undisputed
+                    # initial generation. Once that identity publishes a
+                    # generation, the bootstrap map can never override it.
+                    if public_key is None and approver not in current_generations and approval["approverGeneration"] == 1:
+                        public_key = self.public_keys.get(approver)
+                    if public_key is None:
+                        return "unknown-approver-generation"
                 else:
                     public_key = self.public_keys[approval["approver"]]
                 key = VerifyKey(_unb64(public_key))
@@ -1523,6 +1628,7 @@ class Runtime:
                 revoked_generations=revocations,
                 graph_records=graph_records,
                 authority_root=root,
+                outer_issuer=record.get("issuer"),
             )
             if reason is not None:
                 reasons[rowid] = reason

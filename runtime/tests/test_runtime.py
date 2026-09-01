@@ -11,7 +11,8 @@ from pathlib import Path
 
 from nacl.signing import SigningKey
 
-from arbor_registry_runtime import FileProvider, OrbitDBProvider, Provider, Runtime, RuntimeKey, canonical_json, generate_keypair
+from arbor_registry_runtime import (FileProvider, OrbitDBProvider, Provider, Runtime, RuntimeKey,
+                                    activate_keypair, canonical_json, generate_keypair, stage_keypair)
 from arbor_registry_runtime.runtime import (
     approve_enrollment,
     make_identity_generation,
@@ -277,6 +278,27 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotEqual(first.public_key, second.public_key)
         self.assertTrue((key_dir / "operator.g1.private").exists())
         self.assertTrue((key_dir / "operator.g2.private").exists())
+
+    def test_staged_keypair_activation_keeps_candidate_separate_until_promotion(self):
+        key_dir = Path(self.temp.name) / "staged-identity"
+        first = generate_keypair(key_dir, "operator")
+        candidate = stage_keypair(key_dir, "operator", 2)
+        self.assertEqual(first.public_key, (key_dir / "operator.public").read_text().strip())
+        self.assertNotEqual(candidate.public_key, first.public_key)
+        self.assertEqual(candidate.public_key, (key_dir / "operator.g2.public").read_text().strip())
+        promoted = activate_keypair(key_dir, "operator", 2)
+        self.assertEqual(promoted.public_key, candidate.public_key)
+        self.assertEqual(promoted.public_key, (key_dir / "operator.public").read_text().strip())
+
+    def test_default_policy_rejects_lost_identity_self_recovery(self):
+        identity = make_identity_generation(self.key, "root", 1, self.key.public_key)
+        approval = make_recovery_approval(
+            self.key, "root", 1, role="operator", approver_generation=1,
+            new_public_key="replacement", new_generation=2,
+        )
+        authorization = make_recovery_authorization(self.key, "root", 1, "replacement", [approval])
+        outcome = self.runtime.ingest([identity, authorization])[-1]
+        self.assertEqual(outcome["reason"], "self-recovery-not-authorized")
 
     def test_generate_keypair_rejects_path_traversal_and_absolute_issuers(self):
         key_dir = Path(self.temp.name) / "identity"
@@ -854,7 +876,7 @@ class RuntimeTests(unittest.TestCase):
             current_operator = make_identity_generation(self.key, "operator", 2, "new-operator-key")
             runtime.ingest([current_operator])
             self.assertIn(
-                "stale-approver-generation",
+                "missing-recovery-authorization",
                 {item["reason"] for item in runtime.quarantine()},
             )
             self.assertEqual(runtime.projection()["node"]["generation"], 2)
