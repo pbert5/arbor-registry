@@ -119,6 +119,90 @@ def _write_durable(path: Path, value: str) -> None:
         raise
 
 
+def _recover_keypair_transaction(
+    key_dir: Path,
+    journal_path: Path,
+    lock_path: Path,
+    destinations: dict[str, str],
+) -> None:
+    """Finish or roll back an interrupted active key-pair transaction.
+
+    The journal is the authority for the recovery decision.  In particular,
+    once ``backed-up`` is durable, an active destination is untrusted and must
+    be removed before its old member is restored.  Callers must hold the
+    corresponding pair lock.
+    """
+    if not os.path.lexists(journal_path):
+        return
+
+    def confined(name: Any, *, expected: str | None = None) -> Path:
+        if (not isinstance(name, str) or not name or name in {".", ".."}
+                or name != Path(name).name or "/" in name or "\\" in name or "\x00" in name):
+            raise ValueError("key-pair transaction contains an unsafe path")
+        if expected is not None and name != expected:
+            raise ValueError("key-pair transaction destination mismatch")
+        return key_dir / name
+
+    def transaction_entry(name: Any, mode: int) -> Path:
+        path = confined(name)
+        if path.exists() or os.path.lexists(path):
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != mode:
+                raise ValueError("key-pair transaction entry is not a safe regular file")
+            if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                raise ValueError("key-pair transaction entry has unexpected owner")
+        return path
+
+    try:
+        _secure_file(journal_path)
+        transaction = json.loads(journal_path.read_text(encoding="ascii"))
+        if not isinstance(transaction, dict):
+            raise ValueError("key-pair transaction is not an object")
+        phase = transaction.get("phase")
+        temporary = transaction.get("temporary")
+        backups = transaction.get("backups")
+        if (not isinstance(temporary, dict) or not isinstance(backups, dict)
+                or set(transaction.get("destinations", {})) != set(destinations)
+                or set(temporary) != set(destinations)
+                or set(backups) != set(destinations)):
+            raise ValueError("key-pair transaction has an invalid shape")
+        for kind, expected in destinations.items():
+            transaction_destinations = transaction["destinations"]
+            confined(transaction_destinations[kind], expected=expected)
+            temporary_path = transaction_entry(temporary[kind], 0o600 if kind == "private" else 0o644)
+            backup_name = backups[kind]
+            if backup_name is not None:
+                expected_backup = f".{expected}.backup"
+                confined(backup_name, expected=expected_backup)
+                transaction_entry(backup_name, 0o600 if kind == "private" else 0o644)
+            if temporary_path.name in {journal_path.name, lock_path.name, expected}:
+                raise ValueError("key-pair transaction entry collides with key material")
+        if phase == "installed":
+            for name in backups.values():
+                if name:
+                    confined(name).unlink(missing_ok=True)
+        elif phase in {"prepared", "backed-up"}:
+            # A prepared journal is not proof that a destination was backed
+            # up. Never delete an original in that phase. Once backed-up is
+            # durable, restore both members and discard any partial candidate.
+            for kind, name in backups.items():
+                if name:
+                    backup = confined(name)
+                    destination = confined(transaction["destinations"][kind], expected=destinations[kind])
+                    if backup.exists() and (phase == "backed-up" or not destination.exists()):
+                        if phase == "backed-up":
+                            destination.unlink(missing_ok=True)
+                        os.replace(backup, destination)
+        else:
+            raise ValueError("unknown key-pair transaction phase")
+        for name in temporary.values():
+            confined(name).unlink(missing_ok=True)
+        journal_path.unlink(missing_ok=True)
+        _fsync_directory(key_dir)
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("key-pair transaction recovery failed") from error
+
+
 def canonical_json(value: Any) -> bytes:
     """The wire canonical form: UTF-8, sorted keys, no insignificant whitespace."""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -491,83 +575,6 @@ def generate_keypair(
     journal_path = key_dir / f".{issuer}{suffix}.keypair-transaction"
     lock_path = key_dir / f".{issuer}{suffix}.keypair-lock"
 
-    def confined(name: Any, *, expected: str | None = None) -> Path:
-        if (not isinstance(name, str) or not name or name in {".", ".."}
-                or name != Path(name).name or "/" in name or "\\" in name or "\x00" in name):
-            raise ValueError("key-pair transaction contains an unsafe path")
-        if expected is not None and name != expected:
-            raise ValueError("key-pair transaction destination mismatch")
-        return key_dir / name
-
-    def transaction_entry(name: Any, mode: int) -> Path:
-        path = confined(name)
-        if path.exists() or os.path.lexists(path):
-            info = path.lstat()
-            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != mode:
-                raise ValueError("key-pair transaction entry is not a safe regular file")
-            if hasattr(os, "getuid") and info.st_uid != os.getuid():
-                raise ValueError("key-pair transaction entry has unexpected owner")
-        return path
-
-    def recover() -> None:
-        if not os.path.lexists(journal_path):
-            return
-        try:
-            _secure_file(journal_path)
-            transaction = json.loads(journal_path.read_text(encoding="ascii"))
-            if not isinstance(transaction, dict):
-                raise ValueError("key-pair transaction is not an object")
-            phase = transaction.get("phase")
-            destinations = transaction.get("destinations")
-            temporary = transaction.get("temporary")
-            backups = transaction.get("backups")
-            expected_destinations = {"private": private_path.name, "public": public_path.name}
-            if (not isinstance(destinations, dict) or not isinstance(temporary, dict)
-                    or not isinstance(backups, dict)
-                    or set(destinations) != set(expected_destinations)
-                    or set(temporary) != set(expected_destinations)
-                    or set(backups) != set(expected_destinations)):
-                raise ValueError("key-pair transaction has an invalid shape")
-            for kind, expected in expected_destinations.items():
-                confined(destinations[kind], expected=expected)
-                temporary_path = transaction_entry(temporary[kind], 0o600 if kind == "private" else 0o644)
-                backup_name = backups[kind]
-                if backup_name is not None:
-                    expected_backup = f".{expected}.backup"
-                    confined(backup_name, expected=expected_backup)
-                    transaction_entry(backup_name, 0o600 if kind == "private" else 0o644)
-                if temporary_path.name in {journal_path.name, lock_path.name, expected}:
-                    raise ValueError("key-pair transaction entry collides with key material")
-            if phase == "installed":
-                for name in backups.values():
-                    if name:
-                        confined(name).unlink(missing_ok=True)
-            elif phase in {"prepared", "backed-up"}:
-                # A prepared journal is intentionally not proof that an old
-                # destination was backed up. Never delete it. If a backup is
-                # present, restore it only when the destination is absent.
-                for kind, name in backups.items():
-                    if name:
-                        backup = confined(name)
-                        destination = confined(destinations[kind], expected=expected_destinations[kind])
-                        # Once the durable phase says the old pair was backed
-                        # up, any destination is untrusted (it may be a
-                        # partially installed candidate). Remove it before
-                        # restoring the old member, so a failed transition
-                        # cannot leave a mixed key pair behind.
-                        if backup.exists() and (phase == "backed-up" or not destination.exists()):
-                            if phase == "backed-up":
-                                destination.unlink(missing_ok=True)
-                            os.replace(backup, private_path if kind == "private" else public_path)
-            else:
-                raise ValueError("unknown key-pair transaction phase")
-            for name in temporary.values():
-                confined(name).unlink(missing_ok=True)
-            journal_path.unlink(missing_ok=True)
-            _fsync_directory(key_dir)
-        except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as error:
-            raise RuntimeError("key-pair transaction recovery failed") from error
-
     # The lock makes pair recovery and replacement mutually exclusive with
     # readers/writers that use this API. The journal makes an interrupted pair
     # recoverable without putting private key material in the journal itself.
@@ -577,7 +584,10 @@ def generate_keypair(
         raise ValueError("key-pair lock is not safe") from error
     with os.fdopen(lock_fd, "a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        recover()
+        _recover_keypair_transaction(
+            key_dir, journal_path, lock_path,
+            {"private": private_path.name, "public": public_path.name},
+        )
         lock_path.chmod(0o600)
         _secure_file(private_path)
         _secure_public_file(public_path)
@@ -618,13 +628,19 @@ def generate_keypair(
                 _replace_keypair(str(key_dir / temporary[kind]), destination)
             transaction["phase"] = "installed"
             _write_durable(journal_path, json.dumps(transaction, sort_keys=True))
-            recover()
+            _recover_keypair_transaction(
+                key_dir, journal_path, lock_path,
+                {"private": private_path.name, "public": public_path.name},
+            )
             return key
         except BaseException:
             # Do not expose a partially installed pair to the caller or to a
             # subsequent transition attempt.
             if journal_path.exists():
-                recover()
+                _recover_keypair_transaction(
+                    key_dir, journal_path, lock_path,
+                    {"private": private_path.name, "public": public_path.name},
+                )
             raise
         finally:
             for name in temporary.values():
@@ -668,6 +684,12 @@ def activate_keypair(key_dir: Path, issuer: str, generation: int) -> RuntimeKey:
     lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(lock_fd, "a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        _recover_keypair_transaction(
+            key_dir, journal, lock_path,
+            {"private": active_private.name, "public": active_public.name},
+        )
+        _secure_file(active_private)
+        _secure_public_file(active_public)
         temporary = {}
         backups = {}
         try:
@@ -688,9 +710,9 @@ def activate_keypair(key_dir: Path, issuer: str, generation: int) -> RuntimeKey:
             transaction["phase"] = "backed-up"; _write_durable(journal, json.dumps(transaction, sort_keys=True))
             for kind, destination in (("private", active_private), ("public", active_public)):
                 if backups[kind]:
-                    os.replace(destination, key_dir / backups[kind])
+                    _replace_keypair(str(destination), key_dir / backups[kind])
             for kind, destination in (("private", active_private), ("public", active_public)):
-                os.replace(key_dir / temporary[kind], destination)
+                _replace_keypair(str(key_dir / temporary[kind]), destination)
             transaction["phase"] = "installed"; _write_durable(journal, json.dumps(transaction, sort_keys=True))
             for name in backups.values():
                 if name: (key_dir / name).unlink(missing_ok=True)
@@ -698,12 +720,19 @@ def activate_keypair(key_dir: Path, issuer: str, generation: int) -> RuntimeKey:
             return RuntimeKey(issuer, seed)
         except BaseException:
             # Restore synchronously; the next invocation's recovery remains a
-            # second line of defence for process death.
-            for kind, destination in (("private", active_private), ("public", active_public)):
-                backup = backups.get(kind)
-                if backup and (key_dir / backup).exists():
-                    destination.unlink(missing_ok=True)
-                    os.replace(key_dir / backup, destination)
+            # second line of defence for process death.  The durable journal
+            # is authoritative if the failure happened after it was written.
+            if journal.exists():
+                _recover_keypair_transaction(
+                    key_dir, journal, lock_path,
+                    {"private": active_private.name, "public": active_public.name},
+                )
+            else:
+                for kind, destination in (("private", active_private), ("public", active_public)):
+                    backup = backups.get(kind)
+                    if backup and (key_dir / backup).exists():
+                        destination.unlink(missing_ok=True)
+                        os.replace(key_dir / backup, destination)
             raise
         finally:
             for name in temporary.values(): (key_dir / name).unlink(missing_ok=True)
@@ -998,6 +1027,61 @@ class Runtime:
             self.db.commit()
         return self.ingest([record])[0]
 
+    def activate_recovery_keypair(
+        self,
+        key_dir: Path,
+        issuer: str,
+        generation: int,
+        authorization: dict[str, Any],
+    ) -> RuntimeKey:
+        """Promote a recovery candidate only after Registry acceptance.
+
+        Key files are staged independently.  This method is the sole recovery
+        activation boundary: it requires the exact accepted authorization
+        envelope, then binds the staged public key and generation to that
+        authorization's immutable proposal before touching the active pair.
+        Ordinary key rotation remains available through ``activate_keypair``
+        and ``generate_keypair(rotation=True)``.
+        """
+        if not isinstance(authorization, dict):
+            raise ValueError("recovery authorization is required")
+        payload = authorization.get("payload")
+        lost_generation = payload.get("lostGeneration") if isinstance(payload, dict) else None
+        new_generation = payload.get("newGeneration") if isinstance(payload, dict) else None
+        if (authorization.get("schema") != "recovery-authorization"
+                or not isinstance(payload, dict)
+                or payload.get("identity") != issuer
+                or new_generation != generation
+                or lost_generation != generation - 1
+                or not isinstance(lost_generation, int)
+                or isinstance(lost_generation, bool)
+                or not isinstance(new_generation, int)
+                or isinstance(new_generation, bool)
+                or new_generation != lost_generation + 1):
+            raise ValueError("recovery authorization does not match candidate")
+        try:
+            envelope = canonical_json(authorization).decode("ascii")
+        except (UnicodeError, TypeError, ValueError) as error:
+            raise ValueError("recovery authorization is not canonical") from error
+        row = self.db.execute(
+            "SELECT status FROM records WHERE envelope = ?", (envelope,)
+        ).fetchone()
+        if row != ("accepted",):
+            raise ValueError("recovery authorization is not accepted")
+        proposal_digest = payload.get("proposalDigest")
+        if (not isinstance(payload.get("newPublicKey"), str)
+                or proposal_digest != _recovery_proposal_digest(
+                    issuer, generation - 1, generation, payload["newPublicKey"]
+                )):
+            raise ValueError("recovery authorization proposal is invalid")
+        candidate_public = Path(key_dir) / f"{issuer}.g{generation}.public"
+        if not candidate_public.exists():
+            raise FileNotFoundError("staged key pair does not exist")
+        _secure_public_file(candidate_public)
+        if candidate_public.read_text(encoding="ascii").strip() != payload["newPublicKey"]:
+            raise ValueError("staged key does not match accepted recovery proposal")
+        return activate_keypair(key_dir, issuer, generation)
+
     def _is_exact_local_genesis(self, record: dict[str, Any]) -> bool:
         """Whether a record is the exact persisted local root assertion."""
         identity = record.get("issuer")
@@ -1276,6 +1360,29 @@ class Runtime:
                     or payload.get("generation") != record["generation"]
                     or payload.get("status", "active") not in {"active", "deprecated"}):
                 return "quarantined", "malformed-identity-generation"
+        if record["schema"] == "node-identity":
+            # Modern self-root records may use the historical ``id`` field,
+            # but any record using the identity-generation fields must carry
+            # a complete, authority-bound identity assertion.  In particular,
+            # a root-signed legacy assertion may not name an approver other
+            # than the issuer and thereby smuggle in an unverified approval.
+            if "identity" in payload and (
+                    not isinstance(payload.get("identity"), str)
+                    or not payload.get("identity")):
+                return "quarantined", "malformed-node-identity"
+            if "publicKey" in payload and (
+                    not isinstance(payload.get("publicKey"), str) or not payload.get("publicKey")):
+                return "quarantined", "malformed-node-identity"
+            approved_by = payload.get("approvedBy")
+            if approved_by is not None and (
+                    not isinstance(approved_by, str) or approved_by != record["issuer"]
+                    or not isinstance(payload.get("publicKey"), str)):
+                return "quarantined", "unapproved-node-identity"
+            for field in ("identityGeneration", "approverGeneration"):
+                value = payload.get(field)
+                if value is not None and (
+                        isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                    return "quarantined", "malformed-node-identity"
         if record["schema"] == "revocation":
             if (not isinstance(payload.get("identity"), str) or not isinstance(payload.get("generation"), int)
                     or payload["generation"] < 1 or not isinstance(payload.get("reason"), str)
@@ -1286,6 +1393,10 @@ class Runtime:
             # (published approver generations and graph roles), so it is
             # checked below by _reconcile rather than against bootstrap state.
             if (not isinstance(payload.get("identity"), str)
+                    or record.get("recordId") != f"{payload.get('identity')}:recovery:{payload.get('lostGeneration')}"
+                    or record.get("generation") != 1
+                    or record.get("recordVersion") != 1
+                    or record.get("predecessor") is not None
                     or not isinstance(payload.get("approvals"), list)):
                 return "quarantined", "malformed-recovery-authorization"
         if record["schema"] == "receipt":
@@ -1333,6 +1444,7 @@ class Runtime:
                     or approval["newPublicKey"] != replacement or approval["newGeneration"] != new
                     or approval["proposalDigest"] != proposal_digest
                     or approval["role"] not in {"operator", "parent", "peer"}
+                    or isinstance(approval["approverGeneration"], bool)
                     or not isinstance(approval["approverGeneration"], int)
                     or approval["approverGeneration"] < 1
                     or approval.get("approver") != approval.get("issuer")):
@@ -1496,13 +1608,26 @@ class Runtime:
             if isinstance(record, dict) and record.get("schema") == "recovery-authorization"
             and self._validate(record)[0] == "accepted"
         ]
+        authorization_proposals: dict[tuple[str, int, int], list[int]] = {}
+        for rowid, _, record in valid_authorizations:
+            payload = record.get("payload", {})
+            proposal = (
+                payload.get("identity"), payload.get("lostGeneration"), payload.get("newGeneration")
+            )
+            if all(isinstance(value, int) and not isinstance(value, bool) for value in proposal[1:]):
+                authorization_proposals.setdefault(proposal, []).append(rowid)
+        for rowids in authorization_proposals.values():
+            if len(rowids) > 1:
+                for rowid in rowids:
+                    reasons[rowid] = "replayed-recovery-authorization"
         authorizations = {
             (record["payload"]["identity"], record["payload"]["newGeneration"]): record
-            for _, _, record in valid_authorizations
+            for auth_rowid, _, record in valid_authorizations
             if record["schema"] == "recovery-authorization"
             and isinstance(record.get("payload"), dict)
             and isinstance(record["payload"].get("identity"), str)
             and isinstance(record["payload"].get("newGeneration"), int)
+            and reasons[auth_rowid] is None
         }
         active_generations: dict[str, int] = {}
         for _, _, record in candidates:
@@ -1528,7 +1653,10 @@ class Runtime:
                 if payload.get("identityGeneration") is not None and (
                         identity, payload.get("identityGeneration")) in revocations:
                     reasons[rowid] = "revoked-generation"
-            record_generation = payload.get("identityGeneration") if record["schema"] == "node-identity" else generation
+            record_generation = (
+                payload.get("identityGeneration", record["generation"])
+                if record["schema"] == "node-identity" else generation
+            )
             if isinstance(identity, str) and isinstance(record_generation, int) and identity in active_generations:
                 if (reasons[rowid] is None and record_generation < active_generations[identity]
                         and record["schema"] not in {"revocation", "recovery-authorization"}):
@@ -1600,22 +1728,60 @@ class Runtime:
         # map is only a bootstrap map; it must not make a rotated or revoked
         # generation authoritative.
         generation_keys: dict[tuple[str, int], str] = {}
+        generation_key_candidates: dict[tuple[str, int], set[str]] = {}
         current_generations: dict[str, int] = {}
         for _, _, record in candidates:
             if record["schema"] not in {"node-identity", "identity-generation"}:
                 continue
             payload = record.get("payload", {})
             identity = payload.get("identity") if isinstance(payload, dict) else None
-            generation = payload.get("generation", record.get("generation")) if isinstance(payload, dict) else None
+            generation = (
+                payload.get("identityGeneration", payload.get("generation", record.get("generation")))
+                if isinstance(payload, dict) else None
+            )
             public_key = payload.get("publicKey") if isinstance(payload, dict) else None
             if (not isinstance(identity, str) or isinstance(generation, bool)
                     or not isinstance(generation, int) or generation < 1
                     or not isinstance(public_key, str) or payload.get("status", "active") != "active"
                     or (identity, generation) in revocations):
                 continue
-            generation_keys[(identity, generation)] = public_key
+            generation_key_candidates.setdefault((identity, generation), set()).add(public_key)
             current_generations[identity] = max(current_generations.get(identity, 0), generation)
+        generation_keys = {
+            key: next(iter(public_keys))
+            for key, public_keys in generation_key_candidates.items()
+            if len(public_keys) == 1
+        }
         graph_records = [record for _, _, record in candidates]
+        for rowid, _, record in candidates:
+            if record["schema"] != "node-identity" or reasons[rowid] is not None:
+                continue
+            payload = record.get("payload", {})
+            identity = payload.get("identity") if isinstance(payload, dict) else None
+            if not isinstance(identity, str):
+                continue
+            identity_generation = payload.get("identityGeneration", record.get("generation"))
+            public_key = payload.get("publicKey")
+            if isinstance(identity_generation, int) and isinstance(public_key, str):
+                expected_key = generation_keys.get((identity, identity_generation))
+                if expected_key is None or expected_key != public_key:
+                    reasons[rowid] = "identity-key-mismatch"
+                    continue
+            approved_by = payload.get("approvedBy")
+            approver_generation = payload.get("approverGeneration")
+            if approved_by is None:
+                continue
+            if not isinstance(approver_generation, int) or isinstance(approver_generation, bool):
+                # A legacy approval without a generation is only safe while
+                # the issuer still has its undisputed bootstrap generation.
+                if current_generations.get(approved_by, 1) > 1:
+                    reasons[rowid] = "stale-approver-generation"
+                continue
+            if current_generations.get(approved_by) != approver_generation:
+                reasons[rowid] = "stale-approver-generation"
+                continue
+            if (approved_by, approver_generation) not in generation_keys:
+                reasons[rowid] = "unknown-approver-generation"
         for rowid, _, record in candidates:
             if record["schema"] != "recovery-authorization":
                 continue
