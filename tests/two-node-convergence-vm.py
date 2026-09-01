@@ -59,25 +59,30 @@ def wait_until(node, predicate, label):
         node.succeed("sleep 0.25")
     raise AssertionError(label + ": " + json.dumps(last))
 
-# Both directions are consumed by the installed Registry sync workers.
-assert not transport(node_a, "append", stream="registry", event=by_id["live-a"])["duplicate"]
-assert transport(node_a, "append", stream="registry", event=by_id["live-a"])["duplicate"]
+# Both directions are consumed by the installed Registry sync workers.  The
+# originating node uses the Registry API, which validates, persists, and
+# publishes the record to the raw transport.
+assert registry(node_a, "ingest", records=[by_id["live-a"]])["outcomes"][0]["status"] == "accepted"
 wait_until(node_a, lambda: has_record(node_a, "live-a"), "A did not auto-consume A record")
 wait_until(node_b, lambda: has_record(node_b, "live-a"), "B did not auto-consume A record")
-assert not transport(node_b, "append", stream="registry", event=by_id["live-b"])["duplicate"]
+assert registry(node_b, "ingest", records=[by_id["live-b"]])["outcomes"][0]["status"] == "accepted"
 wait_until(node_a, lambda: has_record(node_a, "live-b"), "A did not auto-consume B record")
 wait_until(node_b, lambda: has_record(node_b, "live-b"), "B did not auto-consume B record")
 
+# Replaying a published transport entry is harmless and does not duplicate
+# the accepted projection.
+assert transport(node_a, "append", stream="registry", event=by_id["live-a"])["duplicate"]
+
 # The invalid entry must not prevent the following valid entry from landing.
-transport(node_a, "append", stream="registry", event=by_id["live-bad"])
-transport(node_a, "append", stream="registry", event=by_id["live-after-bad"])
+assert registry(node_a, "ingest", records=[by_id["live-bad"]])["outcomes"][0]["status"] == "quarantined"
+assert registry(node_a, "ingest", records=[by_id["live-after-bad"]])["outcomes"][0]["status"] == "accepted"
 wait_until(node_b, lambda: any(item["record"].get("recordId") == "live-bad" and item["reason"] == "unknown-schema" for item in quarantined(node_b)), "bad record was not quarantined")
 wait_until(node_b, lambda: has_record(node_b, "live-after-bad"), "valid record after bad record did not continue")
 
 # The transport stays available while B's Registry is down, then the worker
 # catches up from its durable cursor after the Registry restart.
 node_b.succeed("systemctl stop arbor-registry.service")
-transport(node_a, "append", stream="registry", event=by_id["live-outage"])
+assert registry(node_a, "ingest", records=[by_id["live-outage"]])["outcomes"][0]["status"] == "accepted"
 node_b.succeed("systemctl start arbor-registry.service")
 node_b.wait_for_unit("arbor-registry.service", timeout=120)
 wait_until(node_b, lambda: has_record(node_b, "live-outage"), "Registry outage catch-up failed")
@@ -85,13 +90,13 @@ wait_until(node_b, lambda: has_record(node_b, "live-outage"), "Registry outage c
 before = registry(node_b, "status")["runtime"]["providerCursor"]
 node_b.succeed("systemctl restart arbor-registry.service")
 node_b.wait_for_unit("arbor-registry.service", timeout=120)
-transport(node_a, "append", stream="registry", event=by_id["live-after-restart"])
+assert registry(node_a, "ingest", records=[by_id["live-after-restart"]])["outcomes"][0]["status"] == "accepted"
 wait_until(node_b, lambda: has_record(node_b, "live-after-restart"), "restart cursor did not resume")
 after = registry(node_b, "status")["runtime"]["providerCursor"]
 assert before != after, (before, after)
 assert len([item for item in accepted(node_a) if item["recordId"] == "live-a"]) == 1
 assert len([item for item in accepted(node_b) if item["recordId"] == "live-a"]) == 1
-print("LIVE A->B/B->A automatic consumption: PASS")
+print("LIVE Registry A/B ingest -> remote automatic consumption: PASS")
 print("LIVE duplicate idempotence: PASS")
 print("LIVE bad-record quarantine and continue: PASS")
 print("LIVE outage catch-up: PASS")
