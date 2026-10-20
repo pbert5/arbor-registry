@@ -1,0 +1,37 @@
+name: R640 trusted smoke
+
+# Public repository: deliberately MANUAL, DEFAULT-DISABLED, main-only.
+# Never route pull_request or arbitrary branch workflows to an on-prem runner.
+# A public-repository runner is unsafe if fork workflows can target it.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: R640 Arbor Registry smoke
+    if: >-
+      vars.R640_RUNNER_READY == 'true' &&
+      github.repository == 'pbert5/arbor-registry' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.actor == 'pbert5'
+    runs-on: [self-hosted, linux, x64, r640-0, docker-compose]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate checked-out repository (no Nix daemon, Docker or root)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          test -f flake.nix
+          python3 -m compileall -q runtime
+
+# This workflow is not an approval to enroll a self-hosted runner on a public
+# repository. First isolate the runner and verify fork PRs cannot schedule it.
+# Set R640_RUNNER_READY only after that independent security acceptance.
