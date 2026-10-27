@@ -2,7 +2,7 @@
   description = "Arbor Registry: pure signed-record reconciliation and graph library";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/685f399bbe297bdc8dc1712c69b88a2d9df1ea6b";
     systemd-vaultd.url = "github:numtide/systemd-vaultd";
     systemd-vaultd.inputs.nixpkgs.follows = "nixpkgs";
   };
@@ -48,6 +48,15 @@
       };
       formatter = forAllSystems (system: (import nixpkgs { inherit system; }).nixfmt-tree);
       checks = forAllSystems (system: {
+        openbao-version =
+          let
+            pkgs = import nixpkgs { inherit system; };
+            patched = version: pkgs.lib.versionAtLeast version "2.7.2";
+          in
+          assert !patched "2.6.2";
+          assert !patched "2.7.1";
+          assert patched pkgs.openbao.version;
+          pkgs.runCommand "arbor-registry-openbao-version" { } "touch $out";
         invariants = import ./tests/invariants.nix {
           inherit registry;
           pkgs = import nixpkgs { inherit system; };
@@ -183,6 +192,28 @@
               test "$(stat -c '%a' "$work/credential")" = 600
               test "$(stat -c '%a' "$work/ready")" = 644
               test "$(wc -c <"$work/ready")" = 65
+              cp "$work/credential" "$work/credential-before"
+              cp "$work/ready" "$work/ready-before"
+              chmod 644 "$token_file"
+              if ${runtime}/bin/arbor-openbao-provider \
+                --address "$BAO_ADDR" --token-file "$token_file" \
+                --path secret/data/arbor/db --field url \
+                --output "$work/credential" --ready "$work/ready"; then
+                exit 1
+              fi
+              cmp "$work/credential-before" "$work/credential"
+              cmp "$work/ready-before" "$work/ready"
+              chmod 600 "$token_file"
+              printf '%s\n' invalid-test-token >"$token_file"
+              if ${runtime}/bin/arbor-openbao-provider \
+                --address "$BAO_ADDR" --token-file "$token_file" \
+                --path secret/data/arbor/db --field url \
+                --output "$work/credential" --ready "$work/ready"; then
+                exit 1
+              fi
+              cmp "$work/credential-before" "$work/credential"
+              cmp "$work/ready-before" "$work/ready"
+              printf '%s\n' arbor-test-root >"$token_file"
               secret_v2="runtime-$(date +%s%N)"
               BAO_TOKEN=arbor-test-root ${pkgs.openbao}/bin/bao kv put secret/arbor/db url="$secret_v2" >/dev/null
               ${runtime}/bin/arbor-openbao-provider \

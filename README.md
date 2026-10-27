@@ -1,5 +1,9 @@
 # arbor-registry
 
+The Registry flake pins nixpkgs to an immutable revision containing OpenBao
+2.7.2 for its runtime and VM checks. This is dependency evidence, not evidence
+that any host has been deployed or that a particular OpenBao feature is in use.
+
 `arbor-registry` is a standalone component with a pure Nix library and an
 optional runtime package. The library validates canonical signed-record
 envelopes, reconciles accepted history, retains unknown or invalid transport
