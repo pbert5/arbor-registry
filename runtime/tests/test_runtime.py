@@ -3,12 +3,16 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from nacl.signing import SigningKey
 
-from arbor_registry_runtime import FileProvider, OrbitDBProvider, Provider, Runtime, RuntimeKey, canonical_json, generate_keypair
+from arbor_registry_runtime import (FileProvider, OrbitDBProvider, Provider, Runtime, RuntimeKey,
+                                    activate_keypair, canonical_json, generate_keypair, stage_keypair)
 from arbor_registry_runtime.runtime import (
     approve_enrollment,
     make_identity_generation,
@@ -18,6 +22,7 @@ from arbor_registry_runtime.runtime import (
     make_revocation,
     make_receipt,
     make_enrollment_request,
+    make_local_genesis,
 )
 from arbor_registry_runtime.runtime import _key
 from arbor_registry_runtime.openbao_provider import _json_value
@@ -84,6 +89,173 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             provider.fetch(0, 1001)
 
+    def test_sync_catches_up_and_resumes_from_durable_cursor(self):
+        provider = FileProvider(Path(self.temp.name) / "consumer-raw" / "history.jsonl")
+        state = Path(self.temp.name) / "consumer-state"
+        first, second = self.envelope("consumer-one"), self.envelope("consumer-two")
+        provider.append(first); provider.append(second)
+        runtime = Runtime(state, provider, {"root": self.key.public_key})
+        try:
+            self.assertEqual(runtime.sync(max_pages=1, page_size=1)["records"], 1)
+            self.assertEqual(runtime.status()["providerCursor"], 1)
+            runtime.close()
+            runtime = Runtime(state, provider, {"root": self.key.public_key})
+            self.assertEqual(runtime.sync(page_size=1)["records"], 1)
+            self.assertEqual(runtime.status()["providerCursor"], 2)
+            self.assertEqual(len(runtime.accepted()), 2)
+        finally:
+            runtime.close()
+
+    def test_sync_is_idempotent_and_quarantines_malformed_records(self):
+        provider = FileProvider(Path(self.temp.name) / "malformed-raw" / "history.jsonl")
+        state = Path(self.temp.name) / "malformed-state"
+        provider.append({"not": "an envelope"})
+        provider.append(self.envelope("valid-after-malformed"))
+        runtime = Runtime(state, provider, {"root": self.key.public_key})
+        try:
+            result = runtime.sync(page_size=2)
+            self.assertEqual(result["records"], 2)
+            self.assertEqual(runtime.status()["providerCursor"], 2)
+            self.assertEqual(runtime.quarantine()[0]["reason"], "malformed-record")
+            self.assertEqual(len(runtime.accepted()), 1)
+            self.assertEqual(runtime.sync()["records"], 0)
+            self.assertEqual(len(runtime.accepted()), 1)
+        finally:
+            runtime.close()
+
+    def test_sync_degrades_on_outage_without_losing_accepted_state(self):
+        class OutageProvider(Provider):
+            def __init__(self, record):
+                self.record = record
+                self.failed = False
+
+            def append(self, record):
+                return 0
+
+            def fetch(self, cursor=0, limit=100):
+                if self.failed:
+                    raise OSError("transport unavailable")
+                self.failed = True
+                return [(0, self.record)]
+
+        provider = OutageProvider(self.envelope("outage-record"))
+        runtime = Runtime(Path(self.temp.name) / "outage-state", provider, {"root": self.key.public_key})
+        try:
+            self.assertEqual(runtime.sync()["state"], "idle")
+            self.assertEqual(len(runtime.accepted()), 1)
+            self.assertEqual(runtime.sync()["state"], "degraded")
+            self.assertEqual(len(runtime.accepted()), 1)
+            self.assertEqual(runtime.status()["providerCursor"], 1)
+        finally:
+            runtime.close()
+
+    def test_sync_does_not_advance_cursor_when_page_commit_fails(self):
+        class FailingRuntime(Runtime):
+            def _save_provider_cursor(self, cursor):
+                raise OSError("cursor journal unavailable")
+
+        provider = FileProvider(Path(self.temp.name) / "crash-raw" / "history.jsonl")
+        provider.append(self.envelope("not-committed"))
+        runtime = FailingRuntime(Path(self.temp.name) / "crash-state", provider, {"root": self.key.public_key})
+        try:
+            self.assertEqual(runtime.sync()["state"], "degraded")
+            self.assertEqual(runtime.status()["providerCursor"], 0)
+            self.assertEqual(runtime.accepted(), [])
+        finally:
+            runtime.close()
+
+    def test_sync_reports_backlog_when_window_is_full(self):
+        provider = FileProvider(Path(self.temp.name) / "backlog-raw" / "history.jsonl")
+        provider.append(self.envelope("backlog-one"))
+        provider.append(self.envelope("backlog-two"))
+        runtime = Runtime(Path(self.temp.name) / "backlog-state", provider, {"root": self.key.public_key})
+        try:
+            result = runtime.sync(max_pages=1, page_size=1)
+            self.assertTrue(result["backlog"])
+            self.assertEqual(runtime.sync(max_pages=1, page_size=1)["records"], 1)
+        finally:
+            runtime.close()
+
+    def test_sync_worker_exponentially_backs_off_and_resets_after_success(self):
+        from arbor_registry_runtime.daemon import SyncWorker
+
+        calls = []
+        completed = threading.Event()
+
+        def sync(**_):
+            calls.append(time.monotonic())
+            result = {"state": "degraded" if len(calls) < 3 else "idle"}
+            if len(calls) >= 4:
+                completed.set()
+            return result
+
+        worker = SyncWorker(sync, interval=0.01, max_backoff=0.04, max_pages=1, page_size=1)
+        worker.start()
+        try:
+            self.assertTrue(completed.wait(1), "worker did not reset after recovery")
+            self.assertEqual(worker.status()["state"], "ok")
+            self.assertGreaterEqual(calls[2] - calls[1], calls[1] - calls[0])
+        finally:
+            worker.stop()
+
+    def test_daemon_exposes_explicit_transport_update_trigger(self):
+        from arbor_registry_runtime.daemon import RegistryServer
+
+        calls = []
+        server = RegistryServer.__new__(RegistryServer)
+        server.token = "x" * 32
+
+        class StubRuntime:
+            def sync(self, **kwargs):
+                calls.append(kwargs)
+                return {"state": "idle", "pages": 1, "records": 1, "lastError": None}
+
+            def status(self):
+                return {"providerCursor": 1, "sync": {"state": "idle"}}
+
+        server.runtime = StubRuntime()
+        result = server.handle({
+            "token": server.token, "operation": "transport-update",
+            "maxPages": 2, "pageSize": 3,
+        })
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls, [{"max_pages": 2, "page_size": 3}])
+        self.assertEqual(result["runtime"]["providerCursor"], 1)
+
+    def test_daemon_sync_worker_triggers_without_rpc(self):
+        from arbor_registry_runtime.daemon import SyncWorker
+
+        called = threading.Event()
+        calls = []
+
+        def sync(**kwargs):
+            calls.append(kwargs)
+            called.set()
+            return {"state": "idle", "pages": 1, "records": 1}
+
+        worker = SyncWorker(sync, interval=60, max_backoff=60, max_pages=2, page_size=3)
+        worker.start()
+        try:
+            self.assertTrue(called.wait(1), "automatic consumer did not run")
+            self.assertEqual(calls, [{"max_pages": 2, "page_size": 3}])
+            deadline = time.monotonic() + 1
+            while worker.status()["state"] != "ok" and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(worker.status()["state"], "ok")
+        finally:
+            worker.stop()
+
+    def test_daemon_sync_worker_stops_cleanly_while_waiting(self):
+        from arbor_registry_runtime.daemon import SyncWorker
+
+        worker = SyncWorker(lambda **_: {"state": "idle"}, interval=60, max_backoff=60,
+                            max_pages=1, page_size=1)
+        worker.start()
+        worker.stop()
+        thread = worker._thread
+        self.assertIsNotNone(thread)
+        self.assertFalse(thread.is_alive())
+
     def test_public_state_has_no_private_key_material(self):
         self.runtime.ingest([self.envelope("one")])
         files = list(Path(self.temp.name, "state").rglob("*"))
@@ -107,11 +279,245 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue((key_dir / "operator.g1.private").exists())
         self.assertTrue((key_dir / "operator.g2.private").exists())
 
+    def test_staged_keypair_activation_keeps_candidate_separate_until_promotion(self):
+        key_dir = Path(self.temp.name) / "staged-identity"
+        first = generate_keypair(key_dir, "operator")
+        candidate = stage_keypair(key_dir, "operator", 2)
+        self.assertEqual(first.public_key, (key_dir / "operator.public").read_text().strip())
+        self.assertNotEqual(candidate.public_key, first.public_key)
+        self.assertEqual(candidate.public_key, (key_dir / "operator.g2.public").read_text().strip())
+        promoted = activate_keypair(key_dir, "operator", 2)
+        self.assertEqual(promoted.public_key, candidate.public_key)
+        self.assertEqual(promoted.public_key, (key_dir / "operator.public").read_text().strip())
+
+    def test_recovery_activation_requires_accepted_matching_registry_proposal(self):
+        key_dir = Path(self.temp.name) / "gated-identity"
+        first = generate_keypair(key_dir, "operator")
+        candidate = stage_keypair(key_dir, "operator", 2)
+        approval = make_recovery_approval(
+            self.key, "operator", 1, role="operator", approver_generation=1,
+            new_public_key=candidate.public_key, new_generation=2,
+        )
+        authorization = make_recovery_authorization(
+            self.key, "operator", 1, candidate.public_key, [approval]
+        )
+        with self.assertRaises(ValueError):
+            self.runtime.activate_recovery_keypair(key_dir, "operator", 2, authorization)
+        self.assertEqual(first.public_key, (key_dir / "operator.public").read_text().strip())
+        self.assertEqual(self.runtime.ingest([authorization])[0]["status"], "accepted")
+        activated = self.runtime.activate_recovery_keypair(key_dir, "operator", 2, authorization)
+        self.assertEqual(activated.public_key, candidate.public_key)
+
+    def test_recovery_activation_failure_preserves_old_active_pair(self):
+        key_dir = Path(self.temp.name) / "gated-failure-identity"
+        first = generate_keypair(key_dir, "operator")
+        candidate = stage_keypair(key_dir, "operator", 2)
+        authorization = make_recovery_authorization(
+            self.key, "operator", 1, candidate.public_key, [
+                make_recovery_approval(
+                    self.key, "operator", 1, role="operator", approver_generation=1,
+                    new_public_key=candidate.public_key, new_generation=2,
+                )
+            ]
+        )
+        self.assertEqual(self.runtime.ingest([authorization])[0]["status"], "accepted")
+        private = key_dir / "operator.private"
+        public = key_dir / "operator.public"
+        old_private, old_public = private.read_text(), public.read_text()
+        import arbor_registry_runtime.runtime as runtime_module
+        original_replace = runtime_module._replace_keypair
+        calls = 0
+
+        def fail_on_install(source, destination):
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                raise OSError("injected recovery activation failure")
+            return original_replace(source, destination)
+
+        with patch.object(runtime_module, "_replace_keypair", fail_on_install):
+            with self.assertRaises(OSError):
+                self.runtime.activate_recovery_keypair(key_dir, "operator", 2, authorization)
+        self.assertEqual(private.read_text(), old_private)
+        self.assertEqual(public.read_text(), old_public)
+        self.assertEqual(first.public_key, old_public.strip())
+        self.assertFalse((key_dir / ".operator.keypair-transaction").exists())
+
+    def test_legacy_node_identity_cannot_replay_static_key_after_generation_change(self):
+        operator = RuntimeKey("operator", SigningKey.generate())
+        replacement = RuntimeKey("operator-new", SigningKey.generate())
+        runtime = Runtime(
+            Path(self.temp.name) / "legacy-replay-state",
+            FileProvider(Path(self.temp.name) / "legacy-replay-raw" / "history.jsonl"),
+            {"root": self.key.public_key, "operator": operator.public_key},
+            approver_roles={"operator": {"root"}, "parent": set(), "peer": set()},
+        )
+        try:
+            operator_one = make_identity_generation(self.key, "operator", 1, operator.public_key)
+            approval = make_recovery_approval(
+                self.key, "operator", 1, role="operator", approver_generation=1,
+                new_public_key=replacement.public_key, new_generation=2,
+            )
+            authorization = make_recovery_authorization(
+                self.key, "operator", 1, replacement.public_key, [approval]
+            )
+            operator_two = make_identity_generation(
+                self.key, "operator", 2, replacement.public_key,
+                predecessor="operator:1", recovery_authorization=authorization,
+            )
+            legacy = {
+                "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                "recordVersion": 1, "recordId": "operator-legacy", "generation": 1,
+                "predecessor": None, "issuer": "root", "schema": "node-identity",
+                "payload": {"identity": "operator", "publicKey": operator.public_key,
+                            "approvedBy": "root"},
+            }
+            legacy["signature"] = self.key.sign(legacy)
+            outcomes = runtime.ingest([operator_one, authorization, operator_two, legacy])
+            self.assertEqual(outcomes[-1]["reason"], "stale-generation")
+            self.assertNotIn("operator-legacy", {record["recordId"] for record in runtime.accepted()})
+        finally:
+            runtime.close()
+
+    def test_default_policy_rejects_lost_identity_self_recovery(self):
+        identity = make_identity_generation(self.key, "root", 1, self.key.public_key)
+        approval = make_recovery_approval(
+            self.key, "root", 1, role="operator", approver_generation=1,
+            new_public_key="replacement", new_generation=2,
+        )
+        authorization = make_recovery_authorization(self.key, "root", 1, "replacement", [approval])
+        outcome = self.runtime.ingest([identity, authorization])[-1]
+        self.assertEqual(outcome["reason"], "self-recovery-not-authorized")
+
     def test_generate_keypair_rejects_path_traversal_and_absolute_issuers(self):
         key_dir = Path(self.temp.name) / "identity"
         for issuer in ("../escape", "nested/operator", "\\absolute", "/absolute", ".", ".."):
             with self.assertRaises(ValueError):
                 generate_keypair(key_dir, issuer)
+
+    def test_generate_keypair_validates_permissions_before_writing(self):
+        key_dir = Path(self.temp.name) / "permissioned-identity"
+        key_dir.mkdir(mode=0o700)
+        key_dir.chmod(0o755)
+        with self.assertRaises(ValueError):
+            generate_keypair(key_dir, "operator")
+        self.assertEqual(list(key_dir.iterdir()), [])
+
+        key_dir.chmod(0o700)
+        private = key_dir / "operator.private"
+        private.write_text("old", encoding="ascii")
+        private.chmod(0o644)
+        with self.assertRaises(ValueError):
+            generate_keypair(key_dir, "operator", rotation=True)
+        self.assertEqual(private.read_text(encoding="ascii"), "old")
+
+    def test_keypair_rotation_recovers_as_a_pair_after_install_failure(self):
+        key_dir = Path(self.temp.name) / "atomic-identity"
+        first = generate_keypair(key_dir, "operator")
+        private = key_dir / "operator.private"
+        public = key_dir / "operator.public"
+        old_private = private.read_text(encoding="ascii")
+        old_public = public.read_text(encoding="ascii")
+
+        import arbor_registry_runtime.runtime as runtime_module
+        original_replace = runtime_module._replace_keypair
+        calls = 0
+
+        def fail_on_second_install(source, destination):
+            nonlocal calls
+            calls += 1
+            if calls == 4:  # two backups, then the private and public installs
+                raise OSError("injected key-pair install failure")
+            return original_replace(source, destination)
+
+        with patch.object(runtime_module, "_replace_keypair", fail_on_second_install):
+            with self.assertRaises(OSError):
+                generate_keypair(key_dir, "operator", rotation=True)
+
+        # Recovery occurs before the next operation and restores the old pair,
+        # rather than leaving a private key paired with a different public key.
+        with self.assertRaises(FileExistsError):
+            generate_keypair(key_dir, "operator")
+        self.assertEqual(old_private, private.read_text(encoding="ascii"))
+        self.assertEqual(old_public, public.read_text(encoding="ascii"))
+        self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(public.stat().st_mode), 0o644)
+        recovered = generate_keypair(key_dir, "operator", rotation=True)
+        self.assertNotEqual(first.public_key, recovered.public_key)
+        self.assertFalse((key_dir / ".operator.keypair-transaction").exists())
+
+    def test_prepared_keypair_journal_never_deletes_originals(self):
+        key_dir = Path(self.temp.name) / "prepared-identity"
+        first = generate_keypair(key_dir, "operator")
+        private = key_dir / "operator.private"
+        public = key_dir / "operator.public"
+        old_private, old_public = private.read_text(), public.read_text()
+        journal = key_dir / ".operator.keypair-transaction"
+        journal.write_text(json.dumps({
+            "phase": "prepared",
+            "temporary": {"private": ".missing-private", "public": ".missing-public"},
+            "destinations": {"private": private.name, "public": public.name},
+            "backups": {"private": ".operator.private.backup", "public": ".operator.public.backup"},
+        }))
+        journal.chmod(0o600)
+        with self.assertRaises(FileExistsError):
+            generate_keypair(key_dir, "operator")
+        self.assertEqual(private.read_text(), old_private)
+        self.assertEqual(public.read_text(), old_public)
+
+    def test_keypair_recovery_rejects_journal_path_escape(self):
+        key_dir = Path(self.temp.name) / "escaped-journal"
+        generate_keypair(key_dir, "operator")
+        journal = key_dir / ".operator.keypair-transaction"
+        journal.write_text(json.dumps({
+            "phase": "prepared",
+            "temporary": {"private": "../outside", "public": ".missing-public"},
+            "destinations": {"private": "operator.private", "public": "operator.public"},
+            "backups": {"private": None, "public": None},
+        }), encoding="ascii")
+        journal.chmod(0o600)
+        with self.assertRaises(RuntimeError):
+            generate_keypair(key_dir, "operator")
+
+    def test_recovery_authorization_rejects_unbound_approval_fields(self):
+        approval = make_recovery_approval(
+            self.key, "node", 1, role="operator", approver_generation=1,
+            new_public_key="replacement", new_generation=2,
+        )
+        approval.pop("proposalDigest")
+        authorization = make_recovery_authorization(
+            self.key, "node", 1, "replacement", [approval],
+        )
+        self.assertEqual(
+            self.runtime.ingest([authorization])[0]["reason"],
+            "invalid-recovery-approval",
+        )
+
+    def test_projection_records_require_graph_authority_but_local_domain_is_allowed(self):
+        child = RuntimeKey("child", SigningKey.generate())
+        self.runtime.public_keys["child"] = child.public_key
+        service = self.envelope("service-child", schema="service", payload={
+            "id": "service-child", "domain": "root.internal",
+        })
+        service["issuer"] = "child"
+        service["payload"]["authorityRoot"] = "root"
+        service["signature"] = child.sign({key: value for key, value in service.items() if key != "signature"})
+        self.assertEqual(self.runtime.ingest([service])[0]["reason"], "unauthorized-authority")
+
+        node = RuntimeKey("local", SigningKey.generate())
+        local = Runtime(Path(self.temp.name) / "local-projection", FileProvider(Path(self.temp.name) / "local-projection-raw" / "history.jsonl"), {}, node_key=node)
+        try:
+            local.local_genesis("local", "example.internal")
+            record = {
+                "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1, "recordVersion": 1,
+                "recordId": "service-local", "generation": 1, "predecessor": None,
+                "issuer": "local", "schema": "service",
+                "payload": {"id": "service-local", "domain": "example.internal", "authorityRoot": "local"},
+            }
+            record["signature"] = node.sign(record)
+            self.assertEqual(local.ingest([record])[0]["status"], "accepted")
+        finally:
+            local.close()
 
     def test_orbitdb_provider_maps_bounded_socket_contract(self):
         import socketserver
@@ -258,6 +664,244 @@ class RuntimeTests(unittest.TestCase):
         ]
         self.assertEqual([item["status"] for item in self.runtime.ingest(records)], ["accepted"] * 3)
 
+    def test_local_genesis_is_explicit_scoped_and_idempotent_across_restart(self):
+        node = RuntimeKey("node", SigningKey.generate())
+        state = Path(self.temp.name) / "genesis-state"
+        raw = FileProvider(Path(self.temp.name) / "genesis-raw" / "history.jsonl")
+        runtime = Runtime(state, raw, {"root": self.key.public_key}, node_key=node)
+        try:
+            outcome = runtime.local_genesis("node", "example.internal", platform="linux")
+            self.assertEqual(outcome["status"], "accepted")
+            self.assertEqual(runtime.projection()["node"]["payload"]["domain"], "example.internal")
+            self.assertNotIn(bytes(node.signing_key).hex(), json.dumps(runtime.projection()))
+            self.assertEqual(runtime.local_genesis("node", "example.internal", platform="linux"), outcome)
+            with self.assertRaises(ValueError):
+                runtime.local_genesis("node", "other.internal", platform="linux")
+            with self.assertRaises(ValueError):
+                runtime.local_genesis("other", "example.internal", platform="linux")
+        finally:
+            runtime.close()
+        restarted = Runtime(state, raw, {"root": self.key.public_key}, node_key=node)
+        try:
+            self.assertEqual(restarted.projection()["node"]["generation"], 1)
+            self.assertEqual(restarted.local_genesis("node", "example.internal", platform="linux")["status"], "accepted")
+        finally:
+            restarted.close()
+
+    def test_local_authority_cannot_escape_its_identity_and_domain(self):
+        node = RuntimeKey("node", SigningKey.generate())
+        runtime = Runtime(Path(self.temp.name) / "scoped-state", FileProvider(Path(self.temp.name) / "scoped-raw" / "history.jsonl"), {}, node_key=node)
+        try:
+            runtime.local_genesis("node", "example.internal")
+            escaped = make_local_genesis(node, "node", "example.internal")
+            escaped["payload"]["identity"] = "foreign"
+            escaped["signature"] = node.sign({key: value for key, value in escaped.items() if key != "signature"})
+            self.assertEqual(runtime.ingest([escaped])[0]["reason"], "unauthorized-local-authority-scope")
+        finally:
+            runtime.close()
+
+    def test_local_genesis_rejects_signed_variants_and_unrelated_self_roots(self):
+        node = RuntimeKey("node", SigningKey.generate())
+        foreign = RuntimeKey("foreign", SigningKey.generate())
+        runtime = Runtime(Path(self.temp.name) / "genesis-variants", FileProvider(Path(self.temp.name) / "genesis-variants-raw" / "history.jsonl"), {}, node_key=node)
+        try:
+            runtime.local_genesis("node", "example.internal")
+            variant = make_local_genesis(node, "node", "example.internal", platform="other")
+            self.assertEqual(runtime.ingest([variant])[0]["reason"], "conflicting-record-key")
+            unrelated = make_local_genesis(foreign, "foreign", "example.internal")
+            runtime.public_keys["foreign"] = foreign.public_key
+            self.assertEqual(runtime.ingest([unrelated])[0]["reason"], "unauthorized-authority")
+        finally:
+            runtime.close()
+
+    def test_lineage_invalid_relationship_cannot_authorize_identity_or_capability(self):
+        child = RuntimeKey("child", SigningKey.generate())
+
+        def signed(key, record_id, issuer, schema, payload, predecessor=None):
+            record = {"protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                      "recordVersion": 1, "recordId": record_id, "generation": 2 if predecessor else 1,
+                      "predecessor": predecessor, "issuer": issuer, "schema": schema, "payload": payload}
+            record["signature"] = key.sign(record)
+            return record
+
+        self.runtime.public_keys["child"] = child.public_key
+        forged_edge = signed(self.key, "forged-edge", "root", "relationship", {
+            "relationshipId": "forged-edge", "from": "root", "to": "child",
+            "kind": "parent", "status": "active", "authorityRoot": "root",
+        }, predecessor="missing")
+        identity = signed(child, "child", "child", "node-identity", {"id": "child", "authorityRoot": "root"})
+        self.assertEqual(self.runtime.ingest([forged_edge, identity])[-1]["reason"], "unauthorized-authority")
+
+    def test_delegated_issuer_cannot_claim_a_foreign_node_identity(self):
+        child = RuntimeKey("child", SigningKey.generate())
+        self.runtime.public_keys["child"] = child.public_key
+        edge = self.envelope("root-child", schema="relationship", payload={
+            "relationshipId": "root-child", "from": "root", "to": "child",
+            "kind": "parent", "status": "active", "authorityRoot": "root",
+        })
+        forged = {
+            "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+            "recordVersion": 1, "recordId": "victim", "generation": 1,
+            "predecessor": None, "issuer": "child", "schema": "node-identity",
+            "payload": {"identity": "victim", "publicKey": child.public_key,
+                        "authorityRoot": "root"},
+        }
+        forged["signature"] = child.sign(forged)
+        self.assertEqual(self.runtime.ingest([edge, forged])[-1]["reason"], "unauthorized-authority")
+
+    def test_capability_delegation_requires_active_issuer_subject_edge(self):
+        child = RuntimeKey("child", SigningKey.generate())
+        self.runtime.public_keys["child"] = child.public_key
+
+        def signed(key, record_id, issuer, payload):
+            record = {"protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                      "recordVersion": 1, "recordId": record_id, "generation": 1,
+                      "predecessor": None, "issuer": issuer, "schema": "capability", "payload": payload}
+            record["signature"] = key.sign(record)
+            return record
+
+        grant = signed(child, "grant", "child", {"subject": "grandchild", "authorityRoot": "root", "capabilities": ["observe"]})
+        self.assertEqual(self.runtime.ingest([grant])[0]["reason"], "unauthorized-capability")
+
+    def test_authority_is_graph_derived_and_roots_compose(self):
+        child = RuntimeKey("child", SigningKey.generate())
+        foreign = RuntimeKey("foreign", SigningKey.generate())
+
+        def signed(key, record_id, issuer, schema, payload):
+            record = {
+                "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                "recordVersion": 1, "recordId": record_id, "generation": 1,
+                "predecessor": None, "issuer": issuer, "schema": schema,
+                "payload": payload,
+            }
+            record["signature"] = key.sign(record)
+            return record
+
+        parent_edge = signed(self.key, "root-child", "root", "relationship", {
+            "relationshipId": "root-child", "from": "root", "to": "child",
+            "kind": "parent", "status": "active", "authorityRoot": "root",
+        })
+        child_identity = signed(child, "child", "child", "node-identity", {
+            "id": "child", "authorityRoot": "root",
+        })
+        unrelated = signed(foreign, "foreign", "foreign", "node-identity", {
+            "id": "foreign", "authorityRoot": "root",
+        })
+        self.runtime.public_keys.update({"child": child.public_key, "foreign": foreign.public_key})
+        outcomes = self.runtime.ingest([child_identity, unrelated, parent_edge])
+        self.assertEqual(outcomes[0]["status"], "accepted")
+        self.assertEqual(outcomes[1]["reason"], "unauthorized-authority")
+        self.assertIn("child", self.runtime.projection())
+
+        root_grant = signed(self.key, "grant-child", "root", "capability", {
+            "subject": "child", "authorityRoot": "root", "capabilities": ["observe"],
+        })
+        child_edge = signed(child, "child-grandchild", "child", "relationship", {
+            "relationshipId": "child-grandchild", "from": "child", "to": "grandchild",
+            "kind": "parent", "status": "active", "authorityRoot": "root",
+        })
+        amplification = signed(child, "grant-grandchild", "child", "capability", {
+            "subject": "grandchild", "authorityRoot": "root", "capabilities": ["admin"],
+        })
+        self.assertEqual(self.runtime.ingest([root_grant, child_edge, amplification])[-1]["reason"],
+                         "unauthorized-capability")
+
+        root_b = RuntimeKey("root-b", SigningKey.generate())
+        runtime = Runtime(
+            Path(self.temp.name) / "composed-state",
+            FileProvider(Path(self.temp.name) / "composed-raw" / "history.jsonl"),
+            {"root": self.key.public_key, "root-b": root_b.public_key},
+            authority_issuers={"root", "root-b"},
+        )
+        try:
+            root_b_record = signed(root_b, "root-b", "root-b", "node-identity", {"id": "root-b"})
+            self.assertEqual(runtime.ingest([self.envelope("root-a"), root_b_record])[1]["status"], "accepted")
+        finally:
+            runtime.close()
+
+    def test_graph_cycles_are_rejected_after_delegation_resolution(self):
+        a = RuntimeKey("a", SigningKey.generate())
+        b = RuntimeKey("b", SigningKey.generate())
+
+        def edge(key, record_id, issuer, source, target):
+            record = {
+                "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                "recordVersion": 1, "recordId": record_id, "generation": 1,
+                "predecessor": None, "issuer": issuer, "schema": "relationship",
+                "payload": {"relationshipId": record_id, "from": source, "to": target,
+                            "kind": "parent", "status": "active", "authorityRoot": "root"},
+            }
+            record["signature"] = key.sign(record)
+            return record
+
+        self.runtime.public_keys.update({"a": a.public_key, "b": b.public_key})
+        records = [
+            edge(self.key, "root-a", "root", "root", "a"),
+            edge(a, "a-b", "a", "a", "b"),
+            edge(b, "b-a", "b", "b", "a"),
+        ]
+        self.runtime.ingest(records)
+        self.assertEqual([record["recordId"] for record in self.runtime.accepted()], ["root-a"])
+        self.assertEqual({item["reason"] for item in self.runtime.quarantine()}, {"parent-cycle"})
+
+    def test_unauthorized_reverse_edge_cannot_poison_authorized_path(self):
+        foreign = RuntimeKey("foreign", SigningKey.generate())
+
+        def edge(key, record_id, issuer, source, target):
+            record = {
+                "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                "recordVersion": 1, "recordId": record_id, "generation": 1,
+                "predecessor": None, "issuer": issuer, "schema": "relationship",
+                "payload": {"relationshipId": record_id, "from": source, "to": target,
+                            "kind": "parent", "status": "active", "authorityRoot": "root"},
+            }
+            record["signature"] = key.sign(record)
+            return record
+
+        self.runtime.public_keys["foreign"] = foreign.public_key
+        authorized = edge(self.key, "root-a", "root", "root", "a")
+        unauthorized_reverse = edge(foreign, "a-root-forged", "foreign", "a", "root")
+        outcomes = self.runtime.ingest([authorized, unauthorized_reverse])
+        self.assertEqual([outcome["status"] for outcome in outcomes], ["accepted", "quarantined"])
+        self.assertEqual(outcomes[1]["reason"], "unauthorized-relationship")
+        self.assertEqual([record["recordId"] for record in self.runtime.accepted()], ["root-a"])
+
+    def test_cycles_are_scoped_to_authority_root(self):
+        def edge(record_id, source, target, root):
+            record = {
+                "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+                "recordVersion": 1, "recordId": record_id, "generation": 1,
+                "predecessor": None, "issuer": "root", "schema": "relationship",
+                "payload": {"relationshipId": record_id, "from": source, "to": target,
+                            "kind": "parent", "status": "active", "authorityRoot": root},
+            }
+            record["signature"] = self.key.sign(record)
+            return record
+
+        records = [edge("a", "one", "two", "root-a"), edge("b", "two", "one", "root-b")]
+        self.assertEqual(Runtime._cycle_indexes(records), set())
+
+    def test_severed_parent_edge_preserves_established_child_identity(self):
+        child = RuntimeKey("child", SigningKey.generate())
+        self.runtime.public_keys["child"] = child.public_key
+        edge = {
+            "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+            "recordVersion": 1, "recordId": "severed-edge", "generation": 1,
+            "predecessor": None, "issuer": "root", "schema": "relationship",
+            "payload": {"relationshipId": "severed-edge", "from": "root", "to": "child",
+                        "kind": "parent", "status": "severed", "authorityRoot": "root"},
+        }
+        edge["signature"] = self.key.sign(edge)
+        identity = {
+            "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1,
+            "recordVersion": 1, "recordId": "child", "generation": 1,
+            "predecessor": None, "issuer": "child", "schema": "node-identity",
+            "payload": {"identity": "child", "publicKey": child.public_key, "authorityRoot": "root"},
+        }
+        identity["signature"] = child.sign(identity)
+        self.assertEqual([item["status"] for item in self.runtime.ingest([identity, edge])], ["accepted", "accepted"])
+        self.assertIn("child", self.runtime.projection())
+
     def test_active_generation_and_revocation_gate_validation_and_projection(self):
         generation_one = make_identity_generation(self.key, "node", 1, "old-key")
         generation_two = make_identity_generation(
@@ -271,7 +915,8 @@ class RuntimeTests(unittest.TestCase):
 
         authorization = make_recovery_authorization(
             self.key, "node", 1, "new-key",
-            [make_recovery_approval(self.key, "node", 1, role="operator", approver_generation=1)],
+            [make_recovery_approval(self.key, "node", 1, role="operator", approver_generation=1,
+                                    new_public_key="new-key", new_generation=2)],
         )
         generation_two = make_identity_generation(
             self.key, "node", 2, "new-key", predecessor="node:1", recovery_authorization=authorization,
@@ -296,7 +941,10 @@ class RuntimeTests(unittest.TestCase):
             operator_generation = make_identity_generation(self.key, "operator", 1, operator.public_key)
             lost = make_identity_generation(self.key, "node", 1, "old-key")
             revoked = make_revocation(self.key, "node", 1, "lost-key")
-            approval = make_recovery_approval(operator, "node", 1, role="operator", approver_generation=1)
+            approval = make_recovery_approval(
+                operator, "node", 1, role="operator", approver_generation=1,
+                new_public_key=replacement.public_key, new_generation=2,
+            )
             authorization = make_recovery_authorization(self.key, "node", 1, replacement.public_key, [approval])
             recovered = make_identity_generation(
                 self.key, "node", 2, replacement.public_key,
@@ -317,7 +965,7 @@ class RuntimeTests(unittest.TestCase):
             current_operator = make_identity_generation(self.key, "operator", 2, "new-operator-key")
             runtime.ingest([current_operator])
             self.assertIn(
-                "stale-approver-generation",
+                "missing-recovery-authorization",
                 {item["reason"] for item in runtime.quarantine()},
             )
             self.assertEqual(runtime.projection()["node"]["generation"], 2)
@@ -325,17 +973,21 @@ class RuntimeTests(unittest.TestCase):
             runtime.close()
 
     def test_recovery_approvals_are_signed_and_bound_to_lost_generation(self):
-        approval = make_recovery_approval(self.key, "node", 1, role="operator", approver_generation=1)
+        approval = make_recovery_approval(
+            self.key, "node", 1, role="operator", approver_generation=1,
+            new_public_key="new-key", new_generation=2,
+        )
         authorization = make_recovery_authorization(self.key, "node", 1, "new-key", [approval])
         self.assertEqual(self.runtime.ingest([authorization])[0]["status"], "accepted")
         tampered = dict(approval, subject="other")
         bad = make_recovery_authorization(self.key, "other", 1, "new-key", [tampered])
-        self.assertEqual(self.runtime.ingest([bad])[0]["reason"], "invalid-recovery-approval-signature")
+        self.assertEqual(self.runtime.ingest([bad])[0]["reason"], "unbound-recovery-approval")
 
     def test_lifecycle_families_require_shapes_and_recovery_provenance(self):
         identity = make_identity_generation(self.key, "node", 1, self.key.public_key)
         approval = make_recovery_approval(
             self.key, "node", 1, role="operator", approver_generation=1,
+            new_public_key=self.key.public_key, new_generation=2,
         )
         authorization = make_recovery_authorization(
             self.key, "node", 1, self.key.public_key, [approval],
@@ -353,6 +1005,20 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.projection()["node"]["generation"], 2)
         self.assertEqual(self.runtime.projection()["node"]["payload"]["provenance"],
                          [{"source": "operator", "reason": "lost-key"}])
+
+    def test_recovery_generation_must_use_authorized_replacement_key(self):
+        identity = make_identity_generation(self.key, "node", 1, self.key.public_key)
+        approval = make_recovery_approval(
+            self.key, "node", 1, role="operator", approver_generation=1,
+            new_public_key="authorized-key", new_generation=2,
+        )
+        authorization = make_recovery_authorization(self.key, "node", 1, "authorized-key", [approval])
+        replacement = make_identity_generation(
+            self.key, "node", 2, "different-key", predecessor="node:1",
+            recovery_authorization=authorization,
+        )
+        self.runtime.ingest([identity, authorization, replacement])
+        self.assertIn("recovery-key-mismatch", {item["reason"] for item in self.runtime.quarantine()})
 
     def test_revoked_generation_cannot_materialize_or_be_rebound_without_signed_approval(self):
         identity = make_identity_generation(self.key, "node", 1, self.key.public_key)

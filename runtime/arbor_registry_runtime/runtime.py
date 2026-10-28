@@ -13,6 +13,8 @@ import sqlite3
 import fcntl
 import socket
 import stat
+import tempfile
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -28,7 +30,13 @@ SCHEMAS = frozenset({
     "enrollment", "revocation", "recovery-authorization", "receipt",
 })
 ProviderCursor: TypeAlias = int | str
-_SECRET_NAMES = {"secret", "password", "passphrase", "token", "credential", "private", "privatekey", "signingkey", "apikey", "accesskey", "accesstoken", "seed"}
+_SECRET_NAMES = {"secret", "clientsecret", "password", "passphrase", "token", "authtoken", "credential", "authorization", "private", "privatekey", "signingkey", "apikey", "accesskey", "accesstoken", "seed"}
+
+
+def _unsafe_key(name: Any) -> bool:
+    normalized = re.sub(r"[-_]", "", str(name)).lower()
+    words = re.findall(r"[a-z]+|[0-9]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", str(name)))
+    return normalized in _SECRET_NAMES or any(word.lower() in _SECRET_NAMES for word in words)
 
 
 def _unsafe_value(value: Any) -> bool:
@@ -40,7 +48,7 @@ def _unsafe_value(value: Any) -> bool:
         )
     if isinstance(value, dict):
         return any(
-            re.sub(r"[-_]", "", str(key)).lower() in _SECRET_NAMES or _unsafe_value(item)
+            _unsafe_key(key) or _unsafe_value(item)
             for key, item in value.items()
         )
     if isinstance(value, list):
@@ -68,6 +76,133 @@ def _secure_file(path: Path) -> None:
         raise ValueError(f"runtime file has unexpected owner: {path}")
 
 
+def _secure_public_file(path: Path) -> None:
+    if not path.exists():
+        return
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o022:
+        raise ValueError(f"runtime public file is not a safe regular file: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError(f"runtime file has unexpected owner: {path}")
+
+
+def _replace_keypair(source: str, destination: Path) -> None:
+    """Replace one key-pair transaction member (kept injectable for tests)."""
+    os.replace(source, destination)
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _write_durable(path: Path, value: str) -> None:
+    """Replace a small journal atomically, with both file and directory durable."""
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def _recover_keypair_transaction(
+    key_dir: Path,
+    journal_path: Path,
+    lock_path: Path,
+    destinations: dict[str, str],
+) -> None:
+    """Finish or roll back an interrupted active key-pair transaction.
+
+    The journal is the authority for the recovery decision.  In particular,
+    once ``backed-up`` is durable, an active destination is untrusted and must
+    be removed before its old member is restored.  Callers must hold the
+    corresponding pair lock.
+    """
+    if not os.path.lexists(journal_path):
+        return
+
+    def confined(name: Any, *, expected: str | None = None) -> Path:
+        if (not isinstance(name, str) or not name or name in {".", ".."}
+                or name != Path(name).name or "/" in name or "\\" in name or "\x00" in name):
+            raise ValueError("key-pair transaction contains an unsafe path")
+        if expected is not None and name != expected:
+            raise ValueError("key-pair transaction destination mismatch")
+        return key_dir / name
+
+    def transaction_entry(name: Any, mode: int) -> Path:
+        path = confined(name)
+        if path.exists() or os.path.lexists(path):
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != mode:
+                raise ValueError("key-pair transaction entry is not a safe regular file")
+            if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                raise ValueError("key-pair transaction entry has unexpected owner")
+        return path
+
+    try:
+        _secure_file(journal_path)
+        transaction = json.loads(journal_path.read_text(encoding="ascii"))
+        if not isinstance(transaction, dict):
+            raise ValueError("key-pair transaction is not an object")
+        phase = transaction.get("phase")
+        temporary = transaction.get("temporary")
+        backups = transaction.get("backups")
+        if (not isinstance(temporary, dict) or not isinstance(backups, dict)
+                or set(transaction.get("destinations", {})) != set(destinations)
+                or set(temporary) != set(destinations)
+                or set(backups) != set(destinations)):
+            raise ValueError("key-pair transaction has an invalid shape")
+        for kind, expected in destinations.items():
+            transaction_destinations = transaction["destinations"]
+            confined(transaction_destinations[kind], expected=expected)
+            temporary_path = transaction_entry(temporary[kind], 0o600 if kind == "private" else 0o644)
+            backup_name = backups[kind]
+            if backup_name is not None:
+                expected_backup = f".{expected}.backup"
+                confined(backup_name, expected=expected_backup)
+                transaction_entry(backup_name, 0o600 if kind == "private" else 0o644)
+            if temporary_path.name in {journal_path.name, lock_path.name, expected}:
+                raise ValueError("key-pair transaction entry collides with key material")
+        if phase == "installed":
+            for name in backups.values():
+                if name:
+                    confined(name).unlink(missing_ok=True)
+        elif phase in {"prepared", "backed-up"}:
+            # A prepared journal is not proof that a destination was backed
+            # up. Never delete an original in that phase. Once backed-up is
+            # durable, restore both members and discard any partial candidate.
+            for kind, name in backups.items():
+                if name:
+                    backup = confined(name)
+                    destination = confined(transaction["destinations"][kind], expected=destinations[kind])
+                    if backup.exists() and (phase == "backed-up" or not destination.exists()):
+                        if phase == "backed-up":
+                            destination.unlink(missing_ok=True)
+                        os.replace(backup, destination)
+        else:
+            raise ValueError("unknown key-pair transaction phase")
+        for name in temporary.values():
+            confined(name).unlink(missing_ok=True)
+        journal_path.unlink(missing_ok=True)
+        _fsync_directory(key_dir)
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("key-pair transaction recovery failed") from error
+
+
 def canonical_json(value: Any) -> bytes:
     """The wire canonical form: UTF-8, sorted keys, no insignificant whitespace."""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -83,6 +218,22 @@ def _key(record: dict[str, Any]) -> str:
 
 def _digest(record: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(record)).hexdigest()
+
+
+def _recovery_proposal(identity: str, lost_generation: int, new_generation: int,
+                       new_public_key: str) -> dict[str, Any]:
+    """Return the immutable fields an approval authorizes."""
+    return {
+        "identity": identity,
+        "lostGeneration": lost_generation,
+        "newGeneration": new_generation,
+        "newPublicKey": new_public_key,
+    }
+
+
+def _recovery_proposal_digest(identity: str, lost_generation: int, new_generation: int,
+                              new_public_key: str) -> str:
+    return _digest(_recovery_proposal(identity, lost_generation, new_generation, new_public_key))
 
 
 def _b64(data: bytes) -> str:
@@ -193,6 +344,34 @@ def approve_enrollment(
     return {**unsigned, "signature": authority_key.sign(unsigned)}
 
 
+def make_local_genesis(
+    node_key: RuntimeKey,
+    identity: str,
+    domain: str,
+    *,
+    platform: str = "unknown",
+) -> dict[str, Any]:
+    """Build the single generation-one, self-authorized local identity record."""
+    if (not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", identity)
+            or node_key.issuer != identity):
+        raise ValueError("local genesis identity does not match the runtime-held key")
+    if not isinstance(domain, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", domain):
+        raise ValueError("local genesis domain is invalid")
+    if not isinstance(platform, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", platform):
+        raise ValueError("platform is invalid")
+    unsigned = {
+        "protocolEpoch": 1, "wireVersion": 1, "schemaVersion": 1, "recordVersion": 1,
+        "recordId": identity, "generation": 1, "predecessor": None,
+        "issuer": identity, "schema": "node-identity",
+        "payload": {
+            "identity": identity, "publicKey": node_key.public_key, "domain": domain,
+            "platform": platform, "genesis": True, "approvedBy": identity,
+            "authorityRoot": identity,
+        },
+    }
+    return {**unsigned, "signature": node_key.sign(unsigned)}
+
+
 def make_lifecycle_record(
     issuer_key: RuntimeKey,
     schema: str,
@@ -225,6 +404,9 @@ def make_recovery_approval(
     *,
     role: str,
     approver_generation: int,
+    new_public_key: str | None = None,
+    new_generation: int | None = None,
+    proposal_digest: str | None = None,
     operation: str = "recovery",
     decision: str = "approve",
 ) -> dict[str, Any]:
@@ -236,6 +418,21 @@ def make_recovery_approval(
             or approver_generation < 1 or operation != "recovery"
             or decision != "approve"):
         raise ValueError("invalid recovery approval")
+    if new_generation is None:
+        new_generation = lost_generation + 1
+    if new_public_key is not None and (
+            not isinstance(new_public_key, str) or not new_public_key):
+        raise ValueError("invalid recovery replacement key")
+    if (isinstance(new_generation, bool) or not isinstance(new_generation, int)
+            or new_generation != lost_generation + 1):
+        raise ValueError("invalid recovery replacement generation")
+    if new_public_key is not None and proposal_digest is None:
+        proposal_digest = _recovery_proposal_digest(
+            identity, lost_generation, new_generation, new_public_key
+        )
+    if proposal_digest is not None and (
+            not isinstance(proposal_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", proposal_digest)):
+        raise ValueError("invalid recovery proposal digest")
     unsigned = {
         "approver": approver_key.issuer,
         "role": role,
@@ -245,6 +442,12 @@ def make_recovery_approval(
         "approverGeneration": approver_generation,
         "decision": decision,
     }
+    if new_public_key is not None:
+        unsigned.update({
+            "newPublicKey": new_public_key,
+            "newGeneration": new_generation,
+            "proposalDigest": proposal_digest,
+        })
     return {**unsigned, "issuer": approver_key.issuer, "signature": approver_key.sign(unsigned)}
 
 
@@ -258,13 +461,21 @@ def make_recovery_authorization(
     provenance: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build an authority-signed recovery authorization transaction."""
-    if not isinstance(new_public_key, str) or not isinstance(approvals, list) or not approvals:
+    if (not isinstance(identity, str) or not identity or isinstance(lost_generation, bool)
+            or not isinstance(lost_generation, int) or lost_generation < 1
+            or not isinstance(new_public_key, str) or not new_public_key
+            or not isinstance(approvals, list) or not approvals):
         raise ValueError("recovery authorization is incomplete")
+    new_generation = lost_generation + 1
+    proposal_digest = _recovery_proposal_digest(
+        identity, lost_generation, new_generation, new_public_key
+    )
     payload = {
         "identity": identity,
         "lostGeneration": lost_generation,
-        "newGeneration": lost_generation + 1,
+        "newGeneration": new_generation,
         "newPublicKey": new_public_key,
+        "proposalDigest": proposal_digest,
         "approvals": approvals,
         "provenance": provenance or [],
     }
@@ -356,17 +567,175 @@ def generate_keypair(
         raise ValueError("issuer must be a single safe path component")
     if generation is not None and (isinstance(generation, bool) or not isinstance(generation, int) or generation < 1):
         raise ValueError("generation must be a positive integer")
-    key_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    key = RuntimeKey(issuer, SigningKey.generate())
+    key_dir = Path(key_dir)
+    _secure_directory(key_dir)
     suffix = f".g{generation}" if generation is not None else ""
     private_path = key_dir / f"{issuer}{suffix}.private"
     public_path = key_dir / f"{issuer}{suffix}.public"
-    if not rotation and (private_path.exists() or public_path.exists()):
-        raise FileExistsError(f"key material already exists for {issuer}{suffix}; use rotation=True or a new generation")
-    private_path.write_text(_b64(bytes(key.signing_key)), encoding="ascii")
-    os.chmod(private_path, 0o600)
-    public_path.write_text(key.public_key + "\n", encoding="ascii")
-    return key
+    journal_path = key_dir / f".{issuer}{suffix}.keypair-transaction"
+    lock_path = key_dir / f".{issuer}{suffix}.keypair-lock"
+
+    # The lock makes pair recovery and replacement mutually exclusive with
+    # readers/writers that use this API. The journal makes an interrupted pair
+    # recoverable without putting private key material in the journal itself.
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as error:
+        raise ValueError("key-pair lock is not safe") from error
+    with os.fdopen(lock_fd, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        _recover_keypair_transaction(
+            key_dir, journal_path, lock_path,
+            {"private": private_path.name, "public": public_path.name},
+        )
+        lock_path.chmod(0o600)
+        _secure_file(private_path)
+        _secure_public_file(public_path)
+        if not rotation and (private_path.exists() or public_path.exists()):
+            raise FileExistsError(f"key material already exists for {issuer}{suffix}; use rotation=True or a new generation")
+        key = RuntimeKey(issuer, SigningKey.generate())
+        values = ((private_path, _b64(bytes(key.signing_key)), 0o600),
+                  (public_path, key.public_key + "\n", 0o644))
+        temporary: dict[str, str] = {}
+        backups: dict[str, str | None] = {}
+        try:
+            for kind, (destination, value, mode) in zip(("private", "public"), values):
+                fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=key_dir)
+                temporary[kind] = Path(name).name
+                os.fchmod(fd, mode)
+                with os.fdopen(fd, "w", encoding="ascii") as stream:
+                    stream.write(value)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                backups[kind] = None
+                if destination.exists():
+                    backup = key_dir / f".{destination.name}.backup"
+                    backup.unlink(missing_ok=True)
+                    backups[kind] = backup.name
+            transaction = {"phase": "prepared", "temporary": temporary,
+                           "destinations": {kind: path.name for kind, (path, _, _) in zip(("private", "public"), values)},
+                           "backups": backups}
+            _write_durable(journal_path, json.dumps(transaction, sort_keys=True))
+            transaction["phase"] = "backed-up"
+            _write_durable(journal_path, json.dumps(transaction, sort_keys=True))
+            for kind, (destination, _, _) in zip(("private", "public"), values):
+                if backups[kind]:
+                    _replace_keypair(str(destination), key_dir / backups[kind])
+            # The phase is already durable before either old file moves, so a
+            # crash during the backup sequence can restore whichever moved.
+            _fsync_directory(key_dir)
+            for kind, (destination, _, _) in zip(("private", "public"), values):
+                _replace_keypair(str(key_dir / temporary[kind]), destination)
+            transaction["phase"] = "installed"
+            _write_durable(journal_path, json.dumps(transaction, sort_keys=True))
+            _recover_keypair_transaction(
+                key_dir, journal_path, lock_path,
+                {"private": private_path.name, "public": public_path.name},
+            )
+            return key
+        except BaseException:
+            # Do not expose a partially installed pair to the caller or to a
+            # subsequent transition attempt.
+            if journal_path.exists():
+                _recover_keypair_transaction(
+                    key_dir, journal_path, lock_path,
+                    {"private": private_path.name, "public": public_path.name},
+                )
+            raise
+        finally:
+            for name in temporary.values():
+                (key_dir / name).unlink(missing_ok=True)
+
+
+def stage_keypair(key_dir: Path, issuer: str, generation: int) -> RuntimeKey:
+    """Create a numbered candidate without changing the active key pair."""
+    return generate_keypair(key_dir, issuer, generation=generation)
+
+
+def activate_keypair(key_dir: Path, issuer: str, generation: int) -> RuntimeKey:
+    """Atomically promote a staged numbered pair to the active pair.
+
+    The staged pair is copied into the existing journaled pair transaction;
+    the active pair is not touched until both candidate members have been
+    validated and durably prepared.  A failed promotion restores both old
+    members before returning the error.
+    """
+    if (not isinstance(issuer, str) or not issuer or issuer in {".", ".."}
+            or issuer != Path(issuer).name or "/" in issuer or "\\" in issuer or "\x00" in issuer):
+        raise ValueError("issuer must be a single safe path component")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise ValueError("generation must be a positive integer")
+    key_dir = Path(key_dir)
+    candidate_private = key_dir / f"{issuer}.g{generation}.private"
+    candidate_public = key_dir / f"{issuer}.g{generation}.public"
+    if not candidate_private.exists() or not candidate_public.exists():
+        raise FileNotFoundError("staged key pair does not exist")
+    _secure_directory(key_dir)
+    _secure_file(candidate_private)
+    _secure_public_file(candidate_public)
+    seed = SigningKey(_unb64(candidate_private.read_text(encoding="ascii").strip()))
+    if seed.verify_key != VerifyKey(_unb64(candidate_public.read_text(encoding="ascii").strip())):
+        raise ValueError("staged key pair members do not match")
+    # Reuse the proven pair transaction by writing the candidate bytes to
+    # temporary active members, then replacing the active destinations.
+    active_private, active_public = key_dir / f"{issuer}.private", key_dir / f"{issuer}.public"
+    journal = key_dir / f".{issuer}.keypair-transaction"
+    lock_path = key_dir / f".{issuer}.keypair-lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(lock_fd, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        _recover_keypair_transaction(
+            key_dir, journal, lock_path,
+            {"private": active_private.name, "public": active_public.name},
+        )
+        _secure_file(active_private)
+        _secure_public_file(active_public)
+        temporary = {}
+        backups = {}
+        try:
+            for kind, source, mode in (("private", candidate_private, 0o600), ("public", candidate_public, 0o644)):
+                fd, name = tempfile.mkstemp(prefix=f".{issuer}.{kind}.", dir=key_dir)
+                temporary[kind] = Path(name).name
+                os.fchmod(fd, mode)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(source.read_bytes())
+                    stream.flush(); os.fsync(stream.fileno())
+                destination = active_private if kind == "private" else active_public
+                backup = key_dir / f".{destination.name}.backup"
+                backups[kind] = backup.name if destination.exists() else None
+            transaction = {"phase": "prepared", "temporary": temporary,
+                           "destinations": {"private": active_private.name, "public": active_public.name},
+                           "backups": backups}
+            _write_durable(journal, json.dumps(transaction, sort_keys=True))
+            transaction["phase"] = "backed-up"; _write_durable(journal, json.dumps(transaction, sort_keys=True))
+            for kind, destination in (("private", active_private), ("public", active_public)):
+                if backups[kind]:
+                    _replace_keypair(str(destination), key_dir / backups[kind])
+            for kind, destination in (("private", active_private), ("public", active_public)):
+                _replace_keypair(str(key_dir / temporary[kind]), destination)
+            transaction["phase"] = "installed"; _write_durable(journal, json.dumps(transaction, sort_keys=True))
+            for name in backups.values():
+                if name: (key_dir / name).unlink(missing_ok=True)
+            journal.unlink(missing_ok=True); _fsync_directory(key_dir)
+            return RuntimeKey(issuer, seed)
+        except BaseException:
+            # Restore synchronously; the next invocation's recovery remains a
+            # second line of defence for process death.  The durable journal
+            # is authoritative if the failure happened after it was written.
+            if journal.exists():
+                _recover_keypair_transaction(
+                    key_dir, journal, lock_path,
+                    {"private": active_private.name, "public": active_public.name},
+                )
+            else:
+                for kind, destination in (("private", active_private), ("public", active_public)):
+                    backup = backups.get(kind)
+                    if backup and (key_dir / backup).exists():
+                        destination.unlink(missing_ok=True)
+                        os.replace(key_dir / backup, destination)
+            raise
+        finally:
+            for name in temporary.values(): (key_dir / name).unlink(missing_ok=True)
 
 
 class Provider(ABC):
@@ -562,11 +931,17 @@ class Runtime:
         authority_issuers: set[str] | None = None,
         approver_roles: dict[str, set[str]] | None = None,
         recovery_thresholds: dict[str, int] | None = None,
+        node_key: RuntimeKey | None = None,
+        allow_self_recovery: bool = False,
     ):
         self.state_dir = Path(state_dir)
         _secure_directory(self.state_dir)
         self.provider = provider
         self.public_keys = dict(public_keys)
+        self.node_key = node_key
+        self.allow_self_recovery = allow_self_recovery
+        if node_key is not None:
+            self.public_keys.setdefault(node_key.issuer, node_key.public_key)
         self.authority_issuers = set(authority_issuers) if authority_issuers is not None else (
             {"root"} if "root" in self.public_keys else set()
         )
@@ -576,8 +951,14 @@ class Runtime:
             raise ValueError("authority issuers must have configured public keys")
         self.max_bytes = max_bytes
         self.max_quarantine_records = 10000
+        self._sync_lock = threading.Lock()
+        self._sync_status: dict[str, Any] = {
+            "state": "idle", "lastError": None, "pages": 0, "records": 0,
+        }
         database_path = self.state_dir / "registry.sqlite3"
-        self.db = sqlite3.connect(database_path, timeout=30)
+        # The daemon's consumer runs in its own thread; RegistryServer
+        # serializes access around this connection.
+        self.db = sqlite3.connect(database_path, timeout=30, check_same_thread=False)
         if database_path.exists():
             os.chmod(database_path, 0o600)
         _secure_file(self.state_dir / "registry.sqlite3")
@@ -590,11 +971,332 @@ class Runtime:
           CREATE TABLE IF NOT EXISTS projection (
             record_id TEXT PRIMARY KEY, schema TEXT NOT NULL, payload TEXT NOT NULL, generation INTEGER NOT NULL
           );
+          CREATE TABLE IF NOT EXISTS local_genesis (
+            identity TEXT PRIMARY KEY, domain TEXT NOT NULL, public_key TEXT NOT NULL,
+            record_digest TEXT NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS provider_cursors (
+            stream TEXT PRIMARY KEY, cursor TEXT NOT NULL
+          );
         """)
+        self.local_authorities: dict[str, tuple[str, str]] = {
+            identity: (domain, public_key)
+            for identity, domain, public_key in self.db.execute(
+                "SELECT identity, domain, public_key FROM local_genesis"
+            )
+        }
+        for identity, (domain, public_key) in self.local_authorities.items():
+            if self.node_key is not None and self.node_key.issuer == identity and self.node_key.public_key != public_key:
+                raise ValueError("runtime-held node key conflicts with persisted local genesis")
+            self.public_keys.setdefault(identity, public_key)
+            self.authority_issuers.add(identity)
         self.db.commit()
 
     def close(self) -> None:
         self.db.close()
+
+    def local_genesis(self, identity: str, domain: str, *, platform: str = "unknown") -> dict[str, Any]:
+        """Perform the explicitly bounded local-genesis operation.
+
+        The key is supplied at construction and remains in the process. Only
+        public metadata and the signed, ordinary node-identity record persist.
+        """
+        if self.node_key is None:
+            raise ValueError("local genesis requires a runtime-held node key")
+        if identity != self.node_key.issuer:
+            raise ValueError("local genesis identity is foreign to the runtime-held key")
+        record = make_local_genesis(self.node_key, identity, domain, platform=platform)
+        digest = _digest(record)
+        existing = self.local_authorities.get(identity)
+        if existing is not None:
+            if existing != (domain, self.node_key.public_key):
+                raise ValueError("conflicting second local genesis")
+            stored_digest = self.db.execute(
+                "SELECT record_digest FROM local_genesis WHERE identity = ?", (identity,)
+            ).fetchone()[0]
+            if stored_digest != digest:
+                raise ValueError("local genesis state differs from persisted state")
+        else:
+            self.db.execute(
+                "INSERT INTO local_genesis VALUES (?, ?, ?, ?)",
+                (identity, domain, self.node_key.public_key, digest),
+            )
+            self.local_authorities[identity] = (domain, self.node_key.public_key)
+            self.public_keys[identity] = self.node_key.public_key
+            self.authority_issuers.add(identity)
+            self.db.commit()
+        return self.ingest([record])[0]
+
+    def activate_recovery_keypair(
+        self,
+        key_dir: Path,
+        issuer: str,
+        generation: int,
+        authorization: dict[str, Any],
+    ) -> RuntimeKey:
+        """Promote a recovery candidate only after Registry acceptance.
+
+        Key files are staged independently.  This method is the sole recovery
+        activation boundary: it requires the exact accepted authorization
+        envelope, then binds the staged public key and generation to that
+        authorization's immutable proposal before touching the active pair.
+        Ordinary key rotation remains available through ``activate_keypair``
+        and ``generate_keypair(rotation=True)``.
+        """
+        if not isinstance(authorization, dict):
+            raise ValueError("recovery authorization is required")
+        payload = authorization.get("payload")
+        lost_generation = payload.get("lostGeneration") if isinstance(payload, dict) else None
+        new_generation = payload.get("newGeneration") if isinstance(payload, dict) else None
+        if (authorization.get("schema") != "recovery-authorization"
+                or not isinstance(payload, dict)
+                or payload.get("identity") != issuer
+                or new_generation != generation
+                or lost_generation != generation - 1
+                or not isinstance(lost_generation, int)
+                or isinstance(lost_generation, bool)
+                or not isinstance(new_generation, int)
+                or isinstance(new_generation, bool)
+                or new_generation != lost_generation + 1):
+            raise ValueError("recovery authorization does not match candidate")
+        try:
+            envelope = canonical_json(authorization).decode("ascii")
+        except (UnicodeError, TypeError, ValueError) as error:
+            raise ValueError("recovery authorization is not canonical") from error
+        row = self.db.execute(
+            "SELECT status FROM records WHERE envelope = ?", (envelope,)
+        ).fetchone()
+        if row != ("accepted",):
+            raise ValueError("recovery authorization is not accepted")
+        proposal_digest = payload.get("proposalDigest")
+        if (not isinstance(payload.get("newPublicKey"), str)
+                or proposal_digest != _recovery_proposal_digest(
+                    issuer, generation - 1, generation, payload["newPublicKey"]
+                )):
+            raise ValueError("recovery authorization proposal is invalid")
+        candidate_public = Path(key_dir) / f"{issuer}.g{generation}.public"
+        if not candidate_public.exists():
+            raise FileNotFoundError("staged key pair does not exist")
+        _secure_public_file(candidate_public)
+        if candidate_public.read_text(encoding="ascii").strip() != payload["newPublicKey"]:
+            raise ValueError("staged key does not match accepted recovery proposal")
+        return activate_keypair(key_dir, issuer, generation)
+
+    def _is_exact_local_genesis(self, record: dict[str, Any]) -> bool:
+        """Whether a record is the exact persisted local root assertion."""
+        identity = record.get("issuer")
+        stored = self.local_authorities.get(identity)
+        if stored is None or record.get("schema") != "node-identity":
+            return False
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            return False
+        domain, public_key = stored
+        return (
+            record.get("recordId") == identity and record.get("generation") == 1
+            and record.get("predecessor") is None
+            and payload.get("identity") == identity
+            and payload.get("publicKey") == public_key
+            and payload.get("domain") == domain
+            and payload.get("genesis") is True
+            and payload.get("approvedBy") == identity
+            and payload.get("authorityRoot") == identity
+            and self.db.execute(
+                "SELECT record_digest FROM local_genesis WHERE identity = ?", (identity,)
+            ).fetchone() == (_digest(record),)
+        )
+
+    _SENSITIVE_SCHEMAS = set(SCHEMAS)
+    _PROJECTION_SCHEMAS = SCHEMAS - {
+        "enrollment", "revocation", "recovery-authorization", "receipt",
+    }
+
+    @staticmethod
+    def _edge(record: dict[str, Any]) -> tuple[str, str, str, str] | None:
+        payload = record.get("payload", {})
+        if (record.get("schema") not in {"relationship", "peer-relationship"}
+                or not isinstance(payload, dict)
+                or not all(isinstance(payload.get(key), str) for key in ("from", "to"))):
+            return None
+        return (payload["from"], payload["to"], payload.get("kind", "peer"),
+                payload.get("authorityRoot", record.get("issuer", "")))
+
+    def _authority_boundary(
+        self, records: list[dict[str, Any]], historical_identities: set[str] | None = None,
+    ) -> dict[int, str]:
+        """Return record indexes whose authority is not graph-derived.
+
+        ``authority_issuers`` identifies local roots and recovery principals;
+        it is deliberately not consulted as a global issuer allowlist here.
+        Delegation is only through active parent edges in the same root.
+        """
+        accepted: list[dict[str, Any]] = []
+        rejected: dict[int, str] = {}
+        historical_identities = historical_identities or set()
+
+        def root_of(record: dict[str, Any]) -> str:
+            payload = record.get("payload", {})
+            return payload.get("authorityRoot", record.get("issuer", "")) if isinstance(payload, dict) else ""
+
+        def reachable(issuer: str, root: str) -> bool:
+            if issuer == root and root in self.authority_issuers:
+                return True
+            frontier = [root]
+            seen: set[str] = set()
+            while frontier:
+                node = frontier.pop(0)
+                if node in seen:
+                    continue
+                seen.add(node)
+                if node == issuer:
+                    return True
+                for candidate in accepted:
+                    edge = self._edge(candidate)
+                    if (edge is not None and edge[0] == node and edge[2] == "parent"
+                            and edge[3] == root
+                            and candidate.get("payload", {}).get("status") == "active"):
+                        frontier.append(edge[1])
+            return False
+
+        def authorized(record: dict[str, Any]) -> bool:
+            issuer = record.get("issuer")
+            if record.get("schema") not in self._SENSITIVE_SCHEMAS:
+                return True
+            if not isinstance(issuer, str):
+                return False
+            root = root_of(record)
+            if not isinstance(root, str) or root not in self.authority_issuers:
+                return False
+            # A local root may publish records explicitly scoped to its own
+            # domain. This is the only projection exception to graph-derived
+            # authority; it cannot be used for a foreign domain or identity.
+            local_scope = self.local_authorities.get(issuer)
+            payload = record.get("payload", {})
+            if (record.get("schema") in self._PROJECTION_SCHEMAS
+                    and local_scope is not None and issuer == root
+                    and isinstance(payload, dict)
+                    and payload.get("domain") == local_scope[0]):
+                return True
+            root_genesis = any(
+                candidate.get("issuer") == root and self._is_exact_local_genesis(candidate)
+                for candidate in accepted
+            )
+            explicit_root = root in self.authority_issuers and root not in self.local_authorities
+            if record.get("issuer") == root:
+                if root in self.local_authorities and not self._is_exact_local_genesis(record):
+                    return False
+                if root not in self.local_authorities and not explicit_root and not root_genesis:
+                    return False
+            elif not explicit_root and not root_genesis:
+                return False
+            if record.get("schema") in {"relationship", "peer-relationship"}:
+                edge = self._edge(record)
+                if edge is None or issuer not in {root, edge[0]}:
+                    return False
+            # A node identity is durable identity evidence: a severed parent
+            # edge stops delegated authority, but does not erase the child's
+            # already established identity. Other sensitive records require
+            # an active graph path.
+            if record.get("schema") == "node-identity":
+                payload_identity = payload.get("identity") if isinstance(payload, dict) else None
+                # A delegated issuer may assert only its own identity.  A root
+                # may establish a child identity through an approved
+                # enrollment, but that exception must not extend to children.
+                if issuer != root and payload_identity is not None and payload_identity != issuer:
+                    return False
+                identity_edges = [
+                    candidate for candidate in accepted
+                    if (self._edge(candidate) is not None
+                        and self._edge(candidate)[2] == "parent"
+                        and self._edge(candidate)[3] == root)
+                ]
+                exact_historical = _digest(record) in historical_identities
+                has_active_identity_edge = any(
+                    self._edge(edge)[1] == issuer
+                    and self._edge(edge)[3] == root
+                    and edge.get("payload", {}).get("status") == "active"
+                    for edge in identity_edges
+                )
+                has_historical_identity_edge = any(
+                    self._edge(edge)[1] == issuer and self._edge(edge)[3] == root
+                    for edge in identity_edges
+                )
+                if issuer != root and not has_active_identity_edge and not (
+                    exact_historical and has_historical_identity_edge
+                ):
+                    return False
+            elif not reachable(issuer, root):
+                return False
+            if record.get("schema") == "capability" and issuer != root:
+                payload = record.get("payload", {})
+                requested = payload.get("capabilities", []) if isinstance(payload, dict) else []
+                if not any(
+                    (edge := self._edge(candidate)) is not None
+                    and edge[0] == issuer and edge[1] == payload.get("subject")
+                    and edge[2] == "parent" and edge[3] == root
+                    and candidate.get("payload", {}).get("status") == "active"
+                    for candidate in accepted
+                ):
+                    return False
+                inherited = {
+                    capability
+                    for grant in accepted
+                    if grant.get("schema") == "capability"
+                    and isinstance(grant.get("payload"), dict)
+                    and grant["payload"].get("subject") == issuer
+                    and root_of(grant) == root
+                    for capability in grant.get("payload", {}).get("capabilities", [])
+                }
+                inherited.update(
+                    capability
+                    for candidate in accepted
+                    if (edge := self._edge(candidate)) is not None
+                    and edge[1] == issuer and edge[2] == "parent" and edge[3] == root
+                    and candidate.get("payload", {}).get("status") == "active"
+                    for capability in candidate.get("payload", {}).get("scope", [])
+                )
+                if not isinstance(requested, list) or not all(item in inherited for item in requested):
+                    return False
+            return True
+
+        pending = list(enumerate(records))
+        while pending:
+            admitted = [(index, record) for index, record in pending if authorized(record)]
+            if not admitted:
+                break
+            accepted.extend(record for _, record in admitted)
+            admitted_indexes = {index for index, _ in admitted}
+            pending = [(index, record) for index, record in pending if index not in admitted_indexes]
+        for index, record in pending:
+            rejected[index] = "unauthorized-capability" if record.get("schema") == "capability" else (
+                "unauthorized-relationship" if record.get("schema") in {"relationship", "peer-relationship"}
+                else "unauthorized-authority")
+        return rejected
+
+    @classmethod
+    def _cycle_indexes(cls, records: list[dict[str, Any]]) -> set[int]:
+        edges = [(index, cls._edge(record)) for index, record in enumerate(records)]
+        edges = [(index, edge) for index, edge in edges
+                 if edge is not None and edge[2] == "parent"
+                 and records[index].get("payload", {}).get("status") == "active"]
+        adjacency: dict[str, dict[str, set[str]]] = {}
+        for _, (source, target, _, root) in edges:
+            adjacency.setdefault(root, {}).setdefault(source, set()).add(target)
+
+        def reaches(root: str, source: str, target: str) -> bool:
+            frontier = [source]
+            seen: set[str] = set()
+            while frontier:
+                node = frontier.pop()
+                if node == target:
+                    return True
+                if node in seen:
+                    continue
+                seen.add(node)
+                frontier.extend(adjacency.get(root, {}).get(node, ()))
+            return False
+
+        return {index for index, (source, target, _, root) in edges if reaches(root, target, source)}
 
     def _validate(self, record: dict[str, Any]) -> tuple[str, str | None]:
         if isinstance(record, dict) and record.get("quarantined") is True and record.get("reason") == "unsafe-value":
@@ -639,15 +1341,15 @@ class Runtime:
         except (KeyError, ValueError, TypeError, binascii.Error, BadSignatureError):
             return "quarantined", "invalid-signature"
         payload = record["payload"]
-        sensitive_schemas = {
-            "node-identity", "identity-generation", "enrollment", "revocation",
-            "recovery-authorization", "receipt", "relationship", "capability",
-        }
-        if record["schema"] in sensitive_schemas and record["issuer"] not in self.authority_issuers:
-            return "quarantined", "unauthorized-authority"
-        authority_root = payload.get("authorityRoot")
-        if authority_root is not None and authority_root not in self.authority_issuers:
-            return "quarantined", "unauthorized-authority-root"
+        local_scope = self.local_authorities.get(record["issuer"])
+        if local_scope is not None:
+            domain, public_key = local_scope
+            if record["schema"] == "node-identity" and (
+                    payload.get("identity") != record["issuer"] or payload.get("domain") != domain
+                    or payload.get("publicKey") != public_key):
+                return "quarantined", "unauthorized-local-authority-scope"
+            if record["schema"] != "node-identity" and payload.get("domain") is not None and payload.get("domain") != domain:
+                return "quarantined", "unauthorized-local-authority-scope"
         if record["schema"] == "enrollment":
             if (not isinstance(payload.get("identity"), str) or not isinstance(payload.get("publicKey"), str)
                     or not isinstance(payload.get("requestDigest"), str)
@@ -658,55 +1360,145 @@ class Runtime:
                     or payload.get("generation") != record["generation"]
                     or payload.get("status", "active") not in {"active", "deprecated"}):
                 return "quarantined", "malformed-identity-generation"
+        if record["schema"] == "node-identity":
+            # Modern self-root records may use the historical ``id`` field,
+            # but any record using the identity-generation fields must carry
+            # a complete, authority-bound identity assertion.  In particular,
+            # a root-signed legacy assertion may not name an approver other
+            # than the issuer and thereby smuggle in an unverified approval.
+            if "identity" in payload and (
+                    not isinstance(payload.get("identity"), str)
+                    or not payload.get("identity")):
+                return "quarantined", "malformed-node-identity"
+            if "publicKey" in payload and (
+                    not isinstance(payload.get("publicKey"), str) or not payload.get("publicKey")):
+                return "quarantined", "malformed-node-identity"
+            approved_by = payload.get("approvedBy")
+            if approved_by is not None and (
+                    not isinstance(approved_by, str) or approved_by != record["issuer"]
+                    or not isinstance(payload.get("publicKey"), str)):
+                return "quarantined", "unapproved-node-identity"
+            for field in ("identityGeneration", "approverGeneration"):
+                value = payload.get(field)
+                if value is not None and (
+                        isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                    return "quarantined", "malformed-node-identity"
         if record["schema"] == "revocation":
             if (not isinstance(payload.get("identity"), str) or not isinstance(payload.get("generation"), int)
                     or payload["generation"] < 1 or not isinstance(payload.get("reason"), str)
                     or not payload["reason"]):
                 return "quarantined", "malformed-revocation"
         if record["schema"] == "recovery-authorization":
-            if self._recovery_approval_reason(payload) is not None:
-                return "quarantined", self._recovery_approval_reason(payload)
+            # Full authorization depends on the complete reconciled history
+            # (published approver generations and graph roles), so it is
+            # checked below by _reconcile rather than against bootstrap state.
+            if (not isinstance(payload.get("identity"), str)
+                    or record.get("recordId") != f"{payload.get('identity')}:recovery:{payload.get('lostGeneration')}"
+                    or record.get("generation") != 1
+                    or record.get("recordVersion") != 1
+                    or record.get("predecessor") is not None
+                    or not isinstance(payload.get("approvals"), list)):
+                return "quarantined", "malformed-recovery-authorization"
         if record["schema"] == "receipt":
             if not isinstance(payload.get("subject"), str) or not isinstance(payload.get("digest"), str):
                 return "quarantined", "malformed-receipt"
         return "accepted", None
 
-    def _recovery_approval_reason(self, payload: dict[str, Any]) -> str | None:
+    def _recovery_approval_reason(
+        self,
+        payload: dict[str, Any],
+        *,
+        generation_keys: dict[tuple[str, int], str] | None = None,
+        current_generations: dict[str, int] | None = None,
+        revoked_generations: set[tuple[str, int]] | None = None,
+        graph_records: list[dict[str, Any]] | None = None,
+        authority_root: str | None = None,
+        outer_issuer: str | None = None,
+    ) -> str | None:
         identity = payload.get("identity")
         lost = payload.get("lostGeneration")
         new = payload.get("newGeneration")
+        replacement = payload.get("newPublicKey")
+        proposal_digest = payload.get("proposalDigest")
         approvals = payload.get("approvals")
         if (not isinstance(identity, str) or not isinstance(lost, int) or isinstance(lost, bool) or lost < 1
-                or new != lost + 1 or not isinstance(payload.get("newPublicKey"), str)
+                or new != lost + 1 or not isinstance(replacement, str) or not replacement
+                or not isinstance(proposal_digest, str)
+                or proposal_digest != _recovery_proposal_digest(identity, lost, new, replacement)
                 or not isinstance(approvals, list) or not approvals
                 or not isinstance(payload.get("provenance", []), list)):
             return "malformed-recovery-authorization"
+        if any(not isinstance(item, dict) for item in payload.get("provenance", [])):
+            return "malformed-recovery-provenance"
         seen: set[tuple[str, str]] = set()
         counts = {role: 0 for role in ("operator", "parent", "peer")}
         for approval in approvals:
             if not isinstance(approval, dict) or any(key not in approval for key in (
-                    "approver", "role", "subject", "generation", "operation", "approverGeneration", "decision", "signature")):
+                    "approver", "role", "subject", "generation", "operation", "approverGeneration",
+                    "decision", "newPublicKey", "newGeneration", "proposalDigest", "signature")):
                 return "invalid-recovery-approval"
             if approval.get("subject") != identity or approval.get("generation") != lost:
                 return "unbound-recovery-approval"
             if (approval["subject"] != identity or approval["generation"] != lost
                     or approval["operation"] != "recovery" or approval["decision"] != "approve"
+                    or approval["newPublicKey"] != replacement or approval["newGeneration"] != new
+                    or approval["proposalDigest"] != proposal_digest
                     or approval["role"] not in {"operator", "parent", "peer"}
+                    or isinstance(approval["approverGeneration"], bool)
                     or not isinstance(approval["approverGeneration"], int)
                     or approval["approverGeneration"] < 1
                     or approval.get("approver") != approval.get("issuer")):
                 return "unbound-recovery-approval"
             approver = approval["approver"]
             role = approval["role"]
+            if approver == identity and not self.allow_self_recovery:
+                return "self-recovery-not-authorized"
+            if (not isinstance(outer_issuer, str) or not outer_issuer
+                    or outer_issuer == identity or outer_issuer not in self.authority_issuers):
+                return "non-independent-recovery-issuer"
             if approver not in self.approver_roles.get(role, set()):
                 return "untrusted-recovery-approver"
+            if graph_records is not None and role in {"parent", "peer"}:
+                current_role = False
+                for candidate in graph_records:
+                    edge = self._edge(candidate)
+                    if edge is None or edge[3] != authority_root:
+                        continue
+                    edge_payload = candidate.get("payload", {})
+                    if edge_payload.get("status", "active") != "active":
+                        continue
+                    if role == "parent":
+                        current_role = edge[2] == "parent" and edge[0] == approver and edge[1] == identity
+                    else:
+                        current_role = edge[2] == "peer" and {
+                            edge[0], edge[1]
+                        } == {approver, identity}
+                    if current_role:
+                        break
+                if not current_role:
+                    return "stale-recovery-role"
             identity_key = (approver, role)
             if identity_key in seen:
                 return "duplicate-recovery-approver"
             seen.add(identity_key)
             counts[role] += 1
             try:
-                key = VerifyKey(_unb64(self.public_keys[approval["approver"]]))
+                if generation_keys is not None:
+                    if revoked_generations and (approver, approval["approverGeneration"]) in revoked_generations:
+                        return "revoked-approver-generation"
+                    if approver in current_generations and current_generations[approver] != approval["approverGeneration"]:
+                        return "stale-approver-generation"
+                    public_key = generation_keys.get((approver, approval["approverGeneration"]))
+                    # A bootstrap authority is valid only as its undisputed
+                    # initial generation. Once that identity publishes a
+                    # generation, the bootstrap map can never override it.
+                    if public_key is None and approver not in current_generations and approval["approverGeneration"] == 1:
+                        public_key = self.public_keys.get(approver)
+                    if public_key is None:
+                        return "unknown-approver-generation"
+                else:
+                    public_key = self.public_keys[approval["approver"]]
+                key = VerifyKey(_unb64(public_key))
                 unsigned = {key: value for key, value in approval.items() if key not in {"signature", "issuer"}}
                 key.verify(canonical_json(unsigned), _unb64(approval["signature"]))
             except (KeyError, ValueError, TypeError, binascii.Error, BadSignatureError):
@@ -715,7 +1507,15 @@ class Runtime:
             return "recovery-quorum-not-met"
         return None
 
-    def ingest(self, records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    def ingest(self, records: Iterable[dict[str, Any]], *, retain: bool = True,
+               commit: bool = True) -> list[dict[str, Any]]:
+        """Ingest raw records; provider retention is only for local writes.
+
+        Consumer reads set ``retain=False`` so a record fetched from transport
+        is not appended back to that same transport. ``commit=False`` is used
+        by the consumer to commit records, reconciliation, projection, and
+        its cursor in one SQLite transaction.
+        """
         outcomes = []
         for record in records:
             if isinstance(record, dict) and "recordId" in record and "recordVersion" in record:
@@ -746,16 +1546,19 @@ class Runtime:
             else:
                 if existing:
                     record_key = f"{record_key}#conflict:{hashlib.sha256(envelope.encode()).hexdigest()}"
-                if not unsafe:
+                if retain and not unsafe:
                     self.provider.append(record)
                 self.db.execute("INSERT INTO records VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (record_key, record.get("recordId"), record.get("generation"), record.get("predecessor"),
                      status, reason, envelope))
             outcomes.append({"recordKey": record_key, "status": status, "reason": reason})
         self.db.execute("DELETE FROM records WHERE status = 'quarantined' AND rowid NOT IN (SELECT rowid FROM records WHERE status = 'quarantined' ORDER BY rowid DESC LIMIT ?)", (self.max_quarantine_records,))
-        self.db.commit()
+        if commit:
+            self.db.commit()
         self._reconcile()
         self._materialize()
+        if commit:
+            self.db.commit()
         for outcome in outcomes:
             row = self.db.execute("SELECT status, reason FROM records WHERE record_key = ?", (outcome["recordKey"],)).fetchone()
             if row:
@@ -794,13 +1597,37 @@ class Runtime:
             and isinstance(record["payload"].get("identity"), str)
             and isinstance(record["payload"].get("generation"), int)
         }
+        # Keep valid authorization evidence available even if a later
+        # reconciliation marks its approver generation stale.  A recovery
+        # already used to activate a replacement must not disappear merely
+        # because that approver subsequently rotates; the authorization is
+        # itself the durable, signed transition record.
+        valid_authorizations = [
+            (rowid, record_key, record)
+            for rowid, record_key, record in records
+            if isinstance(record, dict) and record.get("schema") == "recovery-authorization"
+            and self._validate(record)[0] == "accepted"
+        ]
+        authorization_proposals: dict[tuple[str, int, int], list[int]] = {}
+        for rowid, _, record in valid_authorizations:
+            payload = record.get("payload", {})
+            proposal = (
+                payload.get("identity"), payload.get("lostGeneration"), payload.get("newGeneration")
+            )
+            if all(isinstance(value, int) and not isinstance(value, bool) for value in proposal[1:]):
+                authorization_proposals.setdefault(proposal, []).append(rowid)
+        for rowids in authorization_proposals.values():
+            if len(rowids) > 1:
+                for rowid in rowids:
+                    reasons[rowid] = "replayed-recovery-authorization"
         authorizations = {
             (record["payload"]["identity"], record["payload"]["newGeneration"]): record
-            for _, _, record in candidates
+            for auth_rowid, _, record in valid_authorizations
             if record["schema"] == "recovery-authorization"
             and isinstance(record.get("payload"), dict)
             and isinstance(record["payload"].get("identity"), str)
             and isinstance(record["payload"].get("newGeneration"), int)
+            and reasons[auth_rowid] is None
         }
         active_generations: dict[str, int] = {}
         for _, _, record in candidates:
@@ -811,15 +1638,6 @@ class Runtime:
                     and payload.get("status", "active") == "active"):
                 identity = payload["identity"]
                 active_generations[identity] = max(active_generations.get(identity, 0), payload["generation"])
-        for rowid, _, record in candidates:
-            if record["schema"] != "recovery-authorization" or reasons[rowid] is not None:
-                continue
-            for approval in record.get("payload", {}).get("approvals", []):
-                approver = approval.get("approver") if isinstance(approval, dict) else None
-                generation = approval.get("approverGeneration") if isinstance(approval, dict) else None
-                if approver not in self.authority_issuers and active_generations.get(approver) != generation:
-                    reasons[rowid] = "stale-approver-generation"
-                    break
         for rowid, _, record in candidates:
             payload = record.get("payload", {})
             identity = payload.get("identity") if isinstance(payload, dict) else None
@@ -835,7 +1653,10 @@ class Runtime:
                 if payload.get("identityGeneration") is not None and (
                         identity, payload.get("identityGeneration")) in revocations:
                     reasons[rowid] = "revoked-generation"
-            record_generation = payload.get("identityGeneration") if record["schema"] == "node-identity" else generation
+            record_generation = (
+                payload.get("identityGeneration", record["generation"])
+                if record["schema"] == "node-identity" else generation
+            )
             if isinstance(identity, str) and isinstance(record_generation, int) and identity in active_generations:
                 if (reasons[rowid] is None and record_generation < active_generations[identity]
                         and record["schema"] not in {"revocation", "recovery-authorization"}):
@@ -848,6 +1669,8 @@ class Runtime:
                     payload_digest = payload.get("recoveryAuthorizationDigest")
                     if payload_digest != _digest(authorization):
                         reasons[rowid] = "recovery-provenance-mismatch"
+                    elif payload.get("publicKey") != authorization["payload"].get("newPublicKey"):
+                        reasons[rowid] = "recovery-key-mismatch"
         by_id: dict[str, list[dict[str, Any]]] = {}
         for _, _, record in candidates:
             by_id.setdefault(record["recordId"], []).append(record)
@@ -881,10 +1704,130 @@ class Runtime:
             if not ((record["generation"] == 1 and predecessor is None)
                     or (predecessor, record["generation"] - 1) in available):
                 reasons[rowid] = "missing-predecessor"
-        with self.db:
-            for rowid, _, _, _, _, _ in rows:
-                status = "accepted" if reasons[rowid] is None else "quarantined"
-                self.db.execute("UPDATE records SET status = ?, reason = ? WHERE rowid = ?", (status, reasons[rowid], rowid))
+
+        # Only lineage-valid records may provide graph evidence.  This also
+        # keeps forged/forked relationships from authorizing other records.
+        candidates = [entry for entry in candidates if reasons[entry[0]] is None]
+        historical_identities = {
+            _digest(json.loads(raw))
+            for (raw,) in self.db.execute(
+                "SELECT envelope FROM records WHERE status = 'accepted'"
+            )
+            if json.loads(raw).get("schema") == "node-identity"
+        }
+        authority_rejected = self._authority_boundary(
+            [record for _, _, record in candidates], historical_identities
+        )
+        for candidate_index, (rowid, _, _) in enumerate(candidates):
+            if candidate_index in authority_rejected:
+                reasons[rowid] = authority_rejected[candidate_index]
+        candidates = [entry for entry in candidates if reasons[entry[0]] is None]
+
+        # Recovery approvals use the exact key published by the approver's
+        # currently active identity generation.  The configured public-key
+        # map is only a bootstrap map; it must not make a rotated or revoked
+        # generation authoritative.
+        generation_keys: dict[tuple[str, int], str] = {}
+        generation_key_candidates: dict[tuple[str, int], set[str]] = {}
+        current_generations: dict[str, int] = {}
+        for _, _, record in candidates:
+            if record["schema"] not in {"node-identity", "identity-generation"}:
+                continue
+            payload = record.get("payload", {})
+            identity = payload.get("identity") if isinstance(payload, dict) else None
+            generation = (
+                payload.get("identityGeneration", payload.get("generation", record.get("generation")))
+                if isinstance(payload, dict) else None
+            )
+            public_key = payload.get("publicKey") if isinstance(payload, dict) else None
+            if (not isinstance(identity, str) or isinstance(generation, bool)
+                    or not isinstance(generation, int) or generation < 1
+                    or not isinstance(public_key, str) or payload.get("status", "active") != "active"
+                    or (identity, generation) in revocations):
+                continue
+            generation_key_candidates.setdefault((identity, generation), set()).add(public_key)
+            current_generations[identity] = max(current_generations.get(identity, 0), generation)
+        generation_keys = {
+            key: next(iter(public_keys))
+            for key, public_keys in generation_key_candidates.items()
+            if len(public_keys) == 1
+        }
+        graph_records = [record for _, _, record in candidates]
+        for rowid, _, record in candidates:
+            if record["schema"] != "node-identity" or reasons[rowid] is not None:
+                continue
+            payload = record.get("payload", {})
+            identity = payload.get("identity") if isinstance(payload, dict) else None
+            if not isinstance(identity, str):
+                continue
+            identity_generation = payload.get("identityGeneration", record.get("generation"))
+            public_key = payload.get("publicKey")
+            if isinstance(identity_generation, int) and isinstance(public_key, str):
+                expected_key = generation_keys.get((identity, identity_generation))
+                if expected_key is None or expected_key != public_key:
+                    reasons[rowid] = "identity-key-mismatch"
+                    continue
+            approved_by = payload.get("approvedBy")
+            approver_generation = payload.get("approverGeneration")
+            if approved_by is None:
+                continue
+            if not isinstance(approver_generation, int) or isinstance(approver_generation, bool):
+                # A legacy approval without a generation is only safe while
+                # the issuer still has its undisputed bootstrap generation.
+                if current_generations.get(approved_by, 1) > 1:
+                    reasons[rowid] = "stale-approver-generation"
+                continue
+            if current_generations.get(approved_by) != approver_generation:
+                reasons[rowid] = "stale-approver-generation"
+                continue
+            if (approved_by, approver_generation) not in generation_keys:
+                reasons[rowid] = "unknown-approver-generation"
+        for rowid, _, record in candidates:
+            if record["schema"] != "recovery-authorization":
+                continue
+            payload = record.get("payload", {})
+            root = payload.get("authorityRoot", record.get("issuer")) if isinstance(payload, dict) else None
+            reason = self._recovery_approval_reason(
+                payload,
+                generation_keys=generation_keys,
+                current_generations=current_generations,
+                revoked_generations=revocations,
+                graph_records=graph_records,
+                authority_root=root,
+                outer_issuer=record.get("issuer"),
+            )
+            if reason is not None:
+                reasons[rowid] = reason
+
+        # A replacement generation cannot bootstrap an approver or become a
+        # usable predecessor when the authorization which names it failed.
+        for rowid, _, record in candidates:
+            if record["schema"] != "identity-generation" or reasons[rowid] is not None:
+                continue
+            payload = record.get("payload", {})
+            identity = payload.get("identity") if isinstance(payload, dict) else None
+            generation = payload.get("generation") if isinstance(payload, dict) else None
+            if not isinstance(generation, int) or generation <= 1:
+                continue
+            authorization_row = next((candidate for candidate in candidates
+                                      if candidate[2]["schema"] == "recovery-authorization"
+                                      and candidate[2].get("payload", {}).get("identity") == identity
+                                      and candidate[2].get("payload", {}).get("newGeneration") == generation), None)
+            if (authorization_row is None
+                    or reasons[authorization_row[0]] not in {None, "stale-approver-generation"}):
+                reasons[rowid] = "missing-recovery-authorization"
+
+        # Authority is a prerequisite for graph evidence. In particular, an
+        # unauthorized reverse edge must not turn an otherwise valid path into
+        # a cycle. Genuine cycles among authorized, active parent edges remain
+        # quarantined, and _cycle_indexes keeps each authorityRoot separate.
+        cycle_indexes = self._cycle_indexes([record for _, _, record in candidates])
+        for candidate_index, (rowid, _, _) in enumerate(candidates):
+            if candidate_index in cycle_indexes:
+                reasons[rowid] = "parent-cycle"
+        for rowid, _, _, _, _, _ in rows:
+            status = "accepted" if reasons[rowid] is None else "quarantined"
+            self.db.execute("UPDATE records SET status = ?, reason = ? WHERE rowid = ?", (status, reasons[rowid], rowid))
 
     def _materialize(self) -> None:
         accepted = self.db.execute("SELECT record_key, record_id, generation, predecessor, status, reason, envelope FROM records WHERE status = 'accepted' OR reason IN ('anti-rollback', 'revoked-generation') ORDER BY generation, record_key").fetchall()
@@ -906,21 +1849,179 @@ class Runtime:
             current = latest.get(record["recordId"])
             if current is None or record["generation"] >= current[0]:
                 latest[record["recordId"]] = (record["generation"], record)
-        with self.db:
-            self.db.execute("DELETE FROM projection")
-            self.db.executemany("INSERT INTO projection VALUES (?, ?, ?, ?)",
-                [(record_id, record["schema"], json.dumps(record["payload"], sort_keys=True), generation)
-                 for record_id, (generation, record) in latest.items()])
+        self.db.execute("DELETE FROM projection")
+        self.db.executemany("INSERT INTO projection VALUES (?, ?, ?, ?)",
+            [(record_id, record["schema"], json.dumps(record["payload"], sort_keys=True), generation)
+             for record_id, (generation, record) in latest.items()])
+
+    @staticmethod
+    def _valid_cursor(cursor: ProviderCursor) -> bool:
+        return ((isinstance(cursor, int) and not isinstance(cursor, bool) and cursor >= 0)
+                or (isinstance(cursor, str) and 0 < len(cursor) <= 1024))
+
+    def _provider_cursor(self) -> ProviderCursor:
+        row = self.db.execute(
+            "SELECT cursor FROM provider_cursors WHERE stream = ?",
+            (getattr(self.provider, "stream", "default"),),
+        ).fetchone()
+        if row is None:
+            return 0
+        value: Any = json.loads(row[0])
+        if not self._valid_cursor(value):
+            raise ValueError("persisted provider cursor is invalid")
+        return value
+
+    def _save_provider_cursor(self, cursor: ProviderCursor) -> None:
+        if not self._valid_cursor(cursor):
+            raise ValueError("provider cursor is invalid")
+        self.db.execute(
+            "INSERT INTO provider_cursors(stream, cursor) VALUES (?, ?) "
+            "ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor",
+            (getattr(self.provider, "stream", "default"), json.dumps(cursor)),
+        )
+
+    @staticmethod
+    def _cursor_advanced(previous: ProviderCursor, current: ProviderCursor) -> bool:
+        if isinstance(previous, int) and isinstance(current, int):
+            return current > previous
+        if isinstance(previous, str) and isinstance(current, str):
+            return current != previous
+        return True
+
+    def sync(self, *, max_pages: int = 8, page_size: int = 100) -> dict[str, Any]:
+        """Consume at most ``max_pages`` bounded provider pages.
+
+        A trigger can be delivered by transport notification or an operator;
+        callers choose their own retry schedule, so this method never polls.
+        """
+        if (isinstance(max_pages, bool) or not isinstance(max_pages, int)
+                or max_pages < 1 or max_pages > 64
+                or isinstance(page_size, bool) or not isinstance(page_size, int)
+                or page_size < 1 or page_size > 500):
+            raise ValueError("sync bounds are invalid")
+        if not self._sync_lock.acquire(blocking=False):
+            return {"state": "busy", "pages": 0, "records": 0}
+        pages = records = 0
+        backlog = False
+        try:
+            self._sync_status = {"state": "syncing", "lastError": None, "pages": 0, "records": 0}
+            cursor = self._provider_cursor()
+            for _ in range(max_pages):
+                # Adapters may retain their last response cursor for
+                # observability; it must never be mistaken for this fetch's
+                # cursor if the fetch itself fails or omits one.
+                if hasattr(self.provider, "next_cursor"):
+                    self.provider.next_cursor = None
+                page = self.provider.fetch(cursor, page_size)
+                if not isinstance(page, list):
+                    raise ValueError("provider returned a non-list page")
+                previous: ProviderCursor | None = None
+                for item_cursor, record in page:
+                    if not self._valid_cursor(item_cursor):
+                        raise ValueError("provider returned an invalid record cursor")
+                    if isinstance(cursor, int) and isinstance(item_cursor, int) and item_cursor < cursor:
+                        raise ValueError("provider returned a cursor before the requested cursor")
+                    if isinstance(cursor, str) and isinstance(item_cursor, str) and item_cursor == cursor:
+                        raise ValueError("provider returned the requested cursor again")
+                    if previous is not None:
+                        if isinstance(previous, int) and isinstance(item_cursor, int) and item_cursor <= previous:
+                            raise ValueError("provider returned non-increasing cursors")
+                        if isinstance(previous, str) and isinstance(item_cursor, str) and item_cursor == previous:
+                            raise ValueError("provider returned duplicate cursors")
+                    previous = item_cursor
+                next_cursor = getattr(self.provider, "next_cursor", None)
+                if page:
+                    if next_cursor is None:
+                        last = page[-1][0]
+                        next_cursor = last + 1 if isinstance(last, int) else None
+                    if not self._valid_cursor(next_cursor) or not self._cursor_advanced(cursor, next_cursor):
+                        raise ValueError("provider did not advance its cursor")
+                    self.ingest((record for _, record in page), retain=False, commit=False)
+                    self._save_provider_cursor(next_cursor)
+                    self.db.commit()
+                    cursor = next_cursor
+                    pages += 1
+                    records += len(page)
+                else:
+                    break
+                if len(page) < page_size:
+                    break
+                backlog = pages >= max_pages
+            self._sync_status = {"state": "idle", "lastError": None, "pages": pages,
+                                 "records": records, "backlog": backlog}
+            return dict(self._sync_status)
+        except (OSError, RuntimeError, TimeoutError, TypeError, ValueError, sqlite3.Error) as error:
+            self.db.rollback()
+            self._sync_status = {"state": "degraded", "lastError": str(error), "pages": pages, "records": records}
+            return dict(self._sync_status)
+        finally:
+            self._sync_lock.release()
 
     def accepted(self, cursor: int = 0, limit: int = 100) -> list[dict[str, Any]]:
         if limit < 1 or limit > 1000 or cursor < 0:
             raise ValueError("cursor must be non-negative and limit must be between 1 and 1000")
-        rows = self.db.execute("SELECT envelope FROM records WHERE status = 'accepted' ORDER BY rowid LIMIT ? OFFSET ?", (limit, cursor)).fetchall()
+        rows = self.db.execute(
+            "SELECT envelope FROM records WHERE status = 'accepted' "
+            "ORDER BY generation, record_id, record_key LIMIT ? OFFSET ?", (limit, cursor)
+        ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
     def quarantine(self) -> list[dict[str, Any]]:
-        return [{"record": json.loads(raw), "reason": reason} for raw, reason in self.db.execute("SELECT envelope, reason FROM records WHERE status = 'quarantined' ORDER BY rowid")]
+        return [{"record": json.loads(raw), "reason": reason} for raw, reason in self.db.execute(
+            "SELECT envelope, reason FROM records WHERE status = 'quarantined' "
+            "ORDER BY reason, record_id, record_key"
+        )]
 
     def projection(self) -> dict[str, dict[str, Any]]:
         return {record_id: {"schema": schema, "payload": json.loads(payload), "generation": generation}
                 for record_id, schema, payload, generation in self.db.execute("SELECT record_id, schema, payload, generation FROM projection")}
+
+    def status(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "records": self.db.execute("SELECT COUNT(*) FROM records").fetchone()[0],
+            "accepted": self.db.execute("SELECT COUNT(*) FROM records WHERE status = 'accepted'").fetchone()[0],
+            "quarantined": self.db.execute("SELECT COUNT(*) FROM records WHERE status = 'quarantined'").fetchone()[0],
+            "projected": self.db.execute("SELECT COUNT(*) FROM projection").fetchone()[0],
+        }
+        try:
+            result["providerCursor"] = self._provider_cursor()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result["providerCursor"] = None
+        result["sync"] = dict(self._sync_status)
+        return result
+
+    def state_summary(self, node_id: str) -> dict[str, Any]:
+        """Return bounded state classification without raw payloads or secrets."""
+        if not isinstance(node_id, str) or not node_id:
+            raise ValueError("node_id is required")
+        totals = self.status()
+        schemas = dict(self.db.execute(
+            "SELECT schema, COUNT(*) FROM records GROUP BY schema ORDER BY schema"
+        ).fetchall())
+        local = self.local_authorities.get(node_id)
+        rows = self.db.execute(
+            "SELECT generation, status, reason FROM records WHERE record_id = ? "
+            "OR json_extract(envelope, '$.payload.identity') = ? ORDER BY generation",
+            (node_id, node_id),
+        ).fetchall()
+        accepted = [row for row in rows if row[1] == "accepted"]
+        generations = sorted({row[0] for row in accepted if isinstance(row[0], int)})
+        conflict = any(row[2] in {"conflicting-record-key", "unauthorized-local-authority-scope"} for row in rows)
+        accepted_records = self.accepted(0, 1000)
+        parents = sum(1 for record in accepted_records if record.get("schema") == "relationship"
+                      and record.get("payload", {}).get("to") == node_id
+                      and record.get("payload", {}).get("kind") == "parent")
+        peers = sum(1 for record in accepted_records if record.get("schema") == "peer-relationship"
+                    and node_id in {record.get("payload", {}).get("from"), record.get("payload", {}).get("to")})
+        return {
+            "records": {key: totals[key] for key in ("records", "accepted", "quarantined")},
+            "projection": {"total": totals["projected"]},
+            "schemas": schemas,
+            "localIdentity": {
+                "nodeId": node_id, "initialized": local is not None,
+                "generation": generations[-1] if generations else None,
+                "selfRooted": local is not None and node_id in self.authority_issuers,
+                "localGenesis": local is not None, "conflict": conflict,
+                "parentCount": parents, "peerCount": peers,
+            },
+        }

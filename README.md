@@ -18,6 +18,12 @@ The pipeline is intentionally explicit:
 raw transport -> envelope validation -> accepted history -> materialized state
 ```
 
+Reconciliation consumes the complete retained record set. Its conflict,
+revocation, lineage, authority, graph, capability, quarantine, and projection
+outputs are canonicalized independently of transport arrival order. The
+runtime invokes this bounded reconciliation pass after each ingestion batch;
+providers remain append/fetch-only and do not perform authorization.
+
 `makeTransport` is a deterministic in-process fixture for tests and snapshots.
 It is only an append/fetch fixture. The runtime adapter uses Ed25519 signatures
 and an append-only local provider. `OrbitDBProvider` is an optional,
@@ -47,8 +53,31 @@ monotonic, and bound each page. It must not validate authority or materialize
 state; `Runtime` performs signature, compatibility, lineage, quarantine, and
 reconciliation checks after transport ingestion. `FileProvider` remains the
 local integer-cursor contract; `OrbitDBProvider` exposes the daemon's opaque
-hash/`v1:<sequence>` cursors through the same runtime-only seam. It is not
-required by Nix evaluation.
+opaque cursors through the same runtime-only seam. It is not required by Nix
+evaluation.
+
+Transport pages now emit `v3-after:<position>` continuations and opaque
+`v3:<position>` record sequences. Positions are local to the persisted stream
+index, ordered by first observation of an exact event, and retained when a
+different OrbitDB hash wins duplicate reconciliation. Keep the transport index
+with its consumer state; cursors are not portable between nodes or rebuilt
+indexes. Append cursors remain inclusive `v2:<hash>` cursors.
+
+On upgrade, `v1:<offset>`, `v2-after:<hash>`, and legacy raw-hash resume cursors
+conservatively replay all retained events in bounded pages. Their old ordering
+cannot establish a consumed prefix, even when the anchor still exists. A missing
+old append anchor also replays from the beginning. Consumers must use each
+returned `nextCursor`; Registry atomically commits it with idempotent ingestion,
+so interrupted replay resumes safely and repeats do not duplicate accepted or
+quarantined history. No authority checks are bypassed. An empty/unavailable page
+does not advance progress.
+
+Already skipped records are recovered only as retained history is fetched and
+validated; upgrading alone is not proof of recovery. Allow catch-up to finish
+and compare expected accepted/quarantined records before relying on an affected
+runtime. Records absent from retained transport require separate recovery.
+Downgrading after saving v3 cursors is unsupported; preserve state and restore a
+compatible daemon rather than deleting cursors or the index.
 
 The library is exposed as both `registry` and `lib` from the flake. Run:
 
@@ -65,6 +94,15 @@ are created under explicit runtime paths; they are never inputs to Nix
 evaluation and must not be committed. `generate_keypair` refuses to replace
 existing active key files; use a numbered `generation` to retain prior keys,
 or explicitly request `rotation=True` for an active-key rotation.
+
+For a deliberately bootstrapped standalone node, construct `Runtime` with its
+runtime-held `node_key` and call `local_genesis(identity, domain)` exactly once.
+This emits the existing generation-one `node-identity` record, self-authorized
+only for that exact identity and domain. The runtime persists only the public
+key, domain, and record digest; repeated identical calls are idempotent and a
+different identity, domain, key, or state is rejected. The ordinary
+`make_enrollment_request` flow remains self-signed proof for external
+authority approval and does not create authority by itself.
 
 ## OpenBao runtime provider
 
