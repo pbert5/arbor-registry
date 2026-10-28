@@ -99,7 +99,7 @@
           pkgs.runCommand "arbor-registry-transport-tests" { nativeBuildInputs = [ pkgs.nodejs_22 ]; } ''
             node --check ${./transport}/registryd.mjs
             node --check ${./transport}/test/registryd.test.mjs
-            node --test ${package}/lib/arbor-registryd/source/test/*.test.mjs
+              node --test ${package}/lib/arbor-registry-transport/source/test/*.test.mjs
             touch $out
           '';
         vault-runtime = import ./tests/vault-runtime.nix {
