@@ -1,6 +1,7 @@
 import json
 import sys
 import base64
+import shlex
 
 TOKEN_FILE = "/run/arbor-test/runtime/socket-token"
 
@@ -157,7 +158,7 @@ print("MATRIX transport-does-not-imply-trust: PASS (invalid signature quarantine
 # Exercise the actual socket adapter and SQLite consumer against retained
 # replicated history. These isolated consumers simulate pre-upgrade omissions;
 # the running Registry and its trust configuration are untouched.
-root_b.succeed("python3 -c %r" % r'''
+root_b.succeed("python3 -c " + shlex.quote(r'''
 import json
 import tempfile
 from pathlib import Path
@@ -200,7 +201,7 @@ for legacy in ('v1:2', 'v2-after:' + raw[-1]['hash'], 'v2-after:replaced-winner'
         assert runtime.quarantine()[0]['reason'] == 'invalid-signature'
         assert 'tampered-transport-record' not in runtime.projection()
         runtime.close()
-''')
+'''))
 print("MATRIX legacy-cursor-replay-atomic-restart-idempotence: PASS")
 
 status = request(root_a, "status")
