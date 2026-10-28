@@ -18,6 +18,7 @@
       registry = import ./lib { lib = nixpkgs.lib; };
       nixosModule = import ./modules/nixos.nix;
       vaultRuntimeModule = import ./modules/vault-runtime.nix;
+      serviceContractModule = import ./modules/service-contract.nix;
     in
     {
       lib = registry;
@@ -36,6 +37,7 @@
       );
       nixosModules = {
         default = nixosModule;
+        service-contract = serviceContractModule;
         vault-runtime = vaultRuntimeModule;
         vault-runtime-upstream = {
           imports = [
@@ -66,6 +68,10 @@
           pkgs = import nixpkgs { inherit system; };
         };
         peers = import ./tests/peers.nix {
+          inherit registry;
+          pkgs = import nixpkgs { inherit system; };
+        };
+        deterministic-reconciliation = import ./tests/deterministic-reconciliation.nix {
           inherit registry;
           pkgs = import nixpkgs { inherit system; };
         };
@@ -102,6 +108,18 @@
         };
         vault-runtime-contract = import ./tests/vault-runtime-contract.nix {
           module = vaultRuntimeModule;
+          pkgs = import nixpkgs { inherit system; };
+        };
+        registry-runtime-vm = import ./tests/registry-runtime-vm.nix {
+          module = serviceContractModule;
+          pkgs = import nixpkgs { inherit system; };
+        };
+        graph-vm = import ./tests/graph-vm.nix {
+          module = serviceContractModule;
+          pkgs = import nixpkgs { inherit system; };
+        };
+        two-node-convergence-vm = import ./tests/two-node-convergence-vm.nix {
+          module = serviceContractModule;
           pkgs = import nixpkgs { inherit system; };
         };
         vault-upstream = import ./tests/vault-upstream.nix {

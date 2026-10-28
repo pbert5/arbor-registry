@@ -18,6 +18,12 @@ The pipeline is intentionally explicit:
 raw transport -> envelope validation -> accepted history -> materialized state
 ```
 
+Reconciliation consumes the complete retained record set. Its conflict,
+revocation, lineage, authority, graph, capability, quarantine, and projection
+outputs are canonicalized independently of transport arrival order. The
+runtime invokes this bounded reconciliation pass after each ingestion batch;
+providers remain append/fetch-only and do not perform authorization.
+
 `makeTransport` is a deterministic in-process fixture for tests and snapshots.
 It is only an append/fetch fixture. The runtime adapter uses Ed25519 signatures
 and an append-only local provider. `OrbitDBProvider` is an optional,
@@ -65,6 +71,15 @@ are created under explicit runtime paths; they are never inputs to Nix
 evaluation and must not be committed. `generate_keypair` refuses to replace
 existing active key files; use a numbered `generation` to retain prior keys,
 or explicitly request `rotation=True` for an active-key rotation.
+
+For a deliberately bootstrapped standalone node, construct `Runtime` with its
+runtime-held `node_key` and call `local_genesis(identity, domain)` exactly once.
+This emits the existing generation-one `node-identity` record, self-authorized
+only for that exact identity and domain. The runtime persists only the public
+key, domain, and record digest; repeated identical calls are idempotent and a
+different identity, domain, key, or state is rejected. The ordinary
+`make_enrollment_request` flow remains self-signed proof for external
+authority approval and does not create authority by itself.
 
 ## OpenBao runtime provider
 

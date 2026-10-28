@@ -62,6 +62,19 @@ async function waitForRecords(socketPath, ids) {
   throw new Error(`records did not arrive at ${socketPath}: ${ids.join(', ')}`)
 }
 
+async function waitForSemanticReplication(socketPath, ids, predicate) {
+  let evidence
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const status = await request(socketPath, { operation: 'status' })
+    const page = await request(socketPath, { operation: 'list', stream: 'registry', cursor: 'v1:0', limit: 20 })
+    evidence = { status, page }
+    const records = page.ok ? page.records.map(item => item.event) : []
+    if (ids.every(id => records.some(event => event.recordId === id)) && predicate(status, records)) return evidence
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  throw new Error(`semantic replication did not converge: ${JSON.stringify(evidence)}`)
+}
+
 test('separate daemon processes preserve the typed append/list transport', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-'))
   const socketPath = path.join(root, 'registry.sock')
@@ -190,6 +203,52 @@ test('two daemons replicate an OrbitDB event over a bootstrapped libp2p peer', a
     await stop(second)
     await stop(first)
     await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('two peers converge through join/update evidence across partition and restart', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-acceptance-'))
+  const portA = await freeTcpPort(); const portB = await freeTcpPort()
+  const stateA = path.join(root, 'a'); const stateB = path.join(root, 'b')
+  const socketA = path.join(root, 'a.sock'); const socketB = path.join(root, 'b.sock')
+  const base = { ...process.env, ARBOR_REGISTRY_SOCKET_TOKEN: 'test-token', ARBOR_REGISTRY_REALM_ID: 'acceptance-realm' }
+  let first; let second
+  const envFor = (stateDir, socketPath, port, peerId) => ({
+    ...base,
+    ARBOR_REGISTRY_STATE_DIR: stateDir,
+    ARBOR_REGISTRY_SOCKET: socketPath,
+    ARBOR_REGISTRY_LISTEN: `/ip4/127.0.0.1/tcp/${port}`,
+    ...(peerId ? { ARBOR_REGISTRY_BOOTSTRAP_PEERS: `/ip4/127.0.0.1/tcp/${portA}/p2p/${peerId}` } : {}),
+  })
+  const start = (stateDir, socketPath, port, peerId) => spawn(process.execPath, [daemon], { env: envFor(stateDir, socketPath, port, peerId), stdio: ['ignore', 'ignore', 'pipe'] })
+  const stop = async child => {
+    if (!child || child.exitCode !== null) return
+    child.kill('SIGTERM'); await new Promise(resolve => child.once('exit', resolve))
+  }
+  try {
+    first = start(stateA, socketA, portA); await waitForStatus(socketA)
+    const firstStatus = await request(socketA, { operation: 'status' })
+    second = start(stateB, socketB, portB, firstStatus.peerId); const secondStatus = await waitForStatus(socketB)
+
+    const fromA = { recordId: 'acceptance-a', recordVersion: 1, payload: { source: 'a' } }
+    const fromB = { recordId: 'acceptance-b', recordVersion: 1, payload: { source: 'b' } }
+    const partitioned = { recordId: 'acceptance-partition', recordVersion: 1, payload: { source: 'partition' } }
+    assert.equal((await request(socketA, { operation: 'append', stream: 'registry', event: fromA })).ok, true)
+    await waitForSemanticReplication(socketB, ['acceptance-a'], status => status.replication.registry.joins > 0 && status.replication.registry.updates > 0)
+    assert.equal((await request(socketB, { operation: 'append', stream: 'registry', event: fromB })).ok, true)
+    await waitForSemanticReplication(socketA, ['acceptance-b'], status => status.replication.registry.joins > 0 && status.replication.registry.updates > 0)
+
+    await stop(second)
+    assert.equal((await request(socketA, { operation: 'append', stream: 'registry', event: partitioned })).ok, true)
+    second = start(stateB, socketB, portB, firstStatus.peerId); await waitForStatus(socketB)
+    const replay = await waitForSemanticReplication(socketB, ['acceptance-a', 'acceptance-b', 'acceptance-partition'], status => status.replication.registry.joins > 0 && status.replication.registry.updates > 0)
+    assert.equal(replay.status.peerId, secondStatus.peerId, 'restart should retain the transport identity')
+
+    const afterRestart = { recordId: 'acceptance-after-restart', recordVersion: 1, payload: { source: 'a-after-restart' } }
+    assert.equal((await request(socketA, { operation: 'append', stream: 'registry', event: afterRestart })).ok, true)
+    await waitForSemanticReplication(socketB, ['acceptance-after-restart'], status => status.replication.registry.updates > 0)
+  } finally {
+    await stop(second); await stop(first); await fs.rm(root, { recursive: true, force: true })
   }
 })
 
@@ -361,5 +420,49 @@ test('malformed replicated entries are quarantined and skipped', async () => {
     await daemon.withIndexLock(async () => { await daemon.refreshIndex('registry') })
     assert.deepEqual(daemon.index.streams.registry.map(item => item.hash), ['good'])
     assert.match(await fs.readFile(path.join(root, 'transport-quarantine.jsonl'), 'utf8'), /malformed-replicated-entry/)
+  } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+test('v2-after preserves a late earlier-clock event across restart', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-late-cursor-'))
+  const entries = [{ hash: 'hash-a', value: { id: 'a' }, clock: { time: 20, id: 'a' } }]
+  const open = async () => ({ iterator: async function * () { yield * entries }, get: async hash => entries.find(entry => entry.hash === hash).value })
+  const first = new TransportDaemon({ stateDir: root }); first.open = open
+  try {
+    await first.withIndexLock(async () => { await first.refreshIndex('registry'); await first.saveIndex() })
+    const saved = await first.list('registry', 'v2:begin', 10)
+    entries.push({ hash: 'hash-b', value: { id: 'b' }, clock: { time: 10, id: 'b' } })
+    assert.deepEqual((await first.list('registry', saved.nextCursor, 10)).records.map(item => item.hash), ['hash-b'])
+    assert.deepEqual(first.index.streams.registry.map(item => item.hash), ['hash-b', 'hash-a'])
+
+    const restarted = new TransportDaemon({ stateDir: root }); restarted.open = open
+    assert.deepEqual((await restarted.list('registry', saved.nextCursor, 10)).records.map(item => item.hash), ['hash-b'])
+  } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+test('healing observation subsets converges deterministic order and duplicate winner', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-healing-'))
+  const entries = [
+    { hash: 'late', value: { id: 'late' }, clock: { time: 2, id: 'b' } },
+    { hash: 'loser', value: { id: 'same' }, clock: { time: 4, id: 'z' } },
+    { hash: 'early', value: { id: 'early' }, clock: { time: 1, id: 'a' } },
+    { hash: 'winner', value: { id: 'same' }, clock: { time: 3, id: 'a' } },
+  ]
+  const makeDaemon = (stateDir, observed) => {
+    const daemon = new TransportDaemon({ stateDir })
+    daemon.open = async () => ({ iterator: async function * () { yield * observed }, get: async hash => entries.find(entry => entry.hash === hash)?.value })
+    return daemon
+  }
+  const first = makeDaemon(path.join(root, 'first'), entries)
+  const second = makeDaemon(path.join(root, 'second'), [...entries].reverse())
+  try {
+    await fs.mkdir(path.join(root, 'first'), { recursive: true }); await fs.mkdir(path.join(root, 'second'), { recursive: true })
+    first.index.streams.registry = [{ key: 'late', hash: 'late', order: '1:late' }]
+    second.index.streams.registry = [{ key: 'early', hash: 'early', order: '1:early' }]
+    await first.refreshIndex('registry'); await second.refreshIndex('registry')
+    assert.deepEqual(first.index.streams.registry.map(item => item.hash), ['early', 'late', 'winner'])
+    assert.deepEqual(second.index.streams.registry.map(item => item.hash), first.index.streams.registry.map(item => item.hash))
+    assert.equal(first.index.streams.registry.some(item => item.hash === 'loser'), false)
+    await assert.rejects(() => first.list('registry', 'v2-after:loser', 10), /invalid cursor/)
   } finally { await fs.rm(root, { recursive: true, force: true }) }
 })
