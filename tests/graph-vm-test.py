@@ -160,9 +160,13 @@ print("MATRIX transport-does-not-imply-trust: PASS (invalid signature quarantine
 # the running Registry and its trust configuration are untouched.
 root_b.succeed("python3 -c " + shlex.quote(r'''
 import json
+import os
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
+runtime_bin = Path(os.path.realpath('/run/current-system/sw/bin/arbor-registryd'))
+sys.path.insert(0, str(runtime_bin.parents[1] / f'lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages'))
 from arbor_registry_runtime import OrbitDBProvider, Runtime
 
 keys = json.loads(Path('/run/arbor-test/bootstrap-authorities.json').read_text())
