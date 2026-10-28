@@ -139,7 +139,9 @@ class RegistryServer:
         if operation in {"identity/inspect", "identity/init-self", "registry/summary"}:
             try:
                 return self._runtime_call(self._manager_request, request)
-            except (OSError, ValueError, TypeError):
+            except (OSError, RuntimeError):
+                return {"format": "arbor-manager/runtime-response", "version": 1, "status": "unavailable"}
+            except (ValueError, TypeError):
                 return {"format": "arbor-manager/runtime-response", "version": 1, "status": "conflict"}
         if operation == "health":
             return {"ok": True, "status": "ok"}

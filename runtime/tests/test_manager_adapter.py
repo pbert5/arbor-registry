@@ -124,6 +124,26 @@ class ManagerAdapterTests(unittest.TestCase):
         self.assertFalse((Path(self.config["keyDir"]) / "node-b.private").exists())
         self.assertEqual(self.request("identity/inspect", {})["nodeId"], "node-a")
 
+    def test_transport_outage_preserves_identity_for_retry(self):
+        class OutageProvider(FileProvider):
+            unavailable = True
+
+            def append(self, record):
+                if self.unavailable:
+                    raise RuntimeError("transport unavailable")
+                return super().append(record)
+
+        provider = OutageProvider(self.root / "raw" / "history.jsonl")
+        self.server.runtime.provider = provider
+        data = {"nodeId": "node-a", "domain": "domain-a"}
+        self.assertEqual(self.request("identity/init-self", data)["status"], "unavailable")
+        private = Path(self.config["keyDir"]) / "node-a.private"
+        before = private.read_bytes()
+        provider.unavailable = False
+        self.assertEqual(self.request("identity/init-self", data)["status"], "accepted")
+        self.assertEqual(private.read_bytes(), before)
+        self.assertEqual(self.server.runtime.status()["accepted"], 1)
+
     def test_key_loading_rejects_dangling_symlinks_and_insecure_files(self):
         key_dir = Path(self.config["keyDir"])
         key_dir.mkdir(mode=0o700)
