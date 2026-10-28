@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import threading
@@ -12,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .runtime import OrbitDBProvider, Runtime
+from .runtime import OrbitDBProvider, Runtime, generate_keypair, load_keypair
 
 
 class SyncWorker:
@@ -111,6 +113,7 @@ class RegistryServer:
             authorities,
             authority_issuers=set(config.get("authorityIssuers", authorities)),
         )
+        self.key_dir = Path(config.get("keyDir", self.runtime.state_dir / "keys"))
         self._runtime_lock = threading.RLock()
         self.sync_worker = SyncWorker(
             lambda **kwargs: self._runtime_call(self.runtime.sync, **kwargs),
@@ -133,6 +136,11 @@ class RegistryServer:
         if not isinstance(request, dict) or request.get("token") != self.token:
             return {"ok": False, "code": "authentication_failed"}
         operation = request.get("operation")
+        if operation in {"identity/inspect", "identity/init-self", "registry/summary"}:
+            try:
+                return self._runtime_call(self._manager_request, request)
+            except (OSError, ValueError, TypeError):
+                return {"format": "arbor-manager/runtime-response", "version": 1, "status": "conflict"}
         if operation == "health":
             return {"ok": True, "status": "ok"}
         if operation == "status":
@@ -159,6 +167,62 @@ class RegistryServer:
                 return {"ok": False, "code": "invalid_records"}
             return {"ok": True, "outcomes": self._runtime_call(self.runtime.ingest, records)}
         return {"ok": False, "code": "unsupported_operation"}
+
+    def _manager_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        from .manager_adapter import validate_request
+
+        validate_request({key: value for key, value in request.items() if key != "token"})
+        operation, data = request["operation"], request["data"]
+        local = self.runtime.local_authorities
+        node_id = data.get("nodeId")
+        if node_id is None and len(local) > 1:
+            raise ValueError("local identity is ambiguous")
+        if node_id is None and operation == "identity/inspect" and len(local) <= 1:
+            node_id = next(iter(local), None)
+        if node_id is None and operation == "identity/inspect":
+            return {"format": "arbor-manager/runtime-response", "version": 1,
+                    "status": "accepted", "operation": operation, "nodeId": None,
+                    "initialized": False, "localGenesis": False}
+        if not isinstance(node_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", node_id):
+            raise ValueError("invalid node identifier")
+        if operation == "identity/init-self":
+            domain = data.get("domain")
+            if not isinstance(domain, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", domain):
+                raise ValueError("invalid authority domain")
+            if local and (set(local) != {node_id} or local[node_id][0] != domain):
+                raise ValueError("conflicting local genesis")
+            key = load_keypair(self.key_dir, node_id)
+            if node_id in local:
+                if key is None or key.public_key != local[node_id][1]:
+                    raise ValueError("key conflicts with local genesis")
+            else:
+                # Existing unclaimed identity material is an operator boundary.
+                if key is not None or any(self.key_dir.glob("*.private")) or any(self.key_dir.glob("*.public")):
+                    raise ValueError("unclaimed key material")
+                if self.runtime.public_keys.get(node_id) is not None:
+                    raise ValueError("identity is already known")
+                key = generate_keypair(self.key_dir, node_id)
+            self.runtime.node_key = key
+            result = self.runtime.local_genesis(node_id, domain)
+            if result["status"] != "accepted":
+                raise ValueError("local genesis was not accepted")
+        elif node_id in local:
+            key = load_keypair(self.key_dir, node_id)
+            if key is None or key.public_key != local[node_id][1]:
+                raise ValueError("key conflicts with local genesis")
+        summary = self.runtime.state_summary(node_id)
+        identity = summary["localIdentity"]
+        public = local.get(node_id, (None, None))[1]
+        return {"format": "arbor-manager/runtime-response", "version": 1,
+                "status": "accepted", "operation": operation, "nodeId": node_id,
+                "initialized": identity["initialized"], "generation": identity["generation"],
+                "localGenesis": identity["localGenesis"], "selfRooted": identity["selfRooted"],
+                "publicFingerprint": hashlib.sha256(public.encode()).hexdigest() if public else None,
+                "parents": identity["parentCount"], "peers": identity["peerCount"],
+                "records": {"total": summary["records"]["records"],
+                            "accepted": summary["records"]["accepted"],
+                            "quarantined": summary["records"]["quarantined"]},
+                "projection": summary["projection"]}
 
     def serve(self) -> None:
         self.socket_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
