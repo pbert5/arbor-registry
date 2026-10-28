@@ -71,7 +71,9 @@ function orbitdbLibp2p(libp2p) {
     const queued = []; let waiting; let ended = false
     const source = { async next() { while (!queued.length && !ended) await new Promise(resolve => { waiting = resolve }); return queued.length ? { value: queued.shift(), done: false } : { done: true } }, [Symbol.asyncIterator]() { return this } }
     const sink = raw.sink(source)
-    return { send(value) { if (ended) throw new Error('stream is closed'); queued.push(value); waiting?.(); waiting = undefined }, [Symbol.asyncIterator]: () => raw.source[Symbol.asyncIterator](), async close() { ended = true; waiting?.(); await sink; await raw.close() } }
+    // OrbitDB closes its outgoing half while concurrently reading peer heads.
+    // Finishing the sink closes the write side; raw.close() also closes read.
+    return { send(value) { if (ended) throw new Error('stream is closed'); queued.push(value); waiting?.(); waiting = undefined }, [Symbol.asyncIterator]: () => raw.source[Symbol.asyncIterator](), async close() { ended = true; waiting?.(); await sink } }
   }
   return new Proxy(libp2p, { get(target, property) {
     if (property === 'handle') return (protocols, handler, options) => target.handle(protocols, event => handler(stream(event.stream), event.connection), options)

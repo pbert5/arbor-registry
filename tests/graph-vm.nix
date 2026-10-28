@@ -53,6 +53,7 @@ let
       # has been installed by the test harness.
       systemd.targets.arbor-participant.wants = pkgs.lib.mkForce [ ];
       systemd.services.arbor-registry.wantedBy = pkgs.lib.mkForce [ ];
+      systemd.services.arbor-registry-transport.wantedBy = pkgs.lib.mkForce [ ];
       systemd.tmpfiles.rules = [
         "d /run/arbor-test 0755 root root -"
         "d /run/arbor-test/runtime 0750 arbor-registry arbor-registry -"

@@ -172,6 +172,8 @@ test('two daemons replicate an OrbitDB event over a bootstrapped libp2p peer', a
     })
     await waitForStatus(socketA)
     const firstStatus = await request(socketA, { operation: 'status' })
+    const beforeJoin = { recordId: 'before-peer-joined', recordVersion: 1, payload: { source: 'peer-a' } }
+    assert.equal((await request(socketA, { operation: 'append', stream: 'registry', event: beforeJoin })).ok, true)
     second = spawn(process.execPath, [daemon], {
       env: {
         ...base,
@@ -184,6 +186,8 @@ test('two daemons replicate an OrbitDB event over a bootstrapped libp2p peer', a
       stdio: ['ignore', 'ignore', 'pipe'],
     })
     await waitForStatus(socketB)
+    const history = await waitForRecords(socketB, ['before-peer-joined'])
+    assert.ok(history.some(item => item.recordId === beforeJoin.recordId))
     const event = { recordId: 'replicated-node', recordVersion: 1, payload: { source: 'peer-a' } }
     const secondEvent = { recordId: 'replicated-node-b', recordVersion: 1, payload: { source: 'peer-b' } }
     assert.equal((await request(socketA, { operation: 'append', stream: 'registry', event })).ok, true)
