@@ -60,6 +60,9 @@ root_a.succeed("systemctl start arbor-registry.service")
 root_a.wait_for_unit("arbor-registry.service", timeout=120)
 wait_for_health(root_a)
 assert request(root_a, "ingest", records=local_records[root_a])["ok"]
+# Publish a tampered signed envelope directly to raw transport.
+invalid_record = dict(by_id["root-a"], recordId="tampered-transport-record")
+assert transport_request(root_a, "append", stream="registry", event=invalid_record)["ok"]
 transport_status = transport_request(root_a, "status")
 assert transport_status["ok"] and transport_status["databaseAddresses"]["registry"]
 address = transport_status["databaseAddresses"]["registry"]
@@ -99,6 +102,10 @@ for node in nodes[1:]:
         f"s.sendall((json.dumps({{'operation':'list','stream':'registry','cursor':'v2:begin','limit':100,'token':open('{TOKEN_FILE}').read().strip()}})+'\\n').encode()); "
         "x=json.loads(s.recv(1048576)); assert x.get('ok') and any(r.get('event',{}).get('recordId') == 'root-a' for r in x.get('records',[])), x;"), timeout=120)
 print("MATRIX foreign-raw-state-before-local-genesis: PASS")
+root_b.wait_until_succeeds("python3 -c %r" % (
+    "import json,socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/arbor-registry-transport/transport.sock'); "
+    f"s.sendall((json.dumps({{'operation':'list','stream':'registry','cursor':'v2:begin','limit':100,'token':open('{TOKEN_FILE}').read().strip()}})+'\\n').encode()); "
+    "x=json.loads(s.recv(1048576)); assert any(r.get('event',{}).get('recordId') == 'tampered-transport-record' for r in x.get('records',[])), x;"), timeout=120)
 
 # Each node performs only its own local-origin Registry ingest. Every other
 # record below must arrive through the transport provider and sync worker.
@@ -139,7 +146,13 @@ for node in nodes:
     for record in records:
         wait_for_record(node, record["recordId"])
 print("MATRIX join-split-rejoin-multiple-parents-two-graph-bridge: PASS")
-print("MATRIX transport-does-not-imply-trust: PASS")
+root_b.wait_until_succeeds("python3 -c %r" % (
+    "import json,socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/arbor-registry/registry.sock'); "
+    f"s.sendall((json.dumps({{'operation':'quarantine','token':open('{TOKEN_FILE}').read().strip()}})+'\\n').encode()); "
+    "x=json.loads(s.recv(1048576)); assert any(item.get('record',{}).get('recordId') == 'tampered-transport-record' and item.get('reason') == 'invalid-signature' for item in x.get('records',[])), x;"), timeout=120)
+assert not any(item.get("recordId") == "tampered-transport-record" for item in request(root_b, "accepted")["records"])
+assert "tampered-transport-record" not in request(root_b, "projection")["records"]
+print("MATRIX transport-does-not-imply-trust: PASS (invalid signature quarantined)")
 
 status = request(root_a, "status")
 assert status["ok"]

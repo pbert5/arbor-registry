@@ -66,11 +66,13 @@ async function assertPrivatePath(file, { directory = false } = {}) {
 
 // OrbitDB 4 expects the pre-1.x libp2p stream shape; this is the only
 // compatibility adapter. It does not alter authentication or validation.
-function orbitdbLibp2p(libp2p) {
+export function orbitdbLibp2p(libp2p) {
   const stream = raw => {
     const queued = []; let waiting; let ended = false
     const source = { async next() { while (!queued.length && !ended) await new Promise(resolve => { waiting = resolve }); return queued.length ? { value: queued.shift(), done: false } : { done: true } }, [Symbol.asyncIterator]() { return this } }
     const sink = raw.sink(source)
+    // Attach a handler immediately; close still observes the original rejection.
+    sink.catch(() => {})
     // OrbitDB closes its outgoing half while concurrently reading peer heads.
     // Finishing the sink closes the write side; raw.close() also closes read.
     return { send(value) { if (ended) throw new Error('stream is closed'); queued.push(value); waiting?.(); waiting = undefined }, [Symbol.asyncIterator]: () => raw.source[Symbol.asyncIterator](), async close() { ended = true; waiting?.(); await sink } }
@@ -225,7 +227,9 @@ export class TransportDaemon {
     if (!this.streams.includes(stream) || !Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new Error('invalid list request')
     return this.withIndexLock(async assertOwned => {
       await this.reloadIndex(); await this.refreshIndex(stream); await assertOwned(); await this.saveIndex(assertOwned)
-      const entries = validateIndex(this.index, this.streams).streams[stream] ?? []
+      // Page in the same durable observation order used by v2-after cursors.
+      const entries = [...(validateIndex(this.index, this.streams).streams[stream] ?? [])]
+        .sort((left, right) => left.issued - right.issued)
       let start
       const v2 = typeof cursor === 'string' && /^v2:(begin|[A-Za-z0-9._:-]{1,1024})$/.exec(cursor)
       const v2After = typeof cursor === 'string' && /^v2-after:([A-Za-z0-9._:-]{1,1024})$/.exec(cursor)
@@ -235,7 +239,6 @@ export class TransportDaemon {
         const anchor = entries.find(item => item.hash === v2After[1])
         if (!anchor || !Number.isSafeInteger(anchor.issued)) throw new Error('invalid cursor')
         selectedAfter = entries.filter(item => item.issued > anchor.issued)
-        selectedAfter.sort((left, right) => (left.order ?? `1:${left.hash}`).localeCompare(right.order ?? `1:${right.hash}`))
         start = 0
       } else if (v2) {
         if (v2[1] === 'begin') start = 0

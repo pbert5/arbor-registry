@@ -5,7 +5,7 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { startSocketServer, TransportDaemon } from '../registryd.mjs'
+import { orbitdbLibp2p, startSocketServer, TransportDaemon } from '../registryd.mjs'
 
 const daemon = path.join(import.meta.dirname, '..', 'registryd.mjs')
 
@@ -469,4 +469,34 @@ test('healing observation subsets converges deterministic order and duplicate wi
     assert.equal(first.index.streams.registry.some(item => item.hash === 'loser'), false)
     await assert.rejects(() => first.list('registry', 'v2-after:loser', 10), /invalid cursor/)
   } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+
+test('pagination follows observation order across logical-clock inversions and restart', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-pages-'))
+  const entries = [{ hash: 'anchor', value: { id: 'anchor' }, clock: { time: 10 } }]
+  const open = async () => ({ iterator: async function * () { yield * entries }, get: async hash => entries.find(item => item.hash === hash).value })
+  const first = new TransportDaemon({ stateDir: root }); first.open = open
+  try {
+    const anchor = await first.list('registry', 'v1:0', 1)
+    entries.push({ hash: 'observed-first', value: { id: 'first' }, clock: { time: 30 } })
+    await first.list('registry', anchor.nextCursor, 1)
+    entries.push({ hash: 'observed-second', value: { id: 'second' }, clock: { time: 5 } })
+    const restarted = new TransportDaemon({ stateDir: root }); restarted.open = open
+    const page = await restarted.list('registry', anchor.nextCursor, 1)
+    assert.deepEqual(page.records.map(item => item.hash), ['observed-first'])
+    assert.equal(page.hasMore, true)
+    const last = await restarted.list('registry', page.nextCursor, 1)
+    assert.deepEqual(last.records.map(item => item.hash), ['observed-second'])
+    assert.equal(last.hasMore, false)
+    assert.deepEqual((await restarted.list('registry', 'v1:0', 1)).records.map(item => item.hash), ['anchor'])
+  } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+test('stream sink failure is handled immediately and reported on close', async () => {
+  const error = new Error('peer disconnected')
+  const adapter = orbitdbLibp2p({ dialProtocol: async () => ({ sink: async () => { throw error }, source: { async * [Symbol.asyncIterator]() {} } }) })
+  const stream = await adapter.dialProtocol('peer', 'protocol')
+  await new Promise(resolve => setTimeout(resolve, 20))
+  await assert.rejects(() => stream.close(), /peer disconnected/)
 })
