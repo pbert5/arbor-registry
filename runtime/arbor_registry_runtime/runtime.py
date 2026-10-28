@@ -647,6 +647,53 @@ def generate_keypair(
                 (key_dir / name).unlink(missing_ok=True)
 
 
+def load_keypair(key_dir: Path, issuer: str) -> RuntimeKey | None:
+    """Load an existing active key pair after validating its durable files.
+
+    This uses the same lock and transaction recovery as key creation so callers
+    never observe a half-installed pair. It never creates key material.
+    """
+    if (not isinstance(issuer, str) or not issuer or issuer in {".", ".."}
+            or issuer != Path(issuer).name or "/" in issuer or "\\" in issuer or "\x00" in issuer):
+        raise ValueError("issuer must be a single safe path component")
+    key_dir = Path(key_dir)
+    if not key_dir.exists():
+        return None
+    _secure_directory(key_dir)
+    private_path = key_dir / f"{issuer}.private"
+    public_path = key_dir / f"{issuer}.public"
+    journal_path = key_dir / f".{issuer}.keypair-transaction"
+    lock_path = key_dir / f".{issuer}.keypair-lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as error:
+        raise ValueError("key-pair lock is not safe") from error
+    with os.fdopen(lock_fd, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        _recover_keypair_transaction(
+            key_dir, journal_path, lock_path,
+            {"private": private_path.name, "public": public_path.name},
+        )
+        lock_path.chmod(0o600)
+        if private_path.is_symlink() or public_path.is_symlink():
+            raise ValueError("key pair must not use symbolic links")
+        private_exists, public_exists = private_path.exists(), public_path.exists()
+        if not private_exists and not public_exists:
+            return None
+        if not private_exists or not public_exists:
+            raise ValueError("key pair is incomplete")
+        _secure_file(private_path)
+        _secure_public_file(public_path)
+        try:
+            seed = SigningKey(_unb64(private_path.read_text(encoding="ascii").strip()))
+            public_key = VerifyKey(_unb64(public_path.read_text(encoding="ascii").strip()))
+        except (OSError, UnicodeError, ValueError, TypeError) as error:
+            raise ValueError("key pair is invalid") from error
+        if seed.verify_key != public_key:
+            raise ValueError("key pair members do not match")
+        return RuntimeKey(issuer, seed)
+
+
 def stage_keypair(key_dir: Path, issuer: str, generation: int) -> RuntimeKey:
     """Create a numbered candidate without changing the active key pair."""
     return generate_keypair(key_dir, issuer, generation=generation)
@@ -795,6 +842,7 @@ class FileProvider(Provider):
                 return cursor
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
 
     def fetch(self, cursor: int = 0, limit: int = 100) -> list[tuple[int, dict[str, Any]]]:
         if cursor < 0 or limit < 1 or limit > 1000:
@@ -1996,7 +2044,8 @@ class Runtime:
             raise ValueError("node_id is required")
         totals = self.status()
         schemas = dict(self.db.execute(
-            "SELECT schema, COUNT(*) FROM records GROUP BY schema ORDER BY schema"
+            "SELECT json_extract(envelope, '$.schema') AS schema, COUNT(*) "
+            "FROM records GROUP BY schema ORDER BY schema"
         ).fetchall())
         local = self.local_authorities.get(node_id)
         rows = self.db.execute(

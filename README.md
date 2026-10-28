@@ -95,6 +95,28 @@ evaluation and must not be committed. `generate_keypair` refuses to replace
 existing active key files; use a numbered `generation` to retain prior keys,
 or explicitly request `rotation=True` for an active-key rotation.
 
+The runtime package also installs `arbor-registry-manager-adapter`. It accepts
+one version-1 `arbor-manager/runtime-adapter` JSON request on stdin and forwards
+`identity/inspect`, `identity/init-self`, or `registry/summary` to the running
+Registry's authenticated Unix socket. Use it with Manager's
+`--runtime-executable` option. It reads `/etc/arbor-registry/config.json` by
+default; `--config` selects an isolated test configuration. Manager clears its
+child environment, so use an executable wrapper with `--config` for a custom
+path, rather than relying on an environment variable.
+
+The daemon serializes identity initialization with other runtime operations.
+Keys live in `<stateDir>/keys` unless `keyDir` is explicitly configured.
+Repeated initialization of the same node/domain preserves the key and genesis;
+conflicting domains, another local identity, missing/mismatched keys, and
+unclaimed pre-existing key material fail closed. Interrupted initialization
+that leaves an unclaimed key requires operator inspection, never automatic
+replacement. Inspection returns public fingerprints and bounded counts only.
+The adapter exits nonzero without emitting runtime errors or credentials on
+failure. It requires the existing socket-token access and does not grant it.
+
+This interface prepares local bootstrap; it does not enroll peers, grant
+relationship authority, activate a host, or establish private networking.
+
 For a deliberately bootstrapped standalone node, construct `Runtime` with its
 runtime-held `node_key` and call `local_genesis(identity, domain)` exactly once.
 This emits the existing generation-one `node-identity` record, self-authorized

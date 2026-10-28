@@ -163,6 +163,9 @@ in
           "arbor-registry-transport"
           "arbor-registry"
         ];
+        # Both daemons cache this shared token; keep it across individual stops.
+        # /run remains ephemeral across boots.
+        RuntimeDirectoryPreserve = true;
         Restart = "on-failure";
         RestartSec = 2;
         ExecStartPre = tokenInit;
@@ -190,6 +193,7 @@ in
         StateDirectory = cfg.stateDirectory;
         StateDirectoryMode = "0700";
         RuntimeDirectory = "arbor-registry";
+        RuntimeDirectoryPreserve = true;
         Restart = "on-failure";
         RestartSec = 2;
         ExecStartPre = tokenInit;

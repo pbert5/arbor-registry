@@ -2,7 +2,7 @@
 pkgs.testers.nixosTest {
   name = "arbor-registry-production-runtime";
   nodes.machine =
-    { ... }:
+    { config, ... }:
     {
       imports = [ module ];
       system.stateVersion = "25.05";
@@ -11,10 +11,12 @@ pkgs.testers.nixosTest {
       environment.systemPackages = [
         pkgs.jq
         pkgs.python3
+        config.cluster.registry.runtime.runtimePackage
       ];
     };
   testScript = ''
     import json
+    import shlex
 
     def refresh():
         machine.succeed("systemctl reset-failed arbor-runtime-status.service; systemctl start arbor-runtime-status.service")
@@ -32,6 +34,7 @@ pkgs.testers.nixosTest {
     machine.succeed("cat /run/arbor/doctor/status.json")
     assert healthy["registry"]["installed"] and healthy["registry"]["running"] and healthy["registry"]["ready"]
     assert healthy["transport"]["installed"] and healthy["transport"]["running"]
+    initial_token_digest = machine.succeed("sha256sum /run/arbor-registry/socket-token")
     machine.succeed("systemctl stop arbor-registry.service")
     machine.wait_until_succeeds("! systemctl is-active --quiet arbor-registry.service")
     refresh()
@@ -44,6 +47,26 @@ pkgs.testers.nixosTest {
     refresh()
     restored = json.loads(machine.succeed("cat /run/arbor/doctor/status.json"))
     assert restored["registry"]["ready"] is True
+    assert machine.succeed("sha256sum /run/arbor-registry/socket-token") == initial_token_digest
+    assert machine.succeed("stat -c %a /run/arbor-registry/socket-token").strip() == "600"
     assert "token" not in json.dumps(restored).lower()
+
+    def adapter(operation, data):
+        request = json.dumps({"protocol": "arbor-manager/runtime-adapter", "version": 1,
+                              "operation": operation, "data": data})
+        return json.loads(machine.succeed("printf %s " + shlex.quote(request) + " | arbor-registry-manager-adapter"))
+
+    assert adapter("identity/inspect", {})["initialized"] is False
+    identity = {"nodeId": "vm-local", "domain": "vm-local-domain"}
+    initialized = adapter("identity/init-self", identity)
+    assert initialized["status"] == "accepted" and initialized["generation"] == 1
+    assert initialized["localGenesis"] and initialized["selfRooted"]
+    assert adapter("identity/init-self", identity) == initialized
+    machine.succeed("systemctl restart arbor-registry.service")
+    machine.wait_until_succeeds("test -S /run/arbor-registry/registry.sock")
+    inspected = adapter("identity/inspect", {})
+    assert inspected["publicFingerprint"] == initialized["publicFingerprint"]
+    assert adapter("registry/summary", {"nodeId": "vm-local"})["records"] == {"total": 1, "accepted": 1, "quarantined": 0}
+    machine.log("MANAGER_ADAPTER_GENESIS_RESTART_PASS")
   '';
 }
