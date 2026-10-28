@@ -362,7 +362,7 @@ test('concurrent appends retain one ordered cursor per event', async () => {
     const results = await Promise.all(values.map(event => daemon.append('registry', event)))
     assert.equal(new Set(results.map(result => result.hash)).size, 3)
     assert.deepEqual(results.map(result => result.cursor).sort(), ['v2:hash-0', 'v2:hash-1', 'v2:hash-2'])
-    assert.deepEqual((await daemon.list('registry', 'v1:0', 10)).records.map(record => record.sequence), [0, 1, 2])
+    assert.deepEqual((await daemon.list('registry', 'v1:0', 10)).records.map(record => record.sequence), ['v3:0', 'v3:1', 'v3:2'])
   } finally { await fs.rm(root, { recursive: true, force: true }) }
 })
 
@@ -427,7 +427,7 @@ test('malformed replicated entries are quarantined and skipped', async () => {
   } finally { await fs.rm(root, { recursive: true, force: true }) }
 })
 
-test('v2-after preserves a late earlier-clock event across restart', async () => {
+test('continuation preserves a late earlier-clock event across restart', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-late-cursor-'))
   const entries = [{ hash: 'hash-a', value: { id: 'a' }, clock: { time: 20, id: 'a' } }]
   const open = async () => ({ iterator: async function * () { yield * entries }, get: async hash => entries.find(entry => entry.hash === hash).value })
@@ -467,7 +467,7 @@ test('healing observation subsets converges deterministic order and duplicate wi
     assert.deepEqual(first.index.streams.registry.map(item => item.hash), ['early', 'late', 'winner'])
     assert.deepEqual(second.index.streams.registry.map(item => item.hash), first.index.streams.registry.map(item => item.hash))
     assert.equal(first.index.streams.registry.some(item => item.hash === 'loser'), false)
-    await assert.rejects(() => first.list('registry', 'v2-after:loser', 10), /invalid cursor/)
+    assert.deepEqual((await first.list('registry', 'v2-after:loser', 10)).records.map(item => item.hash).sort(), ['early', 'late', 'winner'])
   } finally { await fs.rm(root, { recursive: true, force: true }) }
 })
 
@@ -499,4 +499,82 @@ test('stream sink failure is handled immediately and reported on close', async (
   const stream = await adapter.dialProtocol('peer', 'protocol')
   await new Promise(resolve => setTimeout(resolve, 20))
   await assert.rejects(() => stream.close(), /peer disconnected/)
+})
+
+test('REG-R2-01 continuation survives duplicate winner replacement and restart', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-winner-cursor-'))
+  const entries = [{ hash: 'loser', value: { id: 'same' }, clock: { time: 20 } }]
+  const restart = () => {
+    const daemon = new TransportDaemon({ stateDir: root })
+    daemon.open = async () => ({ iterator: async function * () { yield * entries }, get: async hash => entries.find(item => item.hash === hash).value })
+    return daemon
+  }
+  try {
+    const saved = await restart().list('registry', 'v2:begin', 1)
+    entries.push({ hash: 'winner', value: { id: 'same' }, clock: { time: 1 } },
+      { hash: 'partition', value: { id: 'partition' }, clock: { time: 2 } })
+    const healed = await restart().list('registry', saved.nextCursor, 1)
+    assert.deepEqual(healed.records.map(item => item.hash), ['partition'])
+    assert.equal(healed.hasMore, false)
+    assert.deepEqual((await restart().list('registry', healed.nextCursor, 1)).records, [])
+    assert.deepEqual((await restart().list('registry', 'v2:begin', 10)).records.map(item => item.hash), ['winner', 'partition'])
+    assert.match(saved.nextCursor, /^v3-after:/)
+  } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+for (const [finding, cursor] of [['REG-R2-02', 'v2-after:last'], ['REG-R2-03', 'v1:2'], ['REG-R2-02 missing anchor', 'v2-after:replaced'], ['legacy hash', 'last'], ['legacy missing hash', 'replaced'], ['legacy missing append anchor', 'v2:replaced']]) {
+  test(`${finding} replays retained history from an ambiguous legacy cursor`, async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-legacy-cursor-'))
+    // Old logical order: last, anchor, skipped. A saved cursor after last
+    // (issued=2), or offset 2, cannot prove that skipped was consumed.
+    const entries = [
+      { hash: 'anchor', value: { id: 'anchor' }, clock: { time: 10 } },
+      { hash: 'skipped', value: { id: 'skipped' }, clock: { time: 30 } },
+      { hash: 'last', value: { id: 'last' }, clock: { time: 5 } },
+    ]
+    const restart = () => {
+      const daemon = new TransportDaemon({ stateDir: root })
+      daemon.open = async () => ({ iterator: async function * () { yield * entries }, get: async hash => entries.find(item => item.hash === hash).value })
+      return daemon
+    }
+    try {
+      const old = restart()
+      // Build the persisted pre-upgrade index one observation at a time.
+      for (let count = 1; count <= entries.length; count++) {
+        old.open = async () => ({ iterator: async function * () { yield * entries.slice(0, count) } })
+        await old.refreshIndex('registry')
+      }
+      await old.saveIndex()
+      const hashes = []
+      let next = cursor
+      for (let page = 0; page < 3; page++) {
+        const result = await restart().list('registry', next, 1)
+        hashes.push(...result.records.map(item => item.hash))
+        next = result.nextCursor
+      }
+      assert.deepEqual(hashes, ['anchor', 'skipped', 'last'])
+      assert.match(next, /^v3-after:/)
+      assert.deepEqual((await restart().list('registry', next, 1)).records, [])
+    } finally { await fs.rm(root, { recursive: true, force: true }) }
+  })
+}
+
+test('replay preserves progress on unavailable records and rejects invalid v3 positions', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-replay-failure-'))
+  const daemon = new TransportDaemon({ stateDir: root })
+  let unavailable = true
+  daemon.open = async () => ({
+    iterator: async function * () { yield { hash: 'only', value: { id: 'only' } } },
+    get: async () => { if (unavailable) throw new Error('partition'); return { id: 'only' } },
+  })
+  try {
+    assert.deepEqual(await daemon.list('registry', 'v1:99', 1), { records: [], nextCursor: 'v1:99', hasMore: true })
+    unavailable = false
+    const page = await daemon.list('registry', 'v1:99', 1)
+    assert.equal(page.records[0].event.id, 'only')
+    assert.equal(page.nextCursor, 'v3-after:0')
+    for (const cursor of ['v3-after:1', 'v3-after:-1', 'v3-after:01', 'v3-after:9007199254740992', 'v1:9007199254740992']) {
+      await assert.rejects(() => daemon.list('registry', cursor, 1), /invalid cursor/)
+    }
+  } finally { await fs.rm(root, { recursive: true, force: true }) }
 })

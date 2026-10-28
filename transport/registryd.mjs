@@ -227,42 +227,45 @@ export class TransportDaemon {
     if (!this.streams.includes(stream) || !Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new Error('invalid list request')
     return this.withIndexLock(async assertOwned => {
       await this.reloadIndex(); await this.refreshIndex(stream); await assertOwned(); await this.saveIndex(assertOwned)
-      // Page in the same durable observation order used by v2-after cursors.
+      // Continuations use durable event positions, never replaceable winners.
       const entries = [...(validateIndex(this.index, this.streams).streams[stream] ?? [])]
         .sort((left, right) => left.issued - right.issued)
       let start
       const v2 = typeof cursor === 'string' && /^v2:(begin|[A-Za-z0-9._:-]{1,1024})$/.exec(cursor)
       const v2After = typeof cursor === 'string' && /^v2-after:([A-Za-z0-9._:-]{1,1024})$/.exec(cursor)
       const legacy = typeof cursor === 'string' && /^v1:(0|[1-9][0-9]*)$/.exec(cursor)
-      let selectedAfter
-      if (v2After) {
-        const anchor = entries.find(item => item.hash === v2After[1])
-        if (!anchor || !Number.isSafeInteger(anchor.issued)) throw new Error('invalid cursor')
-        selectedAfter = entries.filter(item => item.issued > anchor.issued)
+      const v3After = typeof cursor === 'string' && /^v3-after:(0|[1-9][0-9]*)$/.exec(cursor)
+      if (v3After) {
+        const issued = Number(v3After[1])
+        if (!Number.isSafeInteger(issued) || !entries.some(item => item.issued === issued)) throw new Error('invalid cursor')
+        start = entries.findIndex(item => item.issued > issued)
+        if (start < 0) start = entries.length
+      } else if (v2After || legacy) {
+        if (legacy && !Number.isSafeInteger(Number(legacy[1]))) throw new Error('invalid cursor')
+        // Old pages could already have skipped records. Neither their hash
+        // anchor nor their offset proves a consumed prefix. Replay all retained
+        // events, then migrate via the runtime's atomic ingest/cursor commit.
         start = 0
       } else if (v2) {
         if (v2[1] === 'begin') start = 0
         else {
           const position = entries.findIndex(item => item.hash === v2[1])
-          if (position < 0) throw new Error('invalid cursor')
-          start = position
+          // An old append anchor may also have lost a duplicate-winner election.
+          start = Math.max(0, position)
         }
-      } else if (legacy) {
-        start = Number(legacy[1])
-      } else if (typeof cursor === 'string') {
-        const position = entries.findIndex(item => item.hash === cursor)
-        if (position < 0) throw new Error('invalid cursor')
-        start = position + 1
+      } else if (typeof cursor === 'string' && /^[A-Za-z0-9._-]{1,1024}$/.test(cursor)) {
+        // Legacy raw hash anchors can disappear in the same winner election.
+        start = 0
       } else throw new Error('invalid cursor')
       if (!Number.isSafeInteger(start) || start > Number.MAX_SAFE_INTEGER - limit) throw new Error('invalid cursor')
-      const selected = selectedAfter ? selectedAfter.slice(0, limit) : entries.slice(start, start + limit); const db = await this.open(stream)
+      const selected = entries.slice(start, start + limit); const db = await this.open(stream)
       const records = []
       let processed = 0
       for (const [sequence, item] of selected.entries()) {
-        try { records.push({ hash: item.hash, event: await db.get(item.hash), sequence: start + sequence }); processed = sequence + 1 } catch { break }
+        try { records.push({ hash: item.hash, event: await db.get(item.hash), sequence: `v3:${item.issued}` }); processed = sequence + 1 } catch { break }
       }
-      const nextCursor = processed > 0 ? `v2-after:${records[records.length - 1].hash}` : cursor
-      return { records, nextCursor, hasMore: processed < (selectedAfter ? selectedAfter.length : entries.length - start) }
+      const nextCursor = processed > 0 ? `v3-after:${selected[processed - 1].issued}` : cursor
+      return { records, nextCursor, hasMore: processed < entries.length - start }
     })
   }
 
@@ -393,6 +396,7 @@ export class TransportDaemon {
       if (!Number.isSafeInteger(entry.issued)) entry.issued = index
       nextIssued = Math.max(nextIssued, entry.issued + 1)
     }
+    const issuedByKey = new Map(entries.map(item => [item.key, item.issued]))
     const candidates = new Map(entries.map(item => [item.hash, { key: item.key, hash: item.hash, order: item.order ?? `1:${item.hash}`, issued: item.issued, fromDatabase: false }]))
     for await (const entry of database.iterator()) {
       if (!entry || typeof entry !== 'object' || typeof entry.hash !== 'string' || !entry.hash || !entry.value || typeof entry.value !== 'object' || Array.isArray(entry.value)) {
@@ -420,7 +424,9 @@ export class TransportDaemon {
         continue
       }
       keys.add(entry.key)
-      if (!Number.isSafeInteger(entry.issued)) entry.issued = nextIssued++
+      // A duplicate winner represents the same exact event. Keep its original
+      // observation position so issued continuations remain valid across heals.
+      entry.issued = issuedByKey.get(entry.key) ?? entry.issued ?? nextIssued++
       unique.push({ key: entry.key, hash: entry.hash, order: entry.order, issued: entry.issued })
     }
     this.index.streams[stream] = unique

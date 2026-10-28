@@ -154,6 +154,55 @@ assert not any(item.get("recordId") == "tampered-transport-record" for item in r
 assert "tampered-transport-record" not in request(root_b, "projection")["records"]
 print("MATRIX transport-does-not-imply-trust: PASS (invalid signature quarantined)")
 
+# Exercise the actual socket adapter and SQLite consumer against retained
+# replicated history. These isolated consumers simulate pre-upgrade omissions;
+# the running Registry and its trust configuration are untouched.
+root_b.succeed("python3 -c %r" % r'''
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+from arbor_registry_runtime import OrbitDBProvider, Runtime
+
+keys = json.loads(Path('/run/arbor-test/bootstrap-authorities.json').read_text())
+provider = OrbitDBProvider(Path('/run/arbor-registry-transport/transport.sock'), 'registry',
+    token=Path('/run/arbor-test/runtime/socket-token').read_text().strip())
+raw = provider._request({'operation': 'list', 'stream': 'registry', 'cursor': 'v2:begin', 'limit': 100})['records']
+assert len(raw) == 11, len(raw)
+for legacy in ('v1:2', 'v2-after:' + raw[-1]['hash'], 'v2-after:replaced-winner', raw[-1]['hash']):
+    with tempfile.TemporaryDirectory() as directory:
+        state = Path(directory) / 'consumer'
+        def reopen():
+            return Runtime(state, provider, keys, authority_issuers=set(keys))
+        runtime = reopen()
+        # The old cursor claims progress, but only this subset was consumed.
+        runtime.ingest([raw[-1]['event']], retain=False)
+        runtime._save_provider_cursor(legacy)
+        runtime.db.commit()
+        with patch.object(runtime, '_save_provider_cursor', side_effect=OSError('injected commit failure')):
+            assert runtime.sync(max_pages=1, page_size=1)['state'] == 'degraded'
+        assert runtime.status()['providerCursor'] == legacy
+        assert runtime.db.execute('SELECT count(*) FROM records').fetchone()[0] == 1
+        runtime.close()
+        # Restart between every bounded replay page, including exact duplicates.
+        for _ in range(len(raw)):
+            runtime = reopen()
+            outcome = runtime.sync(max_pages=1, page_size=1)
+            assert outcome['state'] == 'idle' and outcome['records'] == 1, outcome
+            assert runtime.status()['providerCursor'].startswith('v3-after:')
+            runtime.close()
+        runtime = reopen()
+        assert runtime.sync(page_size=1)['records'] == 0
+        assert runtime.db.execute('SELECT count(*) FROM records').fetchone()[0] == len(raw)
+        expected = {item['event']['recordId'] for item in raw} - {'tampered-transport-record'}
+        assert {item['recordId'] for item in runtime.accepted()} == expected
+        assert len(runtime.quarantine()) == 1
+        assert runtime.quarantine()[0]['reason'] == 'invalid-signature'
+        assert 'tampered-transport-record' not in runtime.projection()
+        runtime.close()
+''')
+print("MATRIX legacy-cursor-replay-atomic-restart-idempotence: PASS")
+
 status = request(root_a, "status")
 assert status["ok"]
 root_a.succeed("test -s /var/lib/arbor-registry/registry.sqlite3")
