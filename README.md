@@ -70,6 +70,10 @@ different OrbitDB hash wins duplicate reconciliation. Keep the transport index
 with its consumer state; cursors are not portable between nodes or rebuilt
 indexes. Append cursors remain inclusive `v2:<hash>` cursors.
 
+On Linux, startup can sync a search-only state ancestor through a readable path
+on the same filesystem. That fallback flushes the filesystem before the daemon
+starts serving. Startup fails if an ancestor cannot be synced.
+
 On upgrade, `v1:<offset>`, `v2-after:<hash>`, and legacy raw-hash resume cursors
 conservatively replay all retained events in bounded pages. Their old ordering
 cannot establish a consumed prefix, even when the anchor still exists. A missing
