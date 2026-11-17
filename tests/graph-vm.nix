@@ -1,0 +1,84 @@
+{ module, pkgs }:
+let
+  runtime = pkgs.callPackage ../runtime/package.nix { };
+  transport = pkgs.callPackage ../transport/package.nix { };
+  python = pkgs.python3.withPackages (ps: [
+    ps.pynacl
+    runtime
+  ]);
+  realm = "arbor-graph-acceptance-v1";
+  node =
+    { hostname, address }:
+    {
+      imports = [ module ];
+      system.stateVersion = "25.05";
+      networking.hostName = hostname;
+      networking.useDHCP = false;
+      networking.firewall.enable = false;
+      networking.interfaces.eth1.ipv4.addresses = [
+        {
+          inherit address;
+          prefixLength = 24;
+        }
+      ];
+      virtualisation.memorySize = 1536;
+      environment.systemPackages = [
+        pkgs.jq
+        python
+        runtime
+        transport
+      ];
+      environment.variables.PYTHONPATH = "${runtime}/lib/${pkgs.python3.sitePackages}";
+      environment.etc."arbor-test/graph.py".source = ./graph-vm.py;
+      cluster.registry.runtime = {
+        enable = true;
+        runtimePackage = runtime;
+        transportPackage = transport;
+        transportRealmId = realm;
+        transportProtocolEpoch = 1;
+        transportListen = [ "/ip4/0.0.0.0/tcp/4001" ];
+        socket = "/run/arbor-registry/registry.sock";
+        transportSocket = "/run/arbor-registry-transport/transport.sock";
+        tokenFile = "/run/arbor-test/runtime/socket-token";
+        bootstrapAuthoritiesFile = "/run/arbor-test/bootstrap-authorities.json";
+        authorityIssuers = [
+          "root-a"
+          "root-b"
+          "child"
+          "grandchild"
+        ];
+      };
+      # The graph test creates the authority key at runtime. Keep the
+      # production target from starting Registry until that public key map
+      # has been installed by the test harness.
+      systemd.targets.arbor-participant.wants = pkgs.lib.mkForce [ ];
+      systemd.services.arbor-registry.wantedBy = pkgs.lib.mkForce [ ];
+      systemd.services.arbor-registry-transport.wantedBy = pkgs.lib.mkForce [ ];
+      systemd.tmpfiles.rules = [
+        "d /run/arbor-test 0755 root root -"
+        "d /run/arbor-test/runtime 0750 arbor-registry arbor-registry -"
+      ];
+    };
+in
+pkgs.testers.nixosTest {
+  name = "arbor-self-root-graph-vm";
+  nodes = {
+    root-a = node {
+      hostname = "root-a";
+      address = "10.42.0.10";
+    };
+    root-b = node {
+      hostname = "root-b";
+      address = "10.42.0.11";
+    };
+    child = node {
+      hostname = "child";
+      address = "10.42.0.12";
+    };
+    grandchild = node {
+      hostname = "grandchild";
+      address = "10.42.0.13";
+    };
+  };
+  testScript = builtins.readFile ./graph-vm-test.py;
+}

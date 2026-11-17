@@ -21,6 +21,12 @@ let
     ;
   optional = condition: value: if condition then [ value ] else [ ];
   unique = values: foldl' (out: value: if elem value out then out else out ++ [ value ]) [ ] values;
+  dedupeRecords =
+    records:
+    foldl' (
+      out: record:
+      if lib.any (existing: canonical existing == canonical record) out then out else out ++ [ record ]
+    ) [ ] (sortRecords records);
   findFirst =
     predicate: fallback: values:
     let
@@ -54,6 +60,12 @@ let
 
   unsigned = envelope: if isAttrs envelope then removeAttrs envelope [ "signature" ] else { };
   canonical = value: toJSON value;
+  recordOrderKey =
+    record:
+    "${get "recordId" "" record}:${toString (get "recordVersion" 0 record)}:${
+      toString (get "generation" 0 record)
+    }:${get "schema" "" record}:${canonical record}";
+  sortRecords = records: lib.sortOn recordOrderKey records;
   recordKey = record: "${record.recordId}:${toString record.recordVersion}";
   issuerOf = record: get "issuer" null record;
   isType = expected: value: typeOf value == expected;
@@ -63,10 +75,13 @@ let
 
   unsafeKeys = [
     "secret"
+    "clientsecret"
     "password"
     "passphrase"
     "token"
+    "authtoken"
     "credential"
+    "authorization"
     "privatekey"
     "private-key"
     "signingkey"
@@ -76,7 +91,26 @@ let
     "access-token"
     "seed"
   ];
-  unsafeKey = name: elem (lib.toLower name) unsafeKeys;
+  normalizeUnsafeKey = name: lib.replaceStrings [ "_" "-" ] [ "" "" ] (lib.toLower name);
+  unsafeKey =
+    name:
+    let
+      normalized = normalizeUnsafeKey name;
+    in
+    elem normalized unsafeKeys
+    || lib.any (suffix: lib.hasSuffix suffix normalized) [
+      "secret"
+      "password"
+      "passphrase"
+      "token"
+      "credential"
+      "authorization"
+      "apikey"
+      "accesskey"
+      "privatekey"
+      "signingkey"
+      "seed"
+    ];
   unsafeString =
     value:
     typeOf value == "string"
@@ -218,9 +252,10 @@ let
   validateHistory =
     records:
     let
+      records' = sortRecords (dedupeRecords records);
       byId = foldl' (
         out: record: out // { "${record.recordId}" = (out.${record.recordId} or [ ]) ++ [ record ]; }
-      ) { } records;
+      ) { } records';
       checkOne =
         record:
         let
@@ -229,13 +264,11 @@ let
           maxGeneration = lib.foldl' lib.max 0 generations;
           currentPeers = filter (x: x.generation == maxGeneration) peers;
           conflict = length (unique (map canonical currentPeers)) > 1;
-          predecessorRecord = findFirst (
+          predecessorRecord = lib.any (
             x: x.recordId == record.predecessor && x.generation == record.generation - 1
-          ) null records;
-          predecessorOK =
-            (record.predecessor == null && record.generation == 1)
-            || (predecessorRecord != null && predecessorRecord.generation + 1 == record.generation);
-          successors = filter (x: x.predecessor == record.predecessor) records;
+          ) records';
+          predecessorOK = (record.predecessor == null && record.generation == 1) || predecessorRecord;
+          successors = unique (map recordKey (filter (x: x.predecessor == record.predecessor) records'));
           fork = record.predecessor != null && length successors > 1;
           current = record.generation == maxGeneration;
         in
@@ -270,14 +303,24 @@ let
             quarantine = null;
           };
     in
-    map checkOne records;
+    map checkOne records';
 
   materialize =
     accepted:
     let
-      byFamily = family: filter (record: record.schema == family) accepted;
+      accepted' = sortRecords (dedupeRecords accepted);
+      byFamily = family: sortRecords (filter (record: record.schema == family) accepted');
       ordered = values: lib.sortOn (value: toJSON value) values;
-      identities = map (record: record.payload) (byFamily "node-identity");
+      # Identity presentation follows the stable descending identity key used
+      # by the established projection contract; all other families use the
+      # canonical ascending record order below.
+      identities = map (record: record.payload) (
+        lib.reverseList (
+          lib.sortOn (
+            record: "${canonical record.payload}:${record.recordId}:${toString record.recordVersion}"
+          ) (byFamily "node-identity")
+        )
+      );
       relationships = map (record: record.payload) (
         (byFamily "relationship") ++ (byFamily "peer-relationship")
       );
@@ -286,17 +329,16 @@ let
         records:
         map (
           id:
-          findFirst (
-            x:
-            x.recordId == id
-            &&
-              x.generation == lib.foldl' lib.max 0 (map (y: y.generation) (filter (y: y.recordId == id) records))
-          ) null records
-        ) (unique (map (x: x.recordId) records));
+          let
+            sameId = filter (x: x.recordId == id) records;
+            maxGeneration = lib.foldl' lib.max 0 (map (x: x.generation) sameId);
+          in
+          head (sortRecords (filter (x: x.generation == maxGeneration) sameId))
+        ) (lib.sort builtins.lessThan (unique (map (x: x.recordId) records)));
     in
     {
       inherit identities relationships peerRelationships;
-      records = latest accepted;
+      records = latest accepted';
       endpoints = ordered (map (record: record.payload) (byFamily "endpoint"));
       names = ordered (
         (map (record: record.payload) (byFamily "name"))
@@ -328,6 +370,7 @@ let
       authorizedIssuers ? null,
     }:
     let
+      raw' = sortRecords raw;
       envelopeResults = map (
         record:
         validateEnvelope {
@@ -341,31 +384,150 @@ let
             ;
           authorizedIssuers = null;
         }
-      ) raw;
-      envelopeAccepted = map (result: result.record) (filter (result: result.accepted) envelopeResults);
+      ) raw';
+      envelopeAccepted = dedupeRecords (
+        map (result: result.record) (filter (result: result.accepted) envelopeResults)
+      );
       historyResults = validateHistory envelopeAccepted;
       historyAccepted = map (result: result.record) (filter (result: result.accepted) historyResults);
       rejectedHistory = filter (result: !result.accepted) historyResults;
+      relationshipEvidenceOK =
+        record:
+        let
+          payload = get "payload" { } record;
+          root = get "authorityRoot" (get "issuer" null record) payload;
+          kind = get "kind" null payload;
+        in
+        isAttrs payload
+        && isString (get "from" null payload)
+        && isString (get "to" null payload)
+        && (record.schema == "peer-relationship" || isString kind);
+      relationshipRecordsForGraph =
+        map
+          (
+            record:
+            (
+              record.payload
+              // {
+                kind = if record.schema == "peer-relationship" then "peer" else record.payload.kind;
+                authorityRoot = get "authorityRoot" record.issuer record.payload;
+              }
+            )
+          )
+          (
+            filter (
+              record:
+              (record.schema == "relationship" || record.schema == "peer-relationship")
+              && relationshipEvidenceOK record
+            ) historyAccepted
+          );
       authority = authorityBoundary {
-        records = historyAccepted;
-        inherit authorizedIssuers;
+        records = filter (
+          record:
+          (record.schema != "relationship" && record.schema != "peer-relationship")
+          || relationshipEvidenceOK record
+        ) historyAccepted;
+        inherit authorizedIssuers signers;
       };
-      accepted = authority.accepted;
+      authorityAccepted = sortRecords (dedupeRecords authority.accepted);
+      revocationKeys = unique (
+        map
+          (record: {
+            identity = record.payload.identity;
+            generation = record.payload.generation;
+          })
+          (
+            filter (
+              record:
+              record.schema == "revocation"
+              && isAttrs record.payload
+              && isString (get "identity" null record.payload)
+              && isInt (get "generation" null record.payload)
+            ) authorityAccepted
+          )
+      );
+      revoked =
+        record:
+        record.schema != "revocation"
+        && lib.any (
+          item:
+          get "identity" null record.payload == item.identity
+          && get "generation" null record.payload == item.generation
+        ) revocationKeys;
+      accepted = filter (record: !revoked record) authorityAccepted;
+      revokedQuarantined = map (
+        record:
+        record
+        // {
+          quarantine = reason "revoked-generation" "record belongs to a revoked identity generation";
+        }
+      ) (filter revoked authorityAccepted);
+      authorizedGraphRecords = filter (
+        record: elem (recordKey record) (map recordKey accepted)
+      ) historyAccepted;
+      authorizedRelationships = filter (
+        record:
+        (record.schema == "relationship" || record.schema == "peer-relationship")
+        && relationshipEvidenceOK record
+      ) authorizedGraphRecords;
       quarantined =
         (map (result: result.record // { quarantine = result.quarantine; }) (
           filter (result: !result.accepted) envelopeResults
         ))
         ++ (map (result: result.record // { quarantine = result.quarantine; }) rejectedHistory)
-        ++ authority.quarantined;
-      graph = validateGraph { relationships = relationshipRecords accepted; };
+        ++ (map
+          (
+            record:
+            record
+            // {
+              quarantine = reason "invalid-relationship" "relationship is not valid authority evidence";
+            }
+          )
+          (
+            filter (
+              record:
+              (record.schema == "relationship" || record.schema == "peer-relationship")
+              && !relationshipEvidenceOK record
+            ) historyAccepted
+          )
+        )
+        ++ authority.quarantined
+        ++ revokedQuarantined;
+      graph = validateGraph {
+        relationships = map (
+          record:
+          record.payload
+          // {
+            kind = if record.schema == "peer-relationship" then "peer" else record.payload.kind;
+            authorityRoot = get "authorityRoot" record.issuer record.payload;
+          }
+        ) (sortRecords authorizedRelationships);
+      };
       cycleRecords = filter (
         record:
-        record.schema == "relationship"
-        && elem record.payload.from graph.cycles
-        && elem record.payload.to graph.cycles
-      ) accepted;
-      cycleRecordIds = map (record: record.recordId) cycleRecords;
-      graphAccepted = filter (record: !elem record.recordId cycleRecordIds) accepted;
+        (record.schema == "relationship" || record.schema == "peer-relationship")
+        && elem (recordKey record) (map recordKey authorizedGraphRecords)
+        && relationshipEvidenceOK record
+        && (
+          let
+            root = get "authorityRoot" (get "issuer" null record) record.payload;
+            scoped = filter (candidate: get "authorityRoot" null candidate == root) (
+              map (
+                candidate:
+                candidate.payload
+                // {
+                  kind = if candidate.schema == "peer-relationship" then "peer" else candidate.payload.kind;
+                  authorityRoot = get "authorityRoot" candidate.issuer candidate.payload;
+                }
+              ) authorizedRelationships
+            );
+          in
+          elem record.payload.from (validateGraph { relationships = scoped; }).cycles
+          && elem record.payload.to (validateGraph { relationships = scoped; }).cycles
+        )
+      ) (sortRecords authorizedGraphRecords);
+      cycleRecordKeys = map recordKey cycleRecords;
+      graphAccepted = sortRecords (filter (record: !elem (recordKey record) cycleRecordKeys) accepted);
       cycleQuarantined = map (
         record:
         record
@@ -375,9 +537,9 @@ let
       ) cycleRecords;
     in
     {
-      raw = raw;
+      raw = raw';
       accepted = graphAccepted;
-      quarantined = quarantined ++ cycleQuarantined;
+      quarantined = sortRecords (quarantined ++ cycleQuarantined);
       inherit graph;
       materialized = materialize graphAccepted;
     };
@@ -426,7 +588,8 @@ let
     }:
     filter (edge: (from == null || edge.from == from) && (to == null || edge.to == to)) relationships;
   parentEdges =
-    relationships: filter (edge: edgeActive edge && edgeKind edge == "parent") relationships;
+    relationships:
+    lib.sortOn canonical (filter (edge: edgeActive edge && edgeKind edge == "parent") relationships);
   parentGraph =
     relationships:
     foldl' (out: edge: out // { "${edge.from}" = (out.${edge.from} or [ ]) ++ [ edge.to ]; }) { } (
@@ -451,23 +614,31 @@ let
   hasParentCycle =
     relationships:
     let
-      graph = parentGraph relationships;
-      nodes = unique (
-        concatLists (
-          map (edge: [
-            edge.from
-            edge.to
-          ]) (parentEdges relationships)
-        )
-      );
+      rootOf = edge: get "authorityRoot" (get "issuer" null edge) edge;
+      roots = unique (map rootOf (parentEdges relationships));
       visit =
-        node: path:
+        graph: node: path:
         if elem node path then
           [ node ]
         else
-          concatLists (map (neighbor: visit neighbor (path ++ [ node ])) (get node [ ] graph));
+          concatLists (map (neighbor: visit graph neighbor (path ++ [ node ])) (get node [ ] graph));
+      cyclesFor =
+        root:
+        let
+          scoped = filter (edge: rootOf edge == root) (parentEdges relationships);
+          graph = parentGraph scoped;
+          nodes = unique (
+            concatLists (
+              map (edge: [
+                edge.from
+                edge.to
+              ]) scoped
+            )
+          );
+        in
+        concatLists (map (node: visit graph node [ ]) nodes);
     in
-    unique (concatLists (map (node: visit node [ ]) nodes));
+    unique (concatLists (map cyclesFor roots));
   graphQuery =
     {
       relationships,
@@ -582,10 +753,10 @@ let
           );
         in
         !(lib.all (capability: elem capability inherited) (capabilitiesOf grant))
-      ) grants;
+      ) (lib.sortOn canonical grants);
     in
     {
-      inherit violations;
+      violations = lib.sortOn canonical violations;
       valid = violations == [ ];
     };
 
@@ -593,8 +764,24 @@ let
     {
       records,
       authorizedIssuers,
+      signers ? { },
     }:
     let
+      isSelfGenesis =
+        record:
+        record.schema == "node-identity"
+        && record.issuer == rootOf record
+        && record.generation == 1
+        && record.recordVersion == 1
+        && record.predecessor == null
+        && get "genesis" false record.payload == true
+        && get "identity" null record.payload == record.issuer
+        && isString (get "publicKey" null record.payload)
+        && (signerFor signers record.issuer) != null
+        && get "publicKey" null record.payload == get "publicKey" null (signerFor signers record.issuer)
+        && isString (get "domain" null record.payload)
+        && get "approvedBy" null record.payload == record.issuer
+        && get "authorityRoot" null record.payload == record.issuer;
       relationshipPayloadOK =
         record:
         isAttrs record.payload
@@ -608,6 +795,7 @@ let
           from = get "from" null record.payload;
         in
         record.issuer == root || record.issuer == from;
+      relationshipEvidenceOK = record: relationshipPayloadOK record && relationshipIssuerOK record;
       capabilityPayloadOK =
         record:
         isAttrs record.payload
@@ -616,6 +804,11 @@ let
         && isList (get "capabilities" [ ] record.payload)
         && lib.all isString (get "capabilities" [ ] record.payload);
       rootOf = record: get "authorityRoot" (get "issuer" null record) record.payload;
+      rootEstablished =
+        accepted: root:
+        (authorizedIssuers != null && elem root authorizedIssuers)
+        || (authorizedIssuers == null && root == "root")
+        || lib.any (record: isSelfGenesis record && rootOf record == root) accepted;
       issuerHasPath =
         accepted: record: root:
         let
@@ -665,7 +858,7 @@ let
           && relationshipIssuerOK record
           && isString record.issuer
           && isString root
-          && (authorizedIssuers == null || elem root authorizedIssuers)
+          && (rootEstablished accepted root || isSelfGenesis record)
           && issuerHasPath accepted record root
         else if record.schema == "capability" then
           let
@@ -675,11 +868,66 @@ let
           in
           capabilityPayloadOK record
           && isString record.issuer
-          && (authorizedIssuers == null || elem root authorizedIssuers)
+          && (rootEstablished accepted root || isSelfGenesis record)
           && issuerHasPath accepted record root
+          && (
+            record.issuer == root
+            || lib.any (
+              edge:
+              edgeActive edge
+              && edgeKind edge == "parent"
+              && edge.from == record.issuer
+              && edge.to == record.payload.subject
+              && get "authorityRoot" root edge == root
+            ) (relationshipRecords accepted)
+          )
           && (record.issuer == root || lib.all (capability: elem capability inherited) requested)
         else
-          authorizedIssuers == null || elem record.issuer authorizedIssuers;
+          let
+            projectionBearing = elem record.schema [
+              "node-identity"
+              "identity-generation"
+              "capability"
+              "service"
+              "endpoint"
+              "name"
+              "trusted-peer"
+              "reachability"
+              "compatibility"
+              "machine-facts"
+              "hardware-snapshot"
+              "configuration-intent"
+            ];
+            sensitive =
+              projectionBearing
+              || elem record.schema [
+                "enrollment"
+                "revocation"
+                "recovery-authorization"
+                "receipt"
+              ];
+            root = rootOf record;
+            localDomain = findFirst (
+              genesis:
+              genesis.issuer == record.issuer
+              && get "domain" null genesis.payload == get "domain" null record.payload
+            ) null (filter isSelfGenesis accepted);
+            establishedIdentity =
+              record.schema == "node-identity"
+              && lib.any (edge: edge.to == record.issuer && get "authorityRoot" root edge == root) (
+                relationshipRecords accepted
+              );
+          in
+          (projectionBearing && localDomain != null && record.issuer == root)
+          || (
+            !sensitive
+            || (
+              isString record.issuer
+              && isString root
+              && (rootEstablished accepted root || isSelfGenesis record)
+              && (issuerHasPath accepted record root || establishedIdentity)
+            )
+          );
       resolve =
         accepted: pending:
         let
@@ -775,6 +1023,7 @@ in
     ;
   testSigner = issuer: token: {
     inherit issuer;
+    publicKey = token;
     sign = bytes: "${token}:${bytes}";
     verify = bytes: signature: signature == "${token}:${bytes}";
   };

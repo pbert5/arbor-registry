@@ -18,6 +18,7 @@
       registry = import ./lib { lib = nixpkgs.lib; };
       nixosModule = import ./modules/nixos.nix;
       vaultRuntimeModule = import ./modules/vault-runtime.nix;
+      serviceContractModule = import ./modules/service-contract.nix;
     in
     {
       lib = registry;
@@ -26,7 +27,7 @@
         let
           pkgs = import nixpkgs { inherit system; };
           runtime = import ./runtime/package.nix { inherit (pkgs) lib python3Packages; };
-          transport = import ./transport/package.nix { inherit (pkgs) buildNpmPackage nodejs_22; };
+          transport = import ./transport/package.nix { inherit (pkgs) buildNpmPackage nodejs_22 util-linux; };
         in
         {
           arbor-registry-runtime = runtime;
@@ -36,6 +37,7 @@
       );
       nixosModules = {
         default = nixosModule;
+        service-contract = serviceContractModule;
         vault-runtime = vaultRuntimeModule;
         vault-runtime-upstream = {
           imports = [
@@ -69,6 +71,10 @@
           inherit registry;
           pkgs = import nixpkgs { inherit system; };
         };
+        deterministic-reconciliation = import ./tests/deterministic-reconciliation.nix {
+          inherit registry;
+          pkgs = import nixpkgs { inherit system; };
+        };
         recovery = import ./tests/recovery.nix {
           inherit registry;
           pkgs = import nixpkgs { inherit system; };
@@ -88,12 +94,12 @@
         transport =
           let
             pkgs = import nixpkgs { inherit system; };
-            package = import ./transport/package.nix { inherit (pkgs) buildNpmPackage nodejs_22; };
+            package = import ./transport/package.nix { inherit (pkgs) buildNpmPackage nodejs_22 util-linux; };
           in
-          pkgs.runCommand "arbor-registry-transport-tests" { nativeBuildInputs = [ pkgs.nodejs_22 ]; } ''
+          pkgs.runCommand "arbor-registry-transport-tests" { nativeBuildInputs = [ pkgs.nodejs_22 pkgs.util-linux ]; } ''
             node --check ${./transport}/registryd.mjs
             node --check ${./transport}/test/registryd.test.mjs
-            node --test ${package}/lib/arbor-registryd/source/test/*.test.mjs
+              node --test ${package}/lib/arbor-registry-transport/source/test/*.test.mjs
             touch $out
           '';
         vault-runtime = import ./tests/vault-runtime.nix {
@@ -102,6 +108,18 @@
         };
         vault-runtime-contract = import ./tests/vault-runtime-contract.nix {
           module = vaultRuntimeModule;
+          pkgs = import nixpkgs { inherit system; };
+        };
+        registry-runtime-vm = import ./tests/registry-runtime-vm.nix {
+          module = serviceContractModule;
+          pkgs = import nixpkgs { inherit system; };
+        };
+        graph-vm = import ./tests/graph-vm.nix {
+          module = serviceContractModule;
+          pkgs = import nixpkgs { inherit system; };
+        };
+        two-node-convergence-vm = import ./tests/two-node-convergence-vm.nix {
+          module = serviceContractModule;
           pkgs = import nixpkgs { inherit system; };
         };
         vault-upstream = import ./tests/vault-upstream.nix {

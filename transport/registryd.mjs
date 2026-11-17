@@ -3,6 +3,7 @@ import net from 'node:net'
 import path from 'node:path'
 import process from 'node:process'
 import { createHash, randomUUID } from 'node:crypto'
+import { spawn } from 'node:child_process'
 import { Helia } from '@helia/core'
 import { bitswap } from '@helia/block-brokers'
 import { createOrbitDB, IPFSAccessController } from '@orbitdb/core'
@@ -36,7 +37,7 @@ function validateIndex(index, streams) {
   if (!index || index.version !== 1 || !index.streams || typeof index.streams !== 'object' || Array.isArray(index.streams)) throw new Error('invalid transport index')
   for (const stream of streams) {
     const entries = index.streams[stream]
-    if (!Array.isArray(entries) || entries.some(item => !item || typeof item.key !== 'string' || typeof item.hash !== 'string' || (item.order != null && typeof item.order !== 'string'))) throw new Error('invalid transport index')
+    if (!Array.isArray(entries) || entries.some(item => !item || typeof item.key !== 'string' || typeof item.hash !== 'string' || (item.order != null && typeof item.order !== 'string') || (item.issued != null && (!Number.isSafeInteger(item.issued) || item.issued < 0)))) throw new Error('invalid transport index')
     if (new Set(entries.map(item => item.key)).size !== entries.length) throw new Error('invalid transport index')
     if (new Set(entries.map(item => item.hash)).size !== entries.length) throw new Error('invalid transport index')
   }
@@ -66,12 +67,16 @@ async function assertPrivatePath(file, { directory = false } = {}) {
 
 // OrbitDB 4 expects the pre-1.x libp2p stream shape; this is the only
 // compatibility adapter. It does not alter authentication or validation.
-function orbitdbLibp2p(libp2p) {
+export function orbitdbLibp2p(libp2p) {
   const stream = raw => {
     const queued = []; let waiting; let ended = false
     const source = { async next() { while (!queued.length && !ended) await new Promise(resolve => { waiting = resolve }); return queued.length ? { value: queued.shift(), done: false } : { done: true } }, [Symbol.asyncIterator]() { return this } }
     const sink = raw.sink(source)
-    return { send(value) { if (ended) throw new Error('stream is closed'); queued.push(value); waiting?.(); waiting = undefined }, [Symbol.asyncIterator]: () => raw.source[Symbol.asyncIterator](), async close() { ended = true; waiting?.(); await sink; await raw.close() } }
+    // Attach a handler immediately; close still observes the original rejection.
+    sink.catch(() => {})
+    // OrbitDB closes its outgoing half while concurrently reading peer heads.
+    // Finishing the sink closes the write side; raw.close() also closes read.
+    return { send(value) { if (ended) throw new Error('stream is closed'); queued.push(value); waiting?.(); waiting = undefined }, [Symbol.asyncIterator]: () => raw.source[Symbol.asyncIterator](), async close() { ended = true; waiting?.(); await sink } }
   }
   return new Proxy(libp2p, { get(target, property) {
     if (property === 'handle') return (protocols, handler, options) => target.handle(protocols, event => handler(stream(event.stream), event.connection), options)
@@ -102,6 +107,7 @@ export class TransportDaemon {
     this.index = { version: 1, streams: Object.fromEntries(this.streams.map(s => [s, []])) }
     this.appendQueue = Promise.resolve()
     this.indexQueue = Promise.resolve()
+    this.replication = Object.fromEntries(this.streams.map(stream => [stream, { joins: 0, updates: 0, leaves: 0 }]))
     this.lockPath = path.join(this.stateDir, 'transport-index.lock')
     this.quarantinePath = path.join(this.stateDir, 'transport-quarantine.jsonl')
     this.bootstrapStatePath = path.join(this.stateDir, 'transport-bootstrap.json')
@@ -109,6 +115,12 @@ export class TransportDaemon {
 
   async start() {
     await fs.mkdir(this.stateDir, { recursive: true, mode: 0o700 })
+    // Persist newly created ancestors too, before any cursor can escape.
+    for (let parent = path.dirname(path.resolve(this.stateDir)); ; parent = path.dirname(parent)) {
+      const directory = await fs.open(parent, 'r')
+      try { await directory.sync() } finally { await directory.close() }
+      if (parent === path.dirname(parent)) break
+    }
     if (this.realmId) {
       try {
         const persisted = JSON.parse(await fs.readFile(this.bootstrapStatePath, 'utf8'))
@@ -172,6 +184,21 @@ export class TransportDaemon {
     if (this.realmId != null) options.AccessController = IPFSAccessController({ write: ['*'] })
     const database = await this.orbitdb.open(this.addresses[stream] ?? name, options)
     this.addresses[stream] = String(database.address); this.databases.set(stream, database)
+    const observation = this.replication[stream] ??= { joins: 0, updates: 0, leaves: 0 }
+    if (database.events?.on) {
+      database.events.on('join', (peerId, heads = []) => {
+        observation.joins++
+        observation.lastJoin = { peerId: String(peerId), heads: Array.isArray(heads) ? heads.length : 0 }
+      })
+      database.events.on('update', entry => {
+        observation.updates++
+        observation.lastUpdate = { hash: typeof entry?.hash === 'string' ? entry.hash : null }
+      })
+      database.events.on('leave', peerId => {
+        observation.leaves++
+        observation.lastLeave = { peerId: String(peerId) }
+      })
+    }
     if (this.realmId) await fs.writeFile(this.bootstrapStatePath, `${JSON.stringify({ realmId: this.realmId, protocolEpoch: this.protocolEpoch, databaseAddresses: this.addresses })}\n`, { mode: 0o600 })
     return database
   }
@@ -184,12 +211,20 @@ export class TransportDaemon {
         await this.refreshIndex(stream)
         const key = digest(event); const entries = this.index.streams[stream] ??= []
         const existing = entries.find(item => item.key === key)
-        if (existing) return { hash: existing.hash, cursor: `v2:${existing.hash}`, duplicate: true }
+        if (existing) {
+          // An earlier append may have reached the database without syncing the index.
+          await this.saveIndex(assertOwned)
+          return { hash: existing.hash, cursor: `v2:${existing.hash}`, duplicate: true }
+        }
         const hash = String(await (await this.open(stream)).add(event))
         await this.refreshIndex(stream)
         const refreshed = this.index.streams[stream] ??= []
         let position = refreshed.findIndex(item => item.hash === hash)
-        if (position < 0) { refreshed.push({ key, hash, order: `1:${hash}` }); position = refreshed.length - 1 }
+        if (position < 0) {
+          const issued = refreshed.reduce((next, item) => Math.max(next, Number.isSafeInteger(item.issued) ? item.issued + 1 : 0), 0)
+          refreshed.push({ key, hash, order: `1:${hash}`, issued }); position = refreshed.length - 1
+          refreshed.sort((left, right) => (left.order ?? `1:${left.hash}`).localeCompare(right.order ?? `1:${right.hash}`))
+        }
         const cursor = `v2:${hash}`
         await assertOwned(); await this.saveIndex(assertOwned)
         return { hash, cursor, duplicate: false }
@@ -203,38 +238,45 @@ export class TransportDaemon {
     if (!this.streams.includes(stream) || !Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE) throw new Error('invalid list request')
     return this.withIndexLock(async assertOwned => {
       await this.reloadIndex(); await this.refreshIndex(stream); await assertOwned(); await this.saveIndex(assertOwned)
-      const entries = validateIndex(this.index, this.streams).streams[stream] ?? []
+      // Continuations use durable event positions, never replaceable winners.
+      const entries = [...(validateIndex(this.index, this.streams).streams[stream] ?? [])]
+        .sort((left, right) => left.issued - right.issued)
       let start
       const v2 = typeof cursor === 'string' && /^v2:(begin|[A-Za-z0-9._:-]{1,1024})$/.exec(cursor)
       const v2After = typeof cursor === 'string' && /^v2-after:([A-Za-z0-9._:-]{1,1024})$/.exec(cursor)
       const legacy = typeof cursor === 'string' && /^v1:(0|[1-9][0-9]*)$/.exec(cursor)
-      if (v2After) {
-        const position = entries.findIndex(item => item.hash === v2After[1])
-        if (position < 0) throw new Error('invalid cursor')
-        start = position + 1
+      const v3After = typeof cursor === 'string' && /^v3-after:(0|[1-9][0-9]*)$/.exec(cursor)
+      if (v3After) {
+        const issued = Number(v3After[1])
+        if (!Number.isSafeInteger(issued) || !entries.some(item => item.issued === issued)) throw new Error('invalid cursor')
+        start = entries.findIndex(item => item.issued > issued)
+        if (start < 0) start = entries.length
+      } else if (v2After || legacy) {
+        if (legacy && !Number.isSafeInteger(Number(legacy[1]))) throw new Error('invalid cursor')
+        // Old pages could already have skipped records. Neither their hash
+        // anchor nor their offset proves a consumed prefix. Replay all retained
+        // events, then migrate via the runtime's atomic ingest/cursor commit.
+        start = 0
       } else if (v2) {
         if (v2[1] === 'begin') start = 0
         else {
           const position = entries.findIndex(item => item.hash === v2[1])
-          if (position < 0) throw new Error('invalid cursor')
-          start = position
+          // An old append anchor may also have lost a duplicate-winner election.
+          start = Math.max(0, position)
         }
-      } else if (legacy) {
-        start = Number(legacy[1])
-      } else if (typeof cursor === 'string') {
-        const position = entries.findIndex(item => item.hash === cursor)
-        if (position < 0) throw new Error('invalid cursor')
-        start = position + 1
+      } else if (typeof cursor === 'string' && /^[A-Za-z0-9._-]{1,1024}$/.test(cursor)) {
+        // Legacy raw hash anchors can disappear in the same winner election.
+        start = 0
       } else throw new Error('invalid cursor')
       if (!Number.isSafeInteger(start) || start > Number.MAX_SAFE_INTEGER - limit) throw new Error('invalid cursor')
       const selected = entries.slice(start, start + limit); const db = await this.open(stream)
       const records = []
       let processed = 0
       for (const [sequence, item] of selected.entries()) {
-        try { records.push({ hash: item.hash, event: await db.get(item.hash), sequence: start + sequence }); processed = sequence + 1 } catch { break }
+        try { records.push({ hash: item.hash, event: await db.get(item.hash), sequence: `v3:${item.issued}` }); processed = sequence + 1 } catch { break }
       }
-      const nextCursor = processed > 0 ? `v2-after:${records[records.length - 1].hash}` : cursor
-      return { records, nextCursor, hasMore: start + processed < entries.length }
+      const nextCursor = processed > 0 ? `v3-after:${selected[processed - 1].issued}` : cursor
+      return { records, nextCursor, hasMore: processed < entries.length - start }
     })
   }
 
@@ -243,9 +285,15 @@ export class TransportDaemon {
       await assertOwned()
       const indexFile = path.join(this.stateDir, 'transport-index.json')
       const temporary = `${indexFile}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
-      await fs.writeFile(temporary, `${JSON.stringify(validateIndex(this.index, this.streams))}\n`, { mode: 0o600, flag: 'wx' })
-      await assertOwned()
-      await fs.rename(temporary, indexFile)
+      try {
+        const file = await fs.open(temporary, 'wx', 0o600)
+        try { await file.writeFile(`${JSON.stringify(validateIndex(this.index, this.streams))}\n`); await file.sync() } finally { await file.close() }
+        await assertOwned()
+        await fs.rename(temporary, indexFile)
+        const directory = await fs.open(this.stateDir, 'r')
+        try { await directory.sync() } finally { await directory.close() }
+        await assertOwned()
+      } finally { await fs.rm(temporary, { force: true }) }
     })
     this.indexQueue = write.catch(() => {})
     return write
@@ -258,6 +306,20 @@ export class TransportDaemon {
   }
 
   async withIndexLock(operation) {
+    // flock locks the shared open file description; keeping this descriptor
+    // open fences even an expired lease until this process releases it or dies.
+    const guard = await fs.open(path.join(this.stateDir, 'transport-index.guard'), 'a', 0o600)
+    try {
+      await new Promise((resolve, reject) => {
+        const child = spawn('flock', ['-x', '-w', '30', '3'], { stdio: ['ignore', 'ignore', 'ignore', guard.fd] })
+        child.once('error', reject)
+        child.once('exit', code => code === 0 ? resolve() : reject(new Error('transport index guard lock failed')))
+      })
+      return await this.withIndexLease(operation)
+    } finally { await guard.close() }
+  }
+
+  async withIndexLease(operation) {
     const deadline = Date.now() + LOCK_RETRY_TIMEOUT_MS
     const token = randomUUID()
     const ownerFile = `owner-${token}.json`
@@ -278,7 +340,8 @@ export class TransportDaemon {
             try {
               const owner = JSON.parse(await file.readFile('utf8'))
               if (owner.token !== token) throw new Error('transport index lock ownership lost')
-              await file.truncate(0); await file.writeFile(JSON.stringify({ ...owner, leaseAt: Date.now() }))
+              const now = new Date()
+              await file.utimes(now, now)
             } finally { await file.close() }
           } catch { lost = true }
         }, LOCK_HEARTBEAT_MS)
@@ -326,8 +389,9 @@ export class TransportDaemon {
         const stat = await fs.stat(this.lockPath)
         return Date.now() - stat.mtimeMs > LOCK_LEASE_MS
       }
-      const owner = JSON.parse(await fs.readFile(path.join(this.lockPath, files[0]), 'utf8'))
-      const leaseAt = Number.isFinite(owner.leaseAt) ? owner.leaseAt : owner.acquiredAt
+      const ownerPath = path.join(this.lockPath, files[0])
+      const owner = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
+      const leaseAt = files[0] === 'owner.json' ? (Number.isFinite(owner.leaseAt) ? owner.leaseAt : owner.acquiredAt) : (await fs.stat(ownerPath)).mtimeMs
       const age = Date.now() - leaseAt
       if (owner.owner !== os.hostname() || !Number.isInteger(owner.pid) || !Number.isFinite(leaseAt)) return age > LOCK_LEASE_MS
       try { process.kill(owner.pid, 0); return age > LOCK_LEASE_MS } catch (cause) { return cause.code === 'ESRCH' || age > LOCK_LEASE_MS }
@@ -360,29 +424,43 @@ export class TransportDaemon {
     const database = await this.open(stream)
     const entries = this.index.streams[stream] ??= []
     if (typeof database.iterator !== 'function') return
-    const observed = []
-    const known = new Set()
+    let nextIssued = 0
+    for (const [index, entry] of entries.entries()) {
+      if (!Number.isSafeInteger(entry.issued)) entry.issued = index
+      nextIssued = Math.max(nextIssued, entry.issued + 1)
+    }
+    const issuedByKey = new Map(entries.map(item => [item.key, item.issued]))
+    const candidates = new Map(entries.map(item => [item.hash, { key: item.key, hash: item.hash, order: item.order ?? `1:${item.hash}`, issued: item.issued, fromDatabase: false }]))
     for await (const entry of database.iterator()) {
       if (!entry || typeof entry !== 'object' || typeof entry.hash !== 'string' || !entry.hash || !entry.value || typeof entry.value !== 'object' || Array.isArray(entry.value)) {
         await this.quarantineEntry(entry, 'malformed-replicated-entry'); continue
       }
       const hash = entry.hash
-      if (!known.has(hash)) {
-        try {
-          const clock = entry.clock && typeof entry.clock === 'object' ? entry.clock : {}
-          const order = Number.isSafeInteger(clock.time)
-            ? `0:${String(clock.time).padStart(20, '0')}:${typeof clock.id === 'string' ? clock.id : ''}:${hash}`
-            : `1:${hash}`
-          observed.push({ key: digest(entry.value), hash, order }); known.add(hash)
-        } catch { await this.quarantineEntry(entry, 'malformed-replicated-entry') }
-      }
+      try {
+        const clock = entry.clock && typeof entry.clock === 'object' ? entry.clock : {}
+        const order = Number.isSafeInteger(clock.time)
+          ? `0:${String(clock.time).padStart(20, '0')}:${typeof clock.id === 'string' ? clock.id : ''}:${hash}`
+          : `1:${hash}`
+        const key = digest(entry.value)
+        const candidate = { key, hash, order, issued: undefined, fromDatabase: true }
+        const current = candidates.get(hash)
+        if (!current || `${candidate.order}:${candidate.key}` < `${current.order}:${current.key}`) {
+          candidates.set(hash, { ...candidate, issued: current?.issued })
+        }
+      } catch { await this.quarantineEntry(entry, 'malformed-replicated-entry') }
     }
-    observed.sort((left, right) => left.order.localeCompare(right.order))
-    const unique = []
-    const keys = new Set()
-    for (const entry of observed) {
-      if (keys.has(entry.key)) { await this.quarantineEntry(entry, 'duplicate-event-key'); continue }
-      keys.add(entry.key); unique.push(entry)
+    const sorted = [...candidates.values()].sort((left, right) => left.order.localeCompare(right.order) || left.hash.localeCompare(right.hash) || left.key.localeCompare(right.key))
+    const unique = []; const keys = new Set()
+    for (const entry of sorted) {
+      if (keys.has(entry.key)) {
+        if (entry.fromDatabase) await this.quarantineEntry(entry, 'duplicate-event-key')
+        continue
+      }
+      keys.add(entry.key)
+      // A duplicate winner represents the same exact event. Keep its original
+      // observation position so issued continuations remain valid across heals.
+      entry.issued = issuedByKey.get(entry.key) ?? entry.issued ?? nextIssued++
+      unique.push({ key: entry.key, hash: entry.hash, order: entry.order, issued: entry.issued })
     }
     this.index.streams[stream] = unique
   }
@@ -397,6 +475,7 @@ export class TransportDaemon {
         listenMultiaddrs: this.libp2p.getMultiaddrs().map(String),
         connectedPeers: this.libp2p.getConnections().map(connection => connection.remotePeer.toString()),
         bootstrapPeers: this.bootstrapPeers.map(String),
+        replication: this.replication,
       })
       if (request.operation === 'append') return reply(true, await this.append(request.stream, request.event))
       if (request.operation === 'list') return reply(true, await this.list(request.stream, request.cursor ?? 'v2:begin', request.limit ?? 100))
@@ -454,7 +533,9 @@ async function main() {
   const addresses = process.env.ARBOR_REGISTRY_DATABASE_ADDRESSES ? JSON.parse(process.env.ARBOR_REGISTRY_DATABASE_ADDRESSES) : {}
   const protocolEpoch = process.env.ARBOR_REGISTRY_PROTOCOL_EPOCH == null ? 1 : Number(process.env.ARBOR_REGISTRY_PROTOCOL_EPOCH)
   const daemon = new TransportDaemon({ stateDir, streams, databaseAddresses: addresses, listen: (process.env.ARBOR_REGISTRY_LISTEN ?? '').split(',').filter(Boolean), bootstrapPeers: (process.env.ARBOR_REGISTRY_BOOTSTRAP_PEERS ?? '').split(',').filter(Boolean), realmId: process.env.ARBOR_REGISTRY_REALM_ID || null, protocolEpoch })
-  const token = process.env.ARBOR_REGISTRY_SOCKET_TOKEN
+  const token = process.env.ARBOR_REGISTRY_SOCKET_TOKEN_FILE
+    ? (await fs.readFile(process.env.ARBOR_REGISTRY_SOCKET_TOKEN_FILE, 'utf8')).trim()
+    : process.env.ARBOR_REGISTRY_SOCKET_TOKEN
   if (!token) throw new Error('ARBOR_REGISTRY_SOCKET_TOKEN is required')
   await daemon.start()
   const server = await startSocketServer(daemon, socketPath, { token })

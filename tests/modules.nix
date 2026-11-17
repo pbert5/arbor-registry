@@ -40,7 +40,13 @@ let
       }
       module
       {
-        cluster.registry.policy.metadata.secret = "public metadata must not contain secrets";
+        cluster.registry.policy.metadata = {
+          secret = "public metadata must not contain secrets";
+          private_key = "private";
+          signing_key = "private";
+          api_key = "private";
+          access_key = "private";
+        };
         cluster.vault = {
           requirements = [ "database-read" ];
           bindings.db = {
