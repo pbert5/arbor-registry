@@ -19,9 +19,12 @@ pkgs.testers.nixosTest {
     environment.systemPackages = [
       pkgs.curl
       pkgs.jq
+      pkgs.python3
     ];
   };
   testScript = ''
+    import shlex
+
     machine.start()
     machine.wait_for_unit("arbor-registry.service")
     machine.wait_for_unit("pgadmin.service")
@@ -36,6 +39,8 @@ pkgs.testers.nixosTest {
     machine.succeed("systemctl restart postgresql.service")
     machine.wait_for_unit("arbor-registry.service")
     machine.wait_until_succeeds("runuser -u arbor-registry -- psql -h /run/postgresql -p 5544 -U arbor-registry -d arbor_registry -c 'SELECT 1'")
+    status_request = "import json, socket; s = socket.socket(socket.AF_UNIX); s.connect('/run/arbor-registry/registry.sock'); token = open('/run/arbor-registry/socket-token').read().strip(); s.sendall((json.dumps({'token': token, 'operation': 'status'}) + chr(10)).encode()); assert json.loads(s.recv(65536))['ok'] is True"
+    machine.wait_until_succeeds("python3 -c " + shlex.quote(status_request))
     machine.succeed("test $(stat -c %a /run/pgadmin-test-password) = 600")
   '';
 }
