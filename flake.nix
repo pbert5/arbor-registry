@@ -19,6 +19,7 @@
       nixosModule = import ./modules/nixos.nix;
       vaultRuntimeModule = import ./modules/vault-runtime.nix;
       serviceContractModule = import ./modules/service-contract.nix;
+      postgresqlModule = ./modules/postgresql.nix;
     in
     {
       lib = registry;
@@ -38,6 +39,7 @@
       nixosModules = {
         default = nixosModule;
         service-contract = serviceContractModule;
+        postgresql = postgresqlModule;
         vault-runtime = vaultRuntimeModule;
         vault-runtime-upstream = {
           imports = [
@@ -128,6 +130,13 @@
         };
         registry-runtime-vm = import ./tests/registry-runtime-vm.nix {
           module = serviceContractModule;
+          pkgs = import nixpkgs { inherit system; };
+        };
+        postgresql-pgadmin-vm = import ./tests/postgresql-pgadmin-vm.nix {
+          modules = [
+            serviceContractModule
+            postgresqlModule
+          ];
           pkgs = import nixpkgs { inherit system; };
         };
         graph-vm = import ./tests/graph-vm.nix {

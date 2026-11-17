@@ -45,6 +45,7 @@ let
   '';
 in
 {
+  imports = [ ./postgresql.nix ];
   options.cluster.registry.runtime = {
     enable = lib.mkEnableOption "the Arbor participant runtime";
     registryService = lib.mkOption {
@@ -137,100 +138,103 @@ in
       default = pkgs.callPackage ../transport/package.nix { };
     };
   };
-  config = lib.mkIf cfg.enable {
-    users.groups.arbor-registry = { };
-    users.users.arbor-registry = {
-      isSystemUser = true;
-      group = "arbor-registry";
-    };
-    systemd.targets.arbor-participant = {
-      description = "Arbor participant runtime services";
-      wantedBy = [ "multi-user.target" ];
-      wants = [
-        "arbor-registry.service"
-        "arbor-registry-transport.service"
-      ];
-    };
-    systemd.services.arbor-registry-transport = {
-      wantedBy = [ "arbor-participant.target" ];
-      serviceConfig = {
-        Type = "simple";
-        User = "arbor-registry";
-        Group = "arbor-registry";
-        StateDirectory = cfg.transportStateDirectory;
-        StateDirectoryMode = "0700";
-        RuntimeDirectory = [
-          "arbor-registry-transport"
-          "arbor-registry"
-        ];
-        # Both daemons cache this shared token; keep it across individual stops.
-        # /run remains ephemeral across boots.
-        RuntimeDirectoryPreserve = true;
-        Restart = "on-failure";
-        RestartSec = 2;
-        ExecStartPre = tokenInit;
-        ExecStart = "${cfg.transportPackage}/bin/arbor-registry-transport";
-        Environment = [
-          "ARBOR_REGISTRY_STATE_DIR=/var/lib/${cfg.transportStateDirectory}"
-          "ARBOR_REGISTRY_SOCKET=${cfg.transportSocket}"
-          "ARBOR_REGISTRY_SOCKET_TOKEN_FILE=${cfg.tokenFile}"
-          "ARBOR_REGISTRY_REALM_ID=${lib.optionalString (cfg.transportRealmId != null) cfg.transportRealmId}"
-          "ARBOR_REGISTRY_PROTOCOL_EPOCH=${toString cfg.transportProtocolEpoch}"
-          "ARBOR_REGISTRY_LISTEN=${lib.concatStringsSep "," cfg.transportListen}"
-          "ARBOR_REGISTRY_BOOTSTRAP_PEERS=${lib.concatStringsSep "," cfg.transportBootstrapPeers}"
-          "ARBOR_REGISTRY_DATABASE_ADDRESSES=${builtins.toJSON cfg.transportDatabaseAddresses}"
+  config = lib.mkMerge [
+    { cluster.registry.postgresql.enable = lib.mkDefault cfg.enable; }
+    (lib.mkIf cfg.enable {
+      users.groups.arbor-registry = { };
+      users.users.arbor-registry = {
+        isSystemUser = true;
+        group = "arbor-registry";
+      };
+      systemd.targets.arbor-participant = {
+        description = "Arbor participant runtime services";
+        wantedBy = [ "multi-user.target" ];
+        wants = [
+          "arbor-registry.service"
+          "arbor-registry-transport.service"
         ];
       };
-    };
-    systemd.services.arbor-registry = {
-      wantedBy = [ "arbor-participant.target" ];
-      after = [ "arbor-registry-transport.service" ];
-      requires = [ "arbor-registry-transport.service" ];
-      serviceConfig = {
-        Type = "simple";
-        User = "arbor-registry";
-        Group = "arbor-registry";
-        StateDirectory = cfg.stateDirectory;
-        StateDirectoryMode = "0700";
-        RuntimeDirectory = "arbor-registry";
-        RuntimeDirectoryPreserve = true;
-        Restart = "on-failure";
-        RestartSec = 2;
-        ExecStartPre = tokenInit;
-        ExecStart = "${cfg.runtimePackage}/bin/arbor-registryd --config=/etc/arbor-registry/config.json";
-        Environment = [ "ARBOR_REGISTRY_CONFIG=/etc/arbor-registry/config.json" ];
+      systemd.services.arbor-registry-transport = {
+        wantedBy = [ "arbor-participant.target" ];
+        serviceConfig = {
+          Type = "simple";
+          User = "arbor-registry";
+          Group = "arbor-registry";
+          StateDirectory = cfg.transportStateDirectory;
+          StateDirectoryMode = "0700";
+          RuntimeDirectory = [
+            "arbor-registry-transport"
+            "arbor-registry"
+          ];
+          # Both daemons cache this shared token; keep it across individual stops.
+          # /run remains ephemeral across boots.
+          RuntimeDirectoryPreserve = true;
+          Restart = "on-failure";
+          RestartSec = 2;
+          ExecStartPre = tokenInit;
+          ExecStart = "${cfg.transportPackage}/bin/arbor-registry-transport";
+          Environment = [
+            "ARBOR_REGISTRY_STATE_DIR=/var/lib/${cfg.transportStateDirectory}"
+            "ARBOR_REGISTRY_SOCKET=${cfg.transportSocket}"
+            "ARBOR_REGISTRY_SOCKET_TOKEN_FILE=${cfg.tokenFile}"
+            "ARBOR_REGISTRY_REALM_ID=${lib.optionalString (cfg.transportRealmId != null) cfg.transportRealmId}"
+            "ARBOR_REGISTRY_PROTOCOL_EPOCH=${toString cfg.transportProtocolEpoch}"
+            "ARBOR_REGISTRY_LISTEN=${lib.concatStringsSep "," cfg.transportListen}"
+            "ARBOR_REGISTRY_BOOTSTRAP_PEERS=${lib.concatStringsSep "," cfg.transportBootstrapPeers}"
+            "ARBOR_REGISTRY_DATABASE_ADDRESSES=${builtins.toJSON cfg.transportDatabaseAddresses}"
+          ];
+        };
       };
-    };
-    environment.etc."arbor-registry/config.json".text = builtins.toJSON {
-      stateDir = "/var/lib/${cfg.stateDirectory}";
-      socket = cfg.socket;
-      transportSocket = cfg.transportSocket;
-      tokenFile = cfg.tokenFile;
-      bootstrapAuthoritiesFile = cfg.bootstrapAuthoritiesFile;
-      authorityIssuers = cfg.authorityIssuers;
-      syncInterval = cfg.syncInterval;
-      syncMaxBackoff = cfg.syncMaxBackoff;
-      syncMaxPages = cfg.syncMaxPages;
-      syncPageSize = cfg.syncPageSize;
-    };
-    systemd.services.arbor-runtime-status = {
-      wantedBy = [ "arbor-participant.target" ];
-      after = [
-        "arbor-registry.service"
-        "arbor-registry-transport.service"
-      ];
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStart = statusScript;
+      systemd.services.arbor-registry = {
+        wantedBy = [ "arbor-participant.target" ];
+        after = [ "arbor-registry-transport.service" ];
+        requires = [ "arbor-registry-transport.service" ];
+        serviceConfig = {
+          Type = "simple";
+          User = "arbor-registry";
+          Group = "arbor-registry";
+          StateDirectory = cfg.stateDirectory;
+          StateDirectoryMode = "0700";
+          RuntimeDirectory = "arbor-registry";
+          RuntimeDirectoryPreserve = true;
+          Restart = "on-failure";
+          RestartSec = 2;
+          ExecStartPre = tokenInit;
+          ExecStart = "${cfg.runtimePackage}/bin/arbor-registryd --config=/etc/arbor-registry/config.json";
+          Environment = [ "ARBOR_REGISTRY_CONFIG=/etc/arbor-registry/config.json" ];
+        };
       };
-    };
-    systemd.timers.arbor-runtime-status = {
-      wantedBy = [ "timers.target" ];
-      timerConfig = {
-        OnBootSec = "10s";
-        OnUnitActiveSec = "30s";
-        Unit = "arbor-runtime-status.service";
+      environment.etc."arbor-registry/config.json".text = builtins.toJSON {
+        stateDir = "/var/lib/${cfg.stateDirectory}";
+        socket = cfg.socket;
+        transportSocket = cfg.transportSocket;
+        tokenFile = cfg.tokenFile;
+        bootstrapAuthoritiesFile = cfg.bootstrapAuthoritiesFile;
+        authorityIssuers = cfg.authorityIssuers;
+        syncInterval = cfg.syncInterval;
+        syncMaxBackoff = cfg.syncMaxBackoff;
+        syncMaxPages = cfg.syncMaxPages;
+        syncPageSize = cfg.syncPageSize;
       };
-    };
-  };
+      systemd.services.arbor-runtime-status = {
+        wantedBy = [ "arbor-participant.target" ];
+        after = [
+          "arbor-registry.service"
+          "arbor-registry-transport.service"
+        ];
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = statusScript;
+        };
+      };
+      systemd.timers.arbor-runtime-status = {
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnBootSec = "10s";
+          OnUnitActiveSec = "30s";
+          Unit = "arbor-runtime-status.service";
+        };
+      };
+    })
+  ];
 }
