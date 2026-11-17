@@ -5,6 +5,8 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+
+from postgres_fixture import PostgresFixture
 from unittest.mock import patch
 
 from arbor_registry_runtime.daemon import RegistryServer
@@ -12,8 +14,9 @@ from arbor_registry_runtime.manager_adapter import run
 from arbor_registry_runtime.runtime import FileProvider, generate_keypair
 
 
-class ManagerAdapterTests(unittest.TestCase):
+class ManagerAdapterTests(PostgresFixture, unittest.TestCase):
     def setUp(self):
+        super().setUp()
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.config = {
@@ -25,7 +28,8 @@ class ManagerAdapterTests(unittest.TestCase):
             "bootstrapAuthoritiesFile": str(self.root / "bootstrap.json"),
         }
         Path(self.config["tokenFile"]).write_text("t" * 32)
-        self.server = RegistryServer(self.config)
+        with self.database_environment(self.root / "state"):
+            self.server = RegistryServer(self.config)
         self.server.runtime.provider = FileProvider(self.root / "raw" / "history.jsonl")
         (self.root / "raw" / "history.jsonl").touch(mode=0o600)
 
@@ -90,7 +94,8 @@ class ManagerAdapterTests(unittest.TestCase):
         data = {"nodeId": "node-a", "domain": "domain-a"}
         original = self.request("identity/init-self", data)
         self.server.runtime.close()
-        self.server = RegistryServer(self.config)
+        with self.database_environment(self.root / "state"):
+            self.server = RegistryServer(self.config)
         self.server.runtime.provider = FileProvider(self.root / "raw" / "history.jsonl")
         self.assertEqual(self.request("identity/init-self", data), original)
         inspect = self.request("identity/inspect", {})
@@ -141,7 +146,8 @@ class ManagerAdapterTests(unittest.TestCase):
         private = Path(self.config["keyDir"]) / "node-a.private"
         before = private.read_bytes()
         self.server.runtime.close()
-        self.server = RegistryServer(self.config)
+        with self.database_environment(self.root / "state"):
+            self.server = RegistryServer(self.config)
         self.server.runtime.provider = provider
         inspect = self.request("identity/inspect", {})
         self.assertEqual(inspect["status"], "accepted")
@@ -167,7 +173,8 @@ class ManagerAdapterTests(unittest.TestCase):
         private = Path(self.config["keyDir"]) / "node-a.private"
         before = private.read_bytes()
         self.server.runtime.close()
-        self.server = RegistryServer(self.config)
+        with self.database_environment(self.root / "state"):
+            self.server = RegistryServer(self.config)
         self.server.runtime.provider = FileProvider(self.root / "raw" / "history.jsonl")
 
         inspect = self.request("identity/inspect", {})

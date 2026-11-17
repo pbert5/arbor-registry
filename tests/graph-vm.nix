@@ -24,6 +24,7 @@ let
       virtualisation.memorySize = 1536;
       environment.systemPackages = [
         pkgs.jq
+        pkgs.postgresql
         python
         runtime
         transport

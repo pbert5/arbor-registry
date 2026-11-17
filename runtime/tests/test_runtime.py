@@ -11,6 +11,8 @@ from pathlib import Path
 
 from nacl.signing import SigningKey
 
+from postgres_fixture import PostgresFixture
+
 from arbor_registry_runtime import (FileProvider, OrbitDBProvider, Provider, Runtime, RuntimeKey,
                                     activate_keypair, canonical_json, generate_keypair, stage_keypair)
 from arbor_registry_runtime.runtime import (
@@ -28,13 +30,18 @@ from arbor_registry_runtime.runtime import _key
 from arbor_registry_runtime.openbao_provider import _json_value
 
 
-class RuntimeTests(unittest.TestCase):
+class RuntimeTests(PostgresFixture, unittest.TestCase):
     def setUp(self):
+        super().setUp()
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         key = RuntimeKey("root", SigningKey.generate())
-        self.runtime = Runtime(root / "state", FileProvider(root / "raw" / "history.jsonl"), {"root": key.public_key})
+        self.runtime = self.make_runtime(root / "state", FileProvider(root / "raw" / "history.jsonl"), {"root": key.public_key})
         self.key = key
+
+    def make_runtime(self, state, *args, runtime_class=Runtime, **kwargs):
+        with self.database_environment(state):
+            return runtime_class(state, *args, **kwargs)
 
     def tearDown(self):
         self.runtime.close()
@@ -150,12 +157,12 @@ class RuntimeTests(unittest.TestCase):
         state = Path(self.temp.name) / "consumer-state"
         first, second = self.envelope("consumer-one"), self.envelope("consumer-two")
         provider.append(first); provider.append(second)
-        runtime = Runtime(state, provider, {"root": self.key.public_key})
+        runtime = self.make_runtime(state, provider, {"root": self.key.public_key})
         try:
             self.assertEqual(runtime.sync(max_pages=1, page_size=1)["records"], 1)
             self.assertEqual(runtime.status()["providerCursor"], 1)
             runtime.close()
-            runtime = Runtime(state, provider, {"root": self.key.public_key})
+            runtime = self.make_runtime(state, provider, {"root": self.key.public_key})
             self.assertEqual(runtime.sync(page_size=1)["records"], 1)
             self.assertEqual(runtime.status()["providerCursor"], 2)
             self.assertEqual(len(runtime.accepted()), 2)
@@ -167,7 +174,7 @@ class RuntimeTests(unittest.TestCase):
         state = Path(self.temp.name) / "malformed-state"
         provider.append({"not": "an envelope"})
         provider.append(self.envelope("valid-after-malformed"))
-        runtime = Runtime(state, provider, {"root": self.key.public_key})
+        runtime = self.make_runtime(state, provider, {"root": self.key.public_key})
         try:
             result = runtime.sync(page_size=2)
             self.assertEqual(result["records"], 2)
@@ -195,7 +202,7 @@ class RuntimeTests(unittest.TestCase):
                 return [(0, self.record)]
 
         provider = OutageProvider(self.envelope("outage-record"))
-        runtime = Runtime(Path(self.temp.name) / "outage-state", provider, {"root": self.key.public_key})
+        runtime = self.make_runtime(Path(self.temp.name) / "outage-state", provider, {"root": self.key.public_key})
         try:
             self.assertEqual(runtime.sync()["state"], "idle")
             self.assertEqual(len(runtime.accepted()), 1)
@@ -212,7 +219,7 @@ class RuntimeTests(unittest.TestCase):
 
         provider = FileProvider(Path(self.temp.name) / "crash-raw" / "history.jsonl")
         provider.append(self.envelope("not-committed"))
-        runtime = FailingRuntime(Path(self.temp.name) / "crash-state", provider, {"root": self.key.public_key})
+        runtime = self.make_runtime(Path(self.temp.name) / "crash-state", provider, {"root": self.key.public_key}, runtime_class=FailingRuntime)
         try:
             self.assertEqual(runtime.sync()["state"], "degraded")
             self.assertEqual(runtime.status()["providerCursor"], 0)
@@ -224,7 +231,7 @@ class RuntimeTests(unittest.TestCase):
         provider = FileProvider(Path(self.temp.name) / "backlog-raw" / "history.jsonl")
         provider.append(self.envelope("backlog-one"))
         provider.append(self.envelope("backlog-two"))
-        runtime = Runtime(Path(self.temp.name) / "backlog-state", provider, {"root": self.key.public_key})
+        runtime = self.make_runtime(Path(self.temp.name) / "backlog-state", provider, {"root": self.key.public_key})
         try:
             result = runtime.sync(max_pages=1, page_size=1)
             self.assertTrue(result["backlog"])
@@ -402,7 +409,7 @@ class RuntimeTests(unittest.TestCase):
     def test_legacy_node_identity_cannot_replay_static_key_after_generation_change(self):
         operator = RuntimeKey("operator", SigningKey.generate())
         replacement = RuntimeKey("operator-new", SigningKey.generate())
-        runtime = Runtime(
+        runtime = self.make_runtime(
             Path(self.temp.name) / "legacy-replay-state",
             FileProvider(Path(self.temp.name) / "legacy-replay-raw" / "history.jsonl"),
             {"root": self.key.public_key, "operator": operator.public_key},
@@ -561,7 +568,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.ingest([service])[0]["reason"], "unauthorized-authority")
 
         node = RuntimeKey("local", SigningKey.generate())
-        local = Runtime(Path(self.temp.name) / "local-projection", FileProvider(Path(self.temp.name) / "local-projection-raw" / "history.jsonl"), {}, node_key=node)
+        local = self.make_runtime(Path(self.temp.name) / "local-projection", FileProvider(Path(self.temp.name) / "local-projection-raw" / "history.jsonl"), {}, node_key=node)
         try:
             local.local_genesis("local", "example.internal")
             record = {
@@ -724,7 +731,7 @@ class RuntimeTests(unittest.TestCase):
         node = RuntimeKey("node", SigningKey.generate())
         state = Path(self.temp.name) / "genesis-state"
         raw = FileProvider(Path(self.temp.name) / "genesis-raw" / "history.jsonl")
-        runtime = Runtime(state, raw, {"root": self.key.public_key}, node_key=node)
+        runtime = self.make_runtime(state, raw, {"root": self.key.public_key}, node_key=node)
         try:
             outcome = runtime.local_genesis("node", "example.internal", platform="linux")
             self.assertEqual(outcome["status"], "accepted")
@@ -737,7 +744,7 @@ class RuntimeTests(unittest.TestCase):
                 runtime.local_genesis("other", "example.internal", platform="linux")
         finally:
             runtime.close()
-        restarted = Runtime(state, raw, {"root": self.key.public_key}, node_key=node)
+        restarted = self.make_runtime(state, raw, {"root": self.key.public_key}, node_key=node)
         try:
             self.assertEqual(restarted.projection()["node"]["generation"], 1)
             self.assertEqual(restarted.local_genesis("node", "example.internal", platform="linux")["status"], "accepted")
@@ -746,7 +753,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_local_authority_cannot_escape_its_identity_and_domain(self):
         node = RuntimeKey("node", SigningKey.generate())
-        runtime = Runtime(Path(self.temp.name) / "scoped-state", FileProvider(Path(self.temp.name) / "scoped-raw" / "history.jsonl"), {}, node_key=node)
+        runtime = self.make_runtime(Path(self.temp.name) / "scoped-state", FileProvider(Path(self.temp.name) / "scoped-raw" / "history.jsonl"), {}, node_key=node)
         try:
             runtime.local_genesis("node", "example.internal")
             escaped = make_local_genesis(node, "node", "example.internal")
@@ -759,7 +766,7 @@ class RuntimeTests(unittest.TestCase):
     def test_local_genesis_rejects_signed_variants_and_unrelated_self_roots(self):
         node = RuntimeKey("node", SigningKey.generate())
         foreign = RuntimeKey("foreign", SigningKey.generate())
-        runtime = Runtime(Path(self.temp.name) / "genesis-variants", FileProvider(Path(self.temp.name) / "genesis-variants-raw" / "history.jsonl"), {}, node_key=node)
+        runtime = self.make_runtime(Path(self.temp.name) / "genesis-variants", FileProvider(Path(self.temp.name) / "genesis-variants-raw" / "history.jsonl"), {}, node_key=node)
         try:
             runtime.local_genesis("node", "example.internal")
             variant = make_local_genesis(node, "node", "example.internal", platform="other")
@@ -863,7 +870,7 @@ class RuntimeTests(unittest.TestCase):
                          "unauthorized-capability")
 
         root_b = RuntimeKey("root-b", SigningKey.generate())
-        runtime = Runtime(
+        runtime = self.make_runtime(
             Path(self.temp.name) / "composed-state",
             FileProvider(Path(self.temp.name) / "composed-raw" / "history.jsonl"),
             {"root": self.key.public_key, "root-b": root_b.public_key},
@@ -987,7 +994,7 @@ class RuntimeTests(unittest.TestCase):
     def test_recovery_generation_replays_out_of_order_and_rejects_stale_approver(self):
         operator = RuntimeKey("operator", SigningKey.generate())
         replacement = RuntimeKey("node-replacement", SigningKey.generate())
-        runtime = Runtime(
+        runtime = self.make_runtime(
             Path(self.temp.name) / "recovery-state",
             FileProvider(Path(self.temp.name) / "recovery-raw" / "history.jsonl"),
             {"root": self.key.public_key, "operator": operator.public_key},
