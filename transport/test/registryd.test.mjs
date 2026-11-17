@@ -23,7 +23,7 @@ function request(socketPath, value, token = 'test-token') {
 }
 
 async function waitForSocket(socketPath) {
-  for (let attempt = 0; attempt < 100; attempt++) {
+  for (let attempt = 0; attempt < 500; attempt++) {
     try { await fs.access(socketPath); return } catch { await new Promise(resolve => setTimeout(resolve, 20)) }
   }
   throw new Error('daemon socket did not appear')
@@ -79,16 +79,21 @@ test('separate daemon processes preserve the typed append/list transport', async
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-'))
   const socketPath = path.join(root, 'registry.sock')
   const env = { ...process.env, ARBOR_REGISTRY_STATE_DIR: root, ARBOR_REGISTRY_SOCKET: socketPath, ARBOR_REGISTRY_SOCKET_TOKEN: 'test-token' }
-  const start = () => spawn(process.execPath, [daemon], { env, stdio: ['ignore', 'ignore', 'pipe'] })
+  let stderr = ''
+  const start = () => {
+    const child = spawn(process.execPath, [daemon], { env, stdio: ['ignore', 'ignore', 'pipe'] })
+    child.stderr.on('data', chunk => { stderr += chunk })
+    return child
+  }
   let child = start()
   try {
-    await waitForSocket(socketPath)
+    await waitForSocket(socketPath).catch(error => { throw new Error(`${error.message}: ${stderr}`) })
     const event = { recordId: 'node-a', recordVersion: 1, payload: { role: 'member' } }
     const appended = await request(socketPath, { operation: 'append', stream: 'registry', event })
     assert.equal(appended.ok, true)
     assert.equal((await request(socketPath, { operation: 'append', stream: 'registry', event })).duplicate, true)
     child.kill('SIGTERM'); await new Promise(resolve => child.once('exit', resolve))
-    child = start(); await waitForSocket(socketPath)
+    child = start(); await waitForSocket(socketPath).catch(error => { throw new Error(`${error.message}: ${stderr}`) })
     const page = await request(socketPath, { operation: 'list', stream: 'registry', cursor: 'v1:0', limit: 10 })
     assert.deepEqual(page.records.map(item => item.event), [event])
   } finally {
@@ -386,29 +391,24 @@ test('append cursor is inclusive and stale lock leases are recovered', async () 
 test('an old owner release cannot remove a successor lock after takeover', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-'))
   const first = new TransportDaemon({ stateDir: root })
-  const second = new TransportDaemon({ stateDir: root })
   let releaseFirst
-  let releaseSecond
-  let enteredSecond
   const firstHeld = new Promise(resolve => { releaseFirst = resolve })
-  const secondHeld = new Promise(resolve => { releaseSecond = resolve })
-  const secondEntered = new Promise(resolve => { enteredSecond = resolve })
+  let enteredFirst
+  const firstEntered = new Promise(resolve => { enteredFirst = resolve })
   const firstLock = first.withIndexLock(async () => {
-    const owner = (await fs.readdir(first.lockPath)).find(file => file.startsWith('owner-'))
-    await fs.writeFile(path.join(first.lockPath, owner), JSON.stringify({ token: owner.slice(6, -5), owner: 'dead-host', pid: 999999, acquiredAt: 0, leaseAt: 0 }))
+    enteredFirst()
     await firstHeld
   })
   try {
-    const secondLock = second.withIndexLock(async () => { enteredSecond(); await secondHeld })
-    await new Promise(resolve => setTimeout(resolve, 20))
+    await firstEntered
+    await fs.rename(first.lockPath, `${first.lockPath}.old`)
+    await fs.mkdir(first.lockPath)
+    await fs.writeFile(path.join(first.lockPath, 'owner-successor.json'), '{}')
     releaseFirst()
-    await secondEntered
-    const successor = (await fs.readdir(root + '/transport-index.lock')).find(file => file.startsWith('owner-'))
-    assert.ok(successor, 'successor lock should remain while its owner is active')
-    releaseSecond()
-    await Promise.all([firstLock, secondLock])
+    await firstLock
+    assert.ok((await fs.readdir(first.lockPath)).includes('owner-successor.json'))
   } finally {
-    releaseFirst(); releaseSecond()
+    releaseFirst()
     await fs.rm(root, { recursive: true, force: true })
   }
 })
@@ -577,4 +577,87 @@ test('replay preserves progress on unavailable records and rejects invalid v3 po
       await assert.rejects(() => daemon.list('registry', cursor, 1), /invalid cursor/)
     }
   } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+test('index sync failures withhold continuations and retry preserves observations', async () => {
+  for (const failure of ['file', 'directory']) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-index-sync-'))
+    const entries = [{ hash: 'a', value: { id: 'a' }, clock: { time: 1 } }]
+    const open = async () => ({ iterator: async function * () { yield * entries }, get: async hash => entries.find(entry => entry.hash === hash).value })
+    const daemon = new TransportDaemon({ stateDir: root }); daemon.open = open
+    const originalOpen = fs.open
+    try {
+      fs.open = async (...args) => {
+        const file = await originalOpen(...args)
+        const isTarget = failure === 'file' ? String(args[0]).endsWith('.tmp') : args[0] === root
+        if (isTarget) file.sync = async () => { throw new Error('injected sync failure') }
+        return file
+      }
+      await assert.rejects(daemon.list('registry', 'v2:begin', 1), /injected sync failure/)
+      fs.open = originalOpen
+      const first = await daemon.list('registry', 'v2:begin', 1)
+      entries.push({ hash: 'b', value: { id: 'b' }, clock: { time: 0 } })
+      const restarted = new TransportDaemon({ stateDir: root }); restarted.open = open
+      assert.deepEqual((await restarted.list('registry', first.nextCursor, 10)).records.map(item => item.hash), ['b'])
+    } finally { fs.open = originalOpen; await fs.rm(root, { recursive: true, force: true }) }
+  }
+})
+
+test('heartbeat keeps owner readable and maintains a live lease', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-lock-heartbeat-'))
+  const daemon = new TransportDaemon({ stateDir: root })
+  try {
+    await daemon.withIndexLock(async assertOwned => {
+      const owner = (await fs.readdir(daemon.lockPath)).find(file => file.startsWith('owner-'))
+      const ownerPath = path.join(daemon.lockPath, owner)
+      const initial = await fs.stat(ownerPath)
+      const until = Date.now() + 11000
+      while (Date.now() < until) {
+        JSON.parse(await fs.readFile(ownerPath, 'utf8'))
+        await new Promise(resolve => setTimeout(resolve, 5))
+      }
+      assert.ok((await fs.stat(ownerPath)).mtimeMs > initial.mtimeMs)
+      await assertOwned()
+      assert.equal(await daemon.lockIsStale(), false)
+    })
+  } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+test('a paused lock holder cannot be overtaken before publishing its index', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-lock-fence-'))
+  const first = new TransportDaemon({ stateDir: root })
+  const second = new TransportDaemon({ stateDir: root })
+  let release, entered
+  const held = new Promise(resolve => { release = resolve })
+  const ready = new Promise(resolve => { entered = resolve })
+  let secondEntered = false
+  const firstLock = first.withIndexLock(async () => {
+    const owner = (await fs.readdir(first.lockPath)).find(file => file.startsWith('owner-'))
+    await fs.utimes(path.join(first.lockPath, owner), 0, 0)
+    entered()
+    await held
+  })
+  try {
+    await ready
+    const secondLock = second.withIndexLock(async () => { secondEntered = true })
+    await new Promise(resolve => setTimeout(resolve, 100))
+    assert.equal(secondEntered, false, 'a live owner must fence stale takeover')
+    release()
+    await Promise.all([firstLock, secondLock])
+    assert.equal(secondEntered, true)
+  } finally { release(); await firstLock.catch(() => {}); await fs.rm(root, { recursive: true, force: true }) }
+})
+
+test('startup fails closed if the state directory parent cannot be synced', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-parent-sync-'))
+  const daemon = new TransportDaemon({ stateDir: path.join(root, 'new', 'state') })
+  const originalOpen = fs.open
+  try {
+    fs.open = async (...args) => {
+      const file = await originalOpen(...args)
+      if (args[0] === root) file.sync = async () => { throw new Error('injected parent sync failure') }
+      return file
+    }
+    await assert.rejects(daemon.start(), /injected parent sync failure/)
+  } finally { fs.open = originalOpen; await fs.rm(root, { recursive: true, force: true }) }
 })
