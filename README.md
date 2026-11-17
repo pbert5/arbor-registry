@@ -104,7 +104,7 @@ or explicitly request `rotation=True` for an active-key rotation.
 
 The runtime package also installs `arbor-registry-manager-adapter`. It accepts
 one version-1 `arbor-manager/runtime-adapter` JSON request on stdin and forwards
-`identity/inspect`, `identity/init-self`, or `registry/summary` to the running
+identity, Registry summary, and enrollment operations to the running
 Registry's authenticated Unix socket. Use it with Manager's
 `--runtime-executable` option. It reads `/etc/arbor-registry/config.json` by
 default; `--config` selects an isolated test configuration. Manager clears its
@@ -121,8 +121,39 @@ replacement. Inspection returns public fingerprints and bounded counts only.
 The adapter exits nonzero without emitting runtime errors or credentials on
 failure. It requires the existing socket-token access and does not grant it.
 
-This interface prepares local bootstrap; it does not enroll peers, grant
-relationship authority, activate a host, or establish private networking.
+### Enroll a new node using Manager
+
+Enrollment registers a generation-one identity with an existing external
+authority. Both daemons must independently have the same authority ID and
+public key configured through `authorityIssuers` and
+`bootstrapAuthoritiesFile`. Only the approving daemon needs the matching
+private/public key pair in its protected `keyDir`. Standalone self-genesis
+authorizes only that node's own identity and domain.
+
+1. On the joining node, before initializing a local root, call
+   `enrollment/status` with `authorityId`. Confirm `authorityTrusted` and a
+   new or pending enrollment. On the authority, check `canApprove`.
+2. Call `enrollment/request` on the joining node with `nodeId`, `platform`,
+   and `authorityId`. Transfer the returned public signed `request` to the
+   authority operator. Compare the full 64-character `requestDigest` and
+   node, platform, and authority with the joining operator over a separately
+   authenticated channel. Local signing keys stay with their daemons.
+3. Within 15 minutes, call `enrollment/approve` on the authority with
+   `authorityId`, the unaltered `request`, and the independently confirmed
+   `requestDigest`. Transfer the returned public signed `approval` to the
+   joining operator.
+4. Call `enrollment/finish` there with `nodeId` and `approval`. Check
+   `identity/inspect` or `registry/summary` for the initialized local
+   identity, its public fingerprint, and `localGenesis: false`.
+   `enrollment/status` reports `enrolled` after local completion.
+
+Repeating the same request before expiry reuses its key and signed request.
+After expiry the joining node can issue a new request with the same local
+key. A previously accepted approval can still be re-exported using its
+original request and finished after renewal. A different request cannot take
+over an existing identity. Receipt, review, and approval files carry public
+data. Node activation, peer or parent relationship records, and networking
+have separate lifecycles.
 
 For a deliberately bootstrapped standalone node, construct `Runtime` with its
 runtime-held `node_key` and call `local_genesis(identity, domain)` exactly once.

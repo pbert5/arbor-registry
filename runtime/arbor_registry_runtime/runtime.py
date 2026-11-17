@@ -264,6 +264,8 @@ def make_enrollment_request(
     platform: str,
     requested_parent: str | None = None,
     nonce: str | None = None,
+    issued_at: int | None = None,
+    expires_at: int | None = None,
 ) -> dict[str, Any]:
     """Create a self-signed enrollment request using runtime-held identity.
 
@@ -292,6 +294,10 @@ def make_enrollment_request(
         "nonce": nonce,
         "subject": identity_key.issuer,
     }
+    if issued_at is not None or expires_at is not None:
+        if type(issued_at) is not int or type(expires_at) is not int or issued_at >= expires_at:
+            raise ValueError("invalid enrollment validity window")
+        unsigned.update(issuedAt=issued_at, expiresAt=expires_at)
     return {**unsigned, "signature": identity_key.sign(unsigned)}
 
 
@@ -1018,6 +1024,13 @@ class Runtime:
           );
           CREATE TABLE IF NOT EXISTS projection (
             record_id TEXT PRIMARY KEY, schema TEXT NOT NULL, payload TEXT NOT NULL, generation INTEGER NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS manager_enrollment (
+            slot INTEGER PRIMARY KEY CHECK (slot = 1), node TEXT NOT NULL, authority TEXT NOT NULL,
+            platform TEXT NOT NULL, completed TEXT
+          );
+          CREATE TABLE IF NOT EXISTS manager_enrollment_requests (
+            digest TEXT PRIMARY KEY, request TEXT NOT NULL
           );
           CREATE TABLE IF NOT EXISTS local_genesis (
             identity TEXT PRIMARY KEY, domain TEXT NOT NULL, public_key TEXT NOT NULL,
