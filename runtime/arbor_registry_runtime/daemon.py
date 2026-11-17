@@ -9,11 +9,13 @@ import os
 import re
 import signal
 import socket
+import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
+from . import enrollment
 from .runtime import OrbitDBProvider, Runtime, generate_keypair, load_keypair
 
 
@@ -136,10 +138,10 @@ class RegistryServer:
         if not isinstance(request, dict) or request.get("token") != self.token:
             return {"ok": False, "code": "authentication_failed"}
         operation = request.get("operation")
-        if operation in {"identity/inspect", "identity/init-self", "registry/summary"}:
+        if isinstance(operation, str) and operation in ({"identity/inspect", "identity/init-self", "registry/summary"} | enrollment.FIELDS.keys()):
             try:
                 return self._runtime_call(self._manager_request, request)
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, sqlite3.Error):
                 return {"format": "arbor-manager/runtime-response", "version": 1, "status": "unavailable"}
             except (ValueError, TypeError):
                 return {"format": "arbor-manager/runtime-response", "version": 1, "status": "conflict"}
@@ -175,8 +177,13 @@ class RegistryServer:
 
         validate_request({key: value for key, value in request.items() if key != "token"})
         operation, data = request["operation"], request["data"]
+        if operation in enrollment.FIELDS:
+            return enrollment.handle(self, operation, data)
         local = self.runtime.local_authorities
         node_id = data.get("nodeId")
+        enrolled = enrollment.local_identity(self, node_id) if operation in {"identity/inspect", "registry/summary"} else None
+        if node_id is None and enrolled:
+            node_id = enrolled[0]
         if node_id is None and len(local) > 1:
             raise ValueError("local identity is ambiguous")
         if node_id is None and operation == "identity/inspect" and len(local) <= 1:
@@ -188,6 +195,8 @@ class RegistryServer:
         if not isinstance(node_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", node_id):
             raise ValueError("invalid node identifier")
         if operation == "identity/init-self":
+            if enrollment._intent(self.runtime):
+                raise ValueError("local identity is reserved for enrollment")
             domain = data.get("domain")
             if not isinstance(domain, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", domain):
                 raise ValueError("invalid authority domain")
@@ -214,10 +223,10 @@ class RegistryServer:
                 raise ValueError("key conflicts with local genesis")
         summary = self.runtime.state_summary(node_id)
         identity = summary["localIdentity"]
-        public = local.get(node_id, (None, None))[1]
+        public = enrolled[1] if enrolled else local.get(node_id, (None, None))[1]
         return {"format": "arbor-manager/runtime-response", "version": 1,
                 "status": "accepted", "operation": operation, "nodeId": node_id,
-                "initialized": identity["initialized"], "generation": identity["generation"],
+                "initialized": bool(enrolled) or identity["initialized"], "generation": identity["generation"],
                 "localGenesis": identity["localGenesis"], "selfRooted": identity["selfRooted"],
                 "publicFingerprint": hashlib.sha256(public.encode()).hexdigest() if public else None,
                 "parents": identity["parentCount"], "peers": identity["peerCount"],

@@ -10,21 +10,26 @@ import sys
 from pathlib import Path
 from typing import Any, TextIO
 
+from . import enrollment
 from .daemon import _config, _token
 
 MAX_BYTES = 65536
-OPERATIONS = {"identity/inspect", "identity/init-self", "registry/summary"}
+OPERATIONS = {"identity/inspect", "identity/init-self", "registry/summary"} | enrollment.FIELDS.keys()
 
 
 def validate_request(request: Any) -> None:
     if (not isinstance(request, dict)
             or request.get("protocol") != "arbor-manager/runtime-adapter"
             or type(request.get("version")) is not int or request["version"] != 1
+            or not isinstance(request.get("operation"), str)
             or request.get("operation") not in OPERATIONS
             or not isinstance(request.get("data"), dict)
-            or set(request) != {"protocol", "version", "operation", "data"}
-            or set(request["data"]) - {"nodeId", "domain"}):
+            or set(request) != {"protocol", "version", "operation", "data"}):
         raise ValueError("invalid runtime adapter request")
+    fields = set(request["data"])
+    required = enrollment.FIELDS.get(request["operation"])
+    if (required is not None and fields != required) or (required is None and fields - {"nodeId", "domain"}):
+        raise ValueError("invalid runtime adapter fields")
 
 
 def run(source: TextIO, output: TextIO, config_path: Path) -> int:
@@ -60,6 +65,33 @@ def run(source: TextIO, output: TextIO, config_path: Path) -> int:
             if isinstance(result.get(field), dict):
                 safe[field] = {name: result[field][name] for name in names
                                if type(result[field].get(name)) is int and result[field][name] >= 0}
+        if request["operation"] in enrollment.FIELDS:
+            if result.get("operation") != request["operation"]:
+                raise ValueError("unexpected enrollment operation")
+            operation, data = request["operation"], request["data"]
+            safe = {k: result[k] for k in ("format", "version", "status", "operation")}
+            safe.update(enrollment.validate_public_result(operation, result))
+            if operation == "enrollment/status":
+                if safe["authorityId"] != data["authorityId"]:
+                    raise ValueError("incorrect status subject")
+            else:
+                node = data["request"]["nodeId"] if operation == "enrollment/approve" else data["nodeId"]
+                if result.get("nodeId") != enrollment._identifier(node):
+                    raise ValueError("incorrect enrollment subject")
+                safe["nodeId"] = node
+                if operation == "enrollment/request":
+                    value = safe["request"]
+                    if (value["nodeId"], value["platform"], value["requestedParent"]) != (
+                            node, data["platform"], data["authorityId"]):
+                        raise ValueError("unexpected request")
+                elif operation == "enrollment/approve":
+                    p = safe["approval"]["payload"]
+                    if (safe["requestDigest"] != data["requestDigest"] or p["identity"] != node
+                            or p["approvedBy"] != data["authorityId"] or p["publicKey"] != data["request"]["publicKey"]
+                            or p["platform"] != data["request"]["platform"]):
+                        raise ValueError("unexpected approval")
+                elif safe["requestDigest"] != data["approval"]["payload"]["enrollmentRequestDigest"]:
+                    raise ValueError("unexpected completion")
         output.write(json.dumps(safe, sort_keys=True) + "\n")
         return 0
     except (OSError, ValueError, TypeError, KeyError):
