@@ -101,6 +101,7 @@ in
       systemd.services.arbor-registry = {
         requires = [ "arbor-registry-postgresql-setup.service" ];
         after = [ "arbor-registry-postgresql-setup.service" ];
+        partOf = [ "postgresql.service" ];
         environment = {
           PGDATABASE = "arbor_registry";
           PGUSER = "arbor-registry";
@@ -135,6 +136,10 @@ in
         preStart = lib.mkAfter ''
           if [ ! -e /var/lib/pgadmin/arbor-servers-loaded ]; then
             ${config.services.pgadmin.package}/bin/pgadmin4-cli load-servers ${servers} --user ${lib.escapeShellArg cfg.pgadmin.initialEmail}
+            dump=$(${pkgs.coreutils}/bin/mktemp)
+            trap 'rm -f "$dump"' EXIT
+            ${config.services.pgadmin.package}/bin/pgadmin4-cli dump-servers "$dump" --user ${lib.escapeShellArg cfg.pgadmin.initialEmail}
+            ${pkgs.jq}/bin/jq -e '.Servers | any(.[]; .Name == "Local Arbor Registry (read only)")' "$dump" >/dev/null
             touch /var/lib/pgadmin/arbor-servers-loaded
           fi
         '';

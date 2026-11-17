@@ -33,6 +33,9 @@ pkgs.testers.nixosTest {
     machine.fail("runuser -u pgadmin -- psql -h /run/postgresql -p 5544 -U arbor_registry_readonly -d arbor_registry -v ON_ERROR_STOP=1 -c 'INSERT INTO readonly_test VALUES (2)'")
     machine.fail("runuser -u pgadmin -- psql -h /run/postgresql -p 5544 -U arbor_registry_readonly -d arbor_registry -v ON_ERROR_STOP=1 -c 'CREATE TABLE forbidden (value integer)'")
     machine.fail("runuser -u arbor-registry -- psql -h /run/postgresql -p 5544 -U arbor_registry_readonly -d arbor_registry -c 'SELECT 1'")
+    machine.succeed("systemctl restart postgresql.service")
+    machine.wait_for_unit("arbor-registry.service")
+    machine.wait_until_succeeds("runuser -u arbor-registry -- psql -h /run/postgresql -p 5544 -U arbor-registry -d arbor_registry -c 'SELECT 1'")
     machine.succeed("test $(stat -c %a /run/pgadmin-test-password) = 600")
   '';
 }
