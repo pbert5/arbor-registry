@@ -27,7 +27,7 @@
         let
           pkgs = import nixpkgs { inherit system; };
           runtime = import ./runtime/package.nix { inherit (pkgs) lib python3Packages; };
-          transport = import ./transport/package.nix { inherit (pkgs) buildNpmPackage nodejs_22; };
+          transport = import ./transport/package.nix { inherit (pkgs) buildNpmPackage nodejs_22 util-linux; };
         in
         {
           arbor-registry-runtime = runtime;
@@ -94,9 +94,9 @@
         transport =
           let
             pkgs = import nixpkgs { inherit system; };
-            package = import ./transport/package.nix { inherit (pkgs) buildNpmPackage nodejs_22; };
+            package = import ./transport/package.nix { inherit (pkgs) buildNpmPackage nodejs_22 util-linux; };
           in
-          pkgs.runCommand "arbor-registry-transport-tests" { nativeBuildInputs = [ pkgs.nodejs_22 ]; } ''
+          pkgs.runCommand "arbor-registry-transport-tests" { nativeBuildInputs = [ pkgs.nodejs_22 pkgs.util-linux ]; } ''
             node --check ${./transport}/registryd.mjs
             node --check ${./transport}/test/registryd.test.mjs
               node --test ${package}/lib/arbor-registry-transport/source/test/*.test.mjs
