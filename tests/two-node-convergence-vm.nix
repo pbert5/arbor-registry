@@ -4,6 +4,7 @@ let
   transport = pkgs.callPackage ../transport/package.nix { };
   python = pkgs.python3.withPackages (ps: [
     ps.pynacl
+    ps.psycopg
     runtime
   ]);
   node =
@@ -31,7 +32,7 @@ let
         runtime
         transport
       ];
-      environment.variables.PYTHONPATH = "${runtime}/lib/${pkgs.python3.sitePackages}";
+      environment.variables.PYTHONPATH = "${python}/${pkgs.python3.sitePackages}:${runtime}/lib/${pkgs.python3.sitePackages}";
       environment.etc."arbor-test/fixture.py".source = ./two-node-convergence-fixture.py;
       cluster.registry.runtime = {
         enable = true;

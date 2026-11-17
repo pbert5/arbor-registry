@@ -4,6 +4,7 @@ let
   transport = pkgs.callPackage ../transport/package.nix { };
   python = pkgs.python3.withPackages (ps: [
     ps.pynacl
+    ps.psycopg
     runtime
   ]);
   realm = "arbor-graph-acceptance-v1";
@@ -24,11 +25,12 @@ let
       virtualisation.memorySize = 1536;
       environment.systemPackages = [
         pkgs.jq
+        pkgs.postgresql
         python
         runtime
         transport
       ];
-      environment.variables.PYTHONPATH = "${runtime}/lib/${pkgs.python3.sitePackages}";
+      environment.variables.PYTHONPATH = "${python}/${pkgs.python3.sitePackages}:${runtime}/lib/${pkgs.python3.sitePackages}";
       environment.etc."arbor-test/graph.py".source = ./graph-vm.py;
       cluster.registry.runtime = {
         enable = true;

@@ -9,7 +9,7 @@ optional runtime package. The library validates canonical signed-record
 envelopes, reconciles accepted history, retains unknown or invalid transport
 records in quarantine, materializes consumer projections, and validates/
 queries relationship graphs. The runtime package adds local signed event
-storage, identity generations, and a SQLite materialized view for node
+storage, identity generations, and a PostgreSQL materialized view for node
 processes.
 
 The pipeline is intentionally explicit:
@@ -193,3 +193,26 @@ must provide a `signatureVerifier` function backed by a real verifier. If it
 is absent, recovery is rejected; a non-empty signature field alone is never
 authorization. The runtime's Ed25519 verifier is the reference boundary for
 that interface.
+
+### Local PostgreSQL and pgAdmin
+
+Import `nixosModules.service-contract` and enable
+`cluster.registry.runtime.enable` on
+**each** participant. Each node owns its PostgreSQL database; replication remains
+the registry transport's responsibility. The runtime connects as the local
+`arbor-registry` system user via the PostgreSQL Unix socket using peer
+authentication. The PostgreSQL data directory must be included in backups.
+Keep the existing registry state directory during migration: the runtime imports
+legacy SQLite state into PostgreSQL. Back up both before upgrading and do not
+remove the SQLite file until the migrated state has been verified.
+
+To enable the optional local browser, set
+`cluster.registry.postgresql.pgadmin.enable = true`, set `initialEmail`, and set
+`initialPasswordFile` to an absolute path outside the Nix store. Provision that
+file privately before starting pgAdmin; it supplies the initial login password
+and is not a database password. pgAdmin listens only on `127.0.0.1:5050` by
+default; use an SSH tunnel for remote access. Its preconfigured local connection
+uses peer authentication as `arbor_registry_readonly`, with SELECT access to
+existing and future registry tables and no write or schema creation privileges.
+The initial password applies only when pgAdmin creates its account; manage later
+password changes through pgAdmin.

@@ -17,10 +17,12 @@ import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, TypeAlias
 
+import psycopg
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SigningKey, VerifyKey
 
@@ -1003,30 +1005,14 @@ class Runtime:
         self._sync_status: dict[str, Any] = {
             "state": "idle", "lastError": None, "pages": 0, "records": 0,
         }
-        database_path = self.state_dir / "registry.sqlite3"
-        # The daemon's consumer runs in its own thread; RegistryServer
-        # serializes access around this connection.
-        self.db = sqlite3.connect(database_path, timeout=30, check_same_thread=False)
-        if database_path.exists():
-            os.chmod(database_path, 0o600)
-        _secure_file(self.state_dir / "registry.sqlite3")
-        self.db.execute("PRAGMA busy_timeout = 30000")
-        self.db.executescript("""
-          CREATE TABLE IF NOT EXISTS records (
-            record_key TEXT PRIMARY KEY, record_id TEXT, generation INTEGER,
-            predecessor TEXT, status TEXT NOT NULL, reason TEXT, envelope TEXT NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS projection (
-            record_id TEXT PRIMARY KEY, schema TEXT NOT NULL, payload TEXT NOT NULL, generation INTEGER NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS local_genesis (
-            identity TEXT PRIMARY KEY, domain TEXT NOT NULL, public_key TEXT NOT NULL,
-            record_digest TEXT NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS provider_cursors (
-            stream TEXT PRIMARY KEY, cursor TEXT NOT NULL
-          );
-        """)
+        # Standard libpq environment selects the local per-node database.
+        self.db = psycopg.connect()
+        self._connection_info = self.db.info.dsn
+        try:
+            self._initialize_storage()
+        except Exception:
+            self.db.close()
+            raise
         self.local_authorities: dict[str, tuple[str, str]] = {
             identity: (domain, public_key)
             for identity, domain, public_key in self.db.execute(
@@ -1039,6 +1025,68 @@ class Runtime:
             self.public_keys.setdefault(identity, public_key)
             self.authority_issuers.add(identity)
         self.db.commit()
+
+    @staticmethod
+    def _stored_identifier(value: Any) -> bytes | None:
+        if value is None:
+            return None
+        return str(value).encode()
+
+    @staticmethod
+    def _stored_generation(value: Any) -> int | None:
+        # Invalid generations remain intact in the quarantined envelope.
+        if isinstance(value, int) and not isinstance(value, bool) and -(2**63) <= value < 2**63:
+            return value
+        return None
+
+    def _initialize_storage(self) -> None:
+        """Create storage and atomically import the old SQLite snapshot once."""
+        with self.db.transaction():
+            # Serialize initialization, including concurrent first starts.
+            self.db.execute("SELECT pg_advisory_xact_lock(469719120568716)")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS records (
+                rowid BIGSERIAL PRIMARY KEY, record_key BYTEA NOT NULL,
+                record_id BYTEA, generation BIGINT, predecessor BYTEA,
+                status TEXT NOT NULL, reason TEXT, envelope TEXT NOT NULL)""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS projection (
+                record_id BYTEA NOT NULL, schema TEXT NOT NULL, payload TEXT NOT NULL,
+                generation BIGINT NOT NULL)""")
+            self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS records_key_hash ON records (sha256(record_key))")
+            self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS projection_id_hash ON projection (sha256(record_id))")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS local_genesis (
+                identity TEXT PRIMARY KEY, domain TEXT NOT NULL, public_key TEXT NOT NULL,
+                record_digest TEXT NOT NULL)""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS provider_cursors (
+                stream TEXT PRIMARY KEY, cursor TEXT NOT NULL)""")
+            self.db.execute("CREATE TABLE IF NOT EXISTS storage_migrations (name TEXT PRIMARY KEY)")
+            if self.db.execute("SELECT 1 FROM storage_migrations WHERE name = 'sqlite-v1'").fetchone():
+                return
+            path = self.state_dir / "registry.sqlite3"
+            if path.exists():
+                _secure_file(path)
+                for table in ("records", "projection", "local_genesis", "provider_cursors"):
+                    if self.db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                        raise ValueError("cannot import SQLite into nonempty PostgreSQL storage")
+                with closing(sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True)) as legacy:
+                    legacy.execute("BEGIN")
+                    legacy_tables = {row[0] for row in legacy.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+                    for table, columns, order in (
+                        ("records", "record_key, record_id, generation, predecessor, status, reason, envelope", " ORDER BY rowid"),
+                        ("projection", "record_id, schema, payload, generation", ""),
+                        ("local_genesis", "identity, domain, public_key, record_digest", ""),
+                        ("provider_cursors", "stream, cursor", ""),
+                    ):
+                        if table in {"local_genesis", "provider_cursors"} and table not in legacy_tables:
+                            continue
+                        rows = legacy.execute(f"SELECT {columns} FROM {table}{order}")
+                        if table == "records":
+                            rows = ((row[0].encode(), row[1].encode() if row[1] is not None else None, self._stored_generation(row[2]), row[3].encode() if row[3] is not None else None, *row[4:]) for row in rows)
+                        elif table == "projection":
+                            rows = ((row[0].encode(), *row[1:]) for row in rows)
+                        placeholders = ", ".join(["%s"] * len(columns.split(", ")))
+                        with self.db.cursor() as cursor:
+                            cursor.executemany(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", rows)
+            self.db.execute("INSERT INTO storage_migrations VALUES ('sqlite-v1')")
 
     def close(self) -> None:
         self.db.close()
@@ -1060,13 +1108,13 @@ class Runtime:
             if existing != (domain, self.node_key.public_key):
                 raise ValueError("conflicting second local genesis")
             stored_digest = self.db.execute(
-                "SELECT record_digest FROM local_genesis WHERE identity = ?", (identity,)
+                "SELECT record_digest FROM local_genesis WHERE identity = %s", (identity,)
             ).fetchone()[0]
             if stored_digest != digest:
                 raise ValueError("local genesis state differs from persisted state")
         else:
             self.db.execute(
-                "INSERT INTO local_genesis VALUES (?, ?, ?, ?)",
+                "INSERT INTO local_genesis VALUES (%s, %s, %s, %s)",
                 (identity, domain, self.node_key.public_key, digest),
             )
             self.local_authorities[identity] = (domain, self.node_key.public_key)
@@ -1112,7 +1160,7 @@ class Runtime:
         except (UnicodeError, TypeError, ValueError) as error:
             raise ValueError("recovery authorization is not canonical") from error
         row = self.db.execute(
-            "SELECT status FROM records WHERE envelope = ?", (envelope,)
+            "SELECT status FROM records WHERE envelope = %s", (envelope,)
         ).fetchone()
         if row != ("accepted",):
             raise ValueError("recovery authorization is not accepted")
@@ -1150,7 +1198,7 @@ class Runtime:
             and payload.get("approvedBy") == identity
             and payload.get("authorityRoot") == identity
             and self.db.execute(
-                "SELECT record_digest FROM local_genesis WHERE identity = ?", (identity,)
+                "SELECT record_digest FROM local_genesis WHERE identity = %s", (identity,)
             ).fetchone() == (_digest(record),)
         )
 
@@ -1357,7 +1405,7 @@ class Runtime:
         if any(isinstance(record[name], bool) or not isinstance(record[name], int) for name in integer_fields):
             return "quarantined", "malformed-record"
         if (not isinstance(record["recordId"], str) or not isinstance(record["schema"], str)
-                or not isinstance(record["payload"], dict) or record["generation"] < 1
+                or not isinstance(record["payload"], dict) or not 1 <= record["generation"] < 2**63
                 or not isinstance(record["predecessor"], (str, type(None)))
                 or not isinstance(record["issuer"], str) or not isinstance(record["signature"], str)):
             return "quarantined", "malformed-record"
@@ -1562,7 +1610,7 @@ class Runtime:
         Consumer reads set ``retain=False`` so a record fetched from transport
         is not appended back to that same transport. ``commit=False`` is used
         by the consumer to commit records, reconciliation, projection, and
-        its cursor in one SQLite transaction.
+        its cursor in one PostgreSQL transaction.
         """
         outcomes = []
         for record in records:
@@ -1586,21 +1634,21 @@ class Runtime:
                     envelope = canonical_json(record).decode()
                 except (TypeError, ValueError):
                     envelope = json.dumps({"malformed": "unserializable-record"}, sort_keys=True)
-            exact = self.db.execute("SELECT record_key, status FROM records WHERE envelope = ?", (envelope,)).fetchone()
-            existing = self.db.execute("SELECT envelope, status FROM records WHERE record_key = ?", (record_key,)).fetchone()
+            exact = self.db.execute("SELECT record_key, status FROM records WHERE envelope = %s", (envelope,)).fetchone()
+            existing = self.db.execute("SELECT envelope, status FROM records WHERE record_key = %s", (record_key.encode(),)).fetchone()
             if exact:
-                record_key = exact[0]
+                record_key = bytes(exact[0]).decode()
                 status, reason = exact[1], None
             else:
                 if existing:
                     record_key = f"{record_key}#conflict:{hashlib.sha256(envelope.encode()).hexdigest()}"
                 if retain and not unsafe:
                     self.provider.append(record)
-                self.db.execute("INSERT INTO records VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (record_key, record.get("recordId"), record.get("generation"), record.get("predecessor"),
+                self.db.execute("INSERT INTO records (record_key, record_id, generation, predecessor, status, reason, envelope) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (record_key.encode(), self._stored_identifier(record.get("recordId")), self._stored_generation(record.get("generation")), self._stored_identifier(record.get("predecessor")),
                      status, reason, envelope))
             outcomes.append({"recordKey": record_key, "status": status, "reason": reason})
-        self.db.execute("DELETE FROM records WHERE status = 'quarantined' AND rowid NOT IN (SELECT rowid FROM records WHERE status = 'quarantined' ORDER BY rowid DESC LIMIT ?)", (self.max_quarantine_records,))
+        self.db.execute("DELETE FROM records WHERE status = 'quarantined' AND rowid NOT IN (SELECT rowid FROM records WHERE status = 'quarantined' ORDER BY rowid DESC LIMIT %s)", (self.max_quarantine_records,))
         if commit:
             self.db.commit()
         self._reconcile()
@@ -1608,14 +1656,14 @@ class Runtime:
         if commit:
             self.db.commit()
         for outcome in outcomes:
-            row = self.db.execute("SELECT status, reason FROM records WHERE record_key = ?", (outcome["recordKey"],)).fetchone()
+            row = self.db.execute("SELECT status, reason FROM records WHERE record_key = %s", (outcome["recordKey"].encode(),)).fetchone()
             if row:
                 outcome["status"], outcome["reason"] = row
         return outcomes
 
     def _reconcile(self) -> None:
-        rows = self.db.execute("SELECT rowid, record_key, record_id, generation, predecessor, envelope FROM records").fetchall()
-        records = [(rowid, record_key, json.loads(raw)) for rowid, record_key, _, _, _, raw in rows]
+        rows = self.db.execute("SELECT rowid, record_key, record_id, generation, predecessor, envelope FROM records ORDER BY rowid").fetchall()
+        records = [(rowid, bytes(record_key).decode(), json.loads(raw)) for rowid, record_key, _, _, _, raw in rows]
         by_key: dict[str, list[tuple[int, str, dict[str, Any]]]] = {}
         for rowid, record_key, record in records:
             base_key = _key(record) if isinstance(record, dict) else record_key
@@ -1875,15 +1923,15 @@ class Runtime:
                 reasons[rowid] = "parent-cycle"
         for rowid, _, _, _, _, _ in rows:
             status = "accepted" if reasons[rowid] is None else "quarantined"
-            self.db.execute("UPDATE records SET status = ?, reason = ? WHERE rowid = ?", (status, reasons[rowid], rowid))
+            self.db.execute("UPDATE records SET status = %s, reason = %s WHERE rowid = %s", (status, reasons[rowid], rowid))
 
     def _materialize(self) -> None:
         accepted = self.db.execute("SELECT record_key, record_id, generation, predecessor, status, reason, envelope FROM records WHERE status = 'accepted' OR reason IN ('anti-rollback', 'revoked-generation') ORDER BY generation, record_key").fetchall()
         available: dict[str, dict[str, Any]] = {}
         available_ids: set[str] = set()
-        accepted_keys = {record_key for record_key, _, _, _, status, _, _ in accepted if status == "accepted"}
+        accepted_keys = {bytes(record_key).decode() for record_key, _, _, _, status, _, _ in accepted if status == "accepted"}
         for record_key, record_id, generation, predecessor, _, _, raw in accepted:
-            if (generation == 1 and predecessor is None) or predecessor in available_ids:
+            if (generation == 1 and predecessor is None) or (predecessor is not None and bytes(predecessor).decode() in available_ids):
                 record = json.loads(raw)
                 available[_key(record)] = record
                 available_ids.add(record["recordId"])
@@ -1898,8 +1946,8 @@ class Runtime:
             if current is None or record["generation"] >= current[0]:
                 latest[record["recordId"]] = (record["generation"], record)
         self.db.execute("DELETE FROM projection")
-        self.db.executemany("INSERT INTO projection VALUES (?, ?, ?, ?)",
-            [(record_id, record["schema"], json.dumps(record["payload"], sort_keys=True), generation)
+        self.db.cursor().executemany("INSERT INTO projection VALUES (%s, %s, %s, %s)",
+            [(record_id.encode(), record["schema"], json.dumps(record["payload"], sort_keys=True), generation)
              for record_id, (generation, record) in latest.items()])
 
     @staticmethod
@@ -1909,7 +1957,7 @@ class Runtime:
 
     def _provider_cursor(self) -> ProviderCursor:
         row = self.db.execute(
-            "SELECT cursor FROM provider_cursors WHERE stream = ?",
+            "SELECT cursor FROM provider_cursors WHERE stream = %s",
             (getattr(self.provider, "stream", "default"),),
         ).fetchone()
         if row is None:
@@ -1923,7 +1971,7 @@ class Runtime:
         if not self._valid_cursor(cursor):
             raise ValueError("provider cursor is invalid")
         self.db.execute(
-            "INSERT INTO provider_cursors(stream, cursor) VALUES (?, ?) "
+            "INSERT INTO provider_cursors(stream, cursor) VALUES (%s, %s) "
             "ON CONFLICT(stream) DO UPDATE SET cursor = excluded.cursor",
             (getattr(self.provider, "stream", "default"), json.dumps(cursor)),
         )
@@ -1998,8 +2046,9 @@ class Runtime:
             self._sync_status = {"state": "idle", "lastError": None, "pages": pages,
                                  "records": records, "backlog": backlog}
             return dict(self._sync_status)
-        except (OSError, RuntimeError, TimeoutError, TypeError, ValueError, sqlite3.Error) as error:
-            self.db.rollback()
+        except (OSError, RuntimeError, TimeoutError, TypeError, ValueError, psycopg.Error) as error:
+            if not self.db.closed:
+                self.db.rollback()
             self._sync_status = {"state": "degraded", "lastError": str(error), "pages": pages, "records": records}
             return dict(self._sync_status)
         finally:
@@ -2010,18 +2059,18 @@ class Runtime:
             raise ValueError("cursor must be non-negative and limit must be between 1 and 1000")
         rows = self.db.execute(
             "SELECT envelope FROM records WHERE status = 'accepted' "
-            "ORDER BY generation, record_id, record_key LIMIT ? OFFSET ?", (limit, cursor)
+            "ORDER BY generation, record_id, record_key LIMIT %s OFFSET %s", (limit, cursor)
         ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
     def quarantine(self) -> list[dict[str, Any]]:
         return [{"record": json.loads(raw), "reason": reason} for raw, reason in self.db.execute(
             "SELECT envelope, reason FROM records WHERE status = 'quarantined' "
-            "ORDER BY reason, record_id, record_key"
+            'ORDER BY reason COLLATE "C" NULLS FIRST, record_id NULLS FIRST, record_key'
         )]
 
     def projection(self) -> dict[str, dict[str, Any]]:
-        return {record_id: {"schema": schema, "payload": json.loads(payload), "generation": generation}
+        return {bytes(record_id).decode(): {"schema": schema, "payload": json.loads(payload), "generation": generation}
                 for record_id, schema, payload, generation in self.db.execute("SELECT record_id, schema, payload, generation FROM projection")}
 
     def status(self) -> dict[str, Any]:
@@ -2043,10 +2092,20 @@ class Runtime:
         if not isinstance(node_id, str) or not node_id:
             raise ValueError("node_id is required")
         totals = self.status()
-        schemas = dict(self.db.execute(
-            "SELECT json_extract(envelope, '$.schema') AS schema, COUNT(*) "
-            "FROM records GROUP BY schema ORDER BY schema"
-        ).fetchall())
+        schemas: dict[str | None, int] = {}
+        summary_records = []
+        for raw, generation, status, reason, record_id in self.db.execute(
+            "SELECT envelope, generation, status, reason, record_id FROM records"
+        ):
+            record = json.loads(raw)
+            schema = record.get("schema") if isinstance(record, dict) else None
+            if not isinstance(schema, str):
+                schema = None
+            schemas[schema] = schemas.get(schema, 0) + 1
+            payload = record.get("payload") if isinstance(record, dict) else None
+            if ((record_id is not None and bytes(record_id).decode() == node_id)
+                    or (isinstance(payload, dict) and payload.get("identity") == node_id)):
+                summary_records.append((generation, status, reason))
         local = self.local_authorities.get(node_id)
         # The local authority row reserves the identity before provider append,
         # so it is not by itself evidence that genesis completed. Require the
@@ -2054,10 +2113,10 @@ class Runtime:
         genesis_complete = False
         if local is not None:
             projected = self.db.execute(
-                "SELECT schema, payload, generation FROM projection WHERE record_id = ?", (node_id,)
+                "SELECT schema, payload, generation FROM projection WHERE record_id = %s", (node_id.encode(),)
             ).fetchone()
             for (raw,) in self.db.execute(
-                "SELECT envelope FROM records WHERE record_id = ? AND status = 'accepted'", (node_id,)
+                "SELECT envelope FROM records WHERE record_id = %s AND status = 'accepted'", (node_id.encode(),)
             ):
                 record = json.loads(raw)
                 if (self._is_exact_local_genesis(record) and projected is not None
@@ -2066,11 +2125,7 @@ class Runtime:
                         and projected[2] == record['generation']):
                     genesis_complete = True
                     break
-        rows = self.db.execute(
-            "SELECT generation, status, reason FROM records WHERE record_id = ? "
-            "OR json_extract(envelope, '$.payload.identity') = ? ORDER BY generation",
-            (node_id, node_id),
-        ).fetchall()
+        rows = summary_records
         accepted = [row for row in rows if row[1] == "accepted"]
         generations = sorted({row[0] for row in accepted if isinstance(row[0], int)})
         conflict = any(row[2] in {"conflicting-record-key", "unauthorized-local-authority-scope"} for row in rows)

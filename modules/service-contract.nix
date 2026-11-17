@@ -45,6 +45,7 @@ let
   '';
 in
 {
+  imports = [ ./postgresql.nix ];
   options.cluster.registry.runtime = {
     enable = lib.mkEnableOption "the Arbor participant runtime";
     registryService = lib.mkOption {
@@ -138,6 +139,7 @@ in
     };
   };
   config = lib.mkIf cfg.enable {
+    cluster.registry.postgresql.enable = lib.mkDefault true;
     users.groups.arbor-registry = { };
     users.users.arbor-registry = {
       isSystemUser = true;

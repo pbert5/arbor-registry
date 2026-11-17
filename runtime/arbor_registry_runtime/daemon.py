@@ -10,6 +10,8 @@ import re
 import signal
 import socket
 import threading
+
+import psycopg
 import time
 from pathlib import Path
 from typing import Any
@@ -130,9 +132,25 @@ class RegistryServer:
         if lock is None:
             return operation(*args, **kwargs)
         with lock:
-            return operation(*args, **kwargs)
+            db = getattr(self.runtime, "db", None)
+            if db is not None and db.closed:
+                self.runtime.db = db = psycopg.connect(self.runtime._connection_info)
+            try:
+                return operation(*args, **kwargs)
+            finally:
+                if db is not None and not db.closed:
+                    db.rollback()
 
     def handle(self, request: Any) -> dict[str, Any]:
+        try:
+            return self._handle(request)
+        except psycopg.Error:
+            if isinstance(request, dict) and request.get("operation") in {
+                    "identity/inspect", "identity/init-self", "registry/summary"}:
+                return {"format": "arbor-manager/runtime-response", "version": 1, "status": "unavailable"}
+            return {"ok": False, "code": "unavailable"}
+
+    def _handle(self, request: Any) -> dict[str, Any]:
         if not isinstance(request, dict) or request.get("token") != self.token:
             return {"ok": False, "code": "authentication_failed"}
         operation = request.get("operation")
@@ -264,7 +282,7 @@ class RegistryServer:
             self.socket_path.unlink()
         except FileNotFoundError:
             pass
-        # Do not close SQLite while a worker still owns a runtime operation.
+        # Do not close storage while a worker still owns a runtime operation.
         with self._runtime_lock:
             self.runtime.close()
 

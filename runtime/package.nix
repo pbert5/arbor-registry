@@ -5,7 +5,10 @@ python3Packages.buildPythonApplication {
   pyproject = true;
   build-system = [ python3Packages.setuptools ];
   src = ./.;
-  propagatedBuildInputs = [ python3Packages.pynacl ];
+  propagatedBuildInputs = [
+    python3Packages.pynacl
+    python3Packages.psycopg
+  ];
   dontUsePytest = true;
   installCheckPhase = "true";
   meta = {

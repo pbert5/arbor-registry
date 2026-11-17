@@ -155,9 +155,12 @@ assert not any(item.get("recordId") == "tampered-transport-record" for item in r
 assert "tampered-transport-record" not in request(root_b, "projection")["records"]
 print("MATRIX transport-does-not-imply-trust: PASS (invalid signature quarantined)")
 
-# Exercise the actual socket adapter and SQLite consumer against retained
+# Exercise the actual socket adapter and PostgreSQL consumer against retained
 # replicated history. These isolated consumers simulate pre-upgrade omissions;
 # the running Registry and its trust configuration are untouched.
+root_b.succeed("runuser -u postgres -- createuser root")
+for i in range(4):
+    root_b.succeed(f"runuser -u postgres -- createdb -O root arbor_replay_{i}")
 root_b.succeed("python3 -c " + shlex.quote(r'''
 import json
 import os
@@ -174,7 +177,8 @@ provider = OrbitDBProvider(Path('/run/arbor-registry-transport/transport.sock'),
     token=Path('/run/arbor-test/runtime/socket-token').read_text().strip())
 raw = provider._request({'operation': 'list', 'stream': 'registry', 'cursor': 'v2:begin', 'limit': 100})['records']
 assert len(raw) == 11, len(raw)
-for legacy in ('v1:2', 'v2-after:' + raw[-1]['hash'], 'v2-after:replaced-winner', raw[-1]['hash']):
+for i, legacy in enumerate(('v1:2', 'v2-after:' + raw[-1]['hash'], 'v2-after:replaced-winner', raw[-1]['hash'])):
+    os.environ.update(PGHOST='/run/postgresql', PGUSER='root', PGDATABASE=f'arbor_replay_{i}')
     with tempfile.TemporaryDirectory() as directory:
         state = Path(directory) / 'consumer'
         def reopen():
@@ -206,11 +210,14 @@ for legacy in ('v1:2', 'v2-after:' + raw[-1]['hash'], 'v2-after:replaced-winner'
         assert 'tampered-transport-record' not in runtime.projection()
         runtime.close()
 '''))
+for i in range(4):
+    root_b.succeed(f"runuser -u postgres -- dropdb arbor_replay_{i}")
+root_b.succeed("runuser -u postgres -- dropuser root")
 print("MATRIX legacy-cursor-replay-atomic-restart-idempotence: PASS")
 
 status = request(root_a, "status")
 assert status["ok"]
-root_a.succeed("test -s /var/lib/arbor-registry/registry.sqlite3")
+root_a.succeed("runuser -u postgres -- psql -d arbor_registry -c 'SELECT 1 FROM records LIMIT 1'")
 root_a.succeed("systemctl restart arbor-registry.service")
 root_a.wait_for_unit("arbor-registry.service", timeout=120)
 wait_for_health(root_a)

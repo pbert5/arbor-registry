@@ -19,6 +19,7 @@
       nixosModule = import ./modules/nixos.nix;
       vaultRuntimeModule = import ./modules/vault-runtime.nix;
       serviceContractModule = import ./modules/service-contract.nix;
+      postgresqlModule = ./modules/postgresql.nix;
     in
     {
       lib = registry;
@@ -38,6 +39,7 @@
       nixosModules = {
         default = nixosModule;
         service-contract = serviceContractModule;
+        postgresql = postgresqlModule;
         vault-runtime = vaultRuntimeModule;
         vault-runtime-upstream = {
           imports = [
@@ -83,11 +85,20 @@
           (import nixpkgs { inherit system; }).runCommand "arbor-registry-runtime-tests"
             {
               nativeBuildInputs = [
-                ((import nixpkgs { inherit system; }).python3.withPackages (ps: [ ps.pynacl ]))
+                ((import nixpkgs { inherit system; }).python3.withPackages (ps: [
+                  ps.pynacl
+                  ps.psycopg
+                ]))
+                (import nixpkgs { inherit system; }).postgresql
               ];
             }
             ''
               export PYTHONPATH=${./runtime}
+              export PGDATA="$TMPDIR/postgres" PGHOST="$TMPDIR" PGDATABASE=postgres
+              initdb --no-locale --encoding=UTF8 --auth=trust > /dev/null
+              printf "listen_addresses = \047\047\n" >> "$PGDATA/postgresql.conf"
+              pg_ctl -o "-k $PGHOST" -l "$TMPDIR/postgres.log" start
+              trap 'pg_ctl -m immediate stop' EXIT
               python -m unittest discover -s ${./runtime/tests} -v
               touch $out
             '';
@@ -96,12 +107,19 @@
             pkgs = import nixpkgs { inherit system; };
             package = import ./transport/package.nix { inherit (pkgs) buildNpmPackage nodejs_22 util-linux; };
           in
-          pkgs.runCommand "arbor-registry-transport-tests" { nativeBuildInputs = [ pkgs.nodejs_22 pkgs.util-linux ]; } ''
-            node --check ${./transport}/registryd.mjs
-            node --check ${./transport}/test/registryd.test.mjs
-              node --test ${package}/lib/arbor-registry-transport/source/test/*.test.mjs
-            touch $out
-          '';
+          pkgs.runCommand "arbor-registry-transport-tests"
+            {
+              nativeBuildInputs = [
+                pkgs.nodejs_22
+                pkgs.util-linux
+              ];
+            }
+            ''
+              node --check ${./transport}/registryd.mjs
+              node --check ${./transport}/test/registryd.test.mjs
+                node --test ${package}/lib/arbor-registry-transport/source/test/*.test.mjs
+              touch $out
+            '';
         vault-runtime = import ./tests/vault-runtime.nix {
           module = vaultRuntimeModule;
           pkgs = import nixpkgs { inherit system; };
@@ -112,6 +130,13 @@
         };
         registry-runtime-vm = import ./tests/registry-runtime-vm.nix {
           module = serviceContractModule;
+          pkgs = import nixpkgs { inherit system; };
+        };
+        postgresql-pgadmin-vm = import ./tests/postgresql-pgadmin-vm.nix {
+          modules = [
+            serviceContractModule
+            postgresqlModule
+          ];
           pkgs = import nixpkgs { inherit system; };
         };
         graph-vm = import ./tests/graph-vm.nix {
