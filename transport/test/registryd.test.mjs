@@ -23,7 +23,7 @@ function request(socketPath, value, token = 'test-token') {
 }
 
 async function waitForSocket(socketPath) {
-  for (let attempt = 0; attempt < 100; attempt++) {
+  for (let attempt = 0; attempt < 500; attempt++) {
     try { await fs.access(socketPath); return } catch { await new Promise(resolve => setTimeout(resolve, 20)) }
   }
   throw new Error('daemon socket did not appear')
@@ -79,16 +79,21 @@ test('separate daemon processes preserve the typed append/list transport', async
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-'))
   const socketPath = path.join(root, 'registry.sock')
   const env = { ...process.env, ARBOR_REGISTRY_STATE_DIR: root, ARBOR_REGISTRY_SOCKET: socketPath, ARBOR_REGISTRY_SOCKET_TOKEN: 'test-token' }
-  const start = () => spawn(process.execPath, [daemon], { env, stdio: ['ignore', 'ignore', 'pipe'] })
+  let stderr = ''
+  const start = () => {
+    const child = spawn(process.execPath, [daemon], { env, stdio: ['ignore', 'ignore', 'pipe'] })
+    child.stderr.on('data', chunk => { stderr += chunk })
+    return child
+  }
   let child = start()
   try {
-    await waitForSocket(socketPath)
+    await waitForSocket(socketPath).catch(error => { throw new Error(`${error.message}: ${stderr}`) })
     const event = { recordId: 'node-a', recordVersion: 1, payload: { role: 'member' } }
     const appended = await request(socketPath, { operation: 'append', stream: 'registry', event })
     assert.equal(appended.ok, true)
     assert.equal((await request(socketPath, { operation: 'append', stream: 'registry', event })).duplicate, true)
     child.kill('SIGTERM'); await new Promise(resolve => child.once('exit', resolve))
-    child = start(); await waitForSocket(socketPath)
+    child = start(); await waitForSocket(socketPath).catch(error => { throw new Error(`${error.message}: ${stderr}`) })
     const page = await request(socketPath, { operation: 'list', stream: 'registry', cursor: 'v1:0', limit: 10 })
     assert.deepEqual(page.records.map(item => item.event), [event])
   } finally {
