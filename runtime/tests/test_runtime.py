@@ -76,6 +76,38 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.runtime.accepted(0, 1001)
 
+    def test_summary_counts_current_active_relationship_generations(self):
+        def edge(record_id, kind, status, generation=1, source="root", target="child"):
+            return self.envelope(record_id, generation, record_id if generation > 1 else None,
+                schema="relationship", record_version=generation, payload={
+                    "relationshipId": record_id, "from": source, "to": target,
+                    "kind": kind, "status": status, "authorityRoot": "root",
+                })
+
+        records = [edge("parent", "parent", "active"),
+                   edge("peer-in", "peer", "active"),
+                   edge("peer-out", "peer", "active", source="child", target="root"),
+                   edge("old-parent", "parent", "severed"),
+                   edge("old-peer", "peer", "severed")]
+        self.assertEqual({r["status"] for r in self.runtime.ingest(records)}, {"accepted"})
+        identity = self.runtime.state_summary("child")["localIdentity"]
+        self.assertEqual((identity["parentCount"], identity["peerCount"]), (1, 2))
+
+        changes = [edge("parent", "parent", "severed", 2),
+                   edge("peer-in", "peer", "severed", 2)]
+        self.assertEqual({r["status"] for r in self.runtime.ingest(changes)}, {"accepted"})
+        identity = self.runtime.state_summary("child")["localIdentity"]
+        self.assertEqual((identity["parentCount"], identity["peerCount"]), (0, 1))
+
+    def test_summary_counts_relationships_after_first_thousand_records(self):
+        records = [self.envelope(f"a-{i:04}") for i in range(1000)]
+        records.append(self.envelope("z-parent", schema="relationship", payload={
+            "relationshipId": "z-parent", "from": "root", "to": "child",
+            "kind": "parent", "status": "active", "authorityRoot": "root",
+        }))
+        self.assertEqual({r["status"] for r in self.runtime.ingest(records)}, {"accepted"})
+        self.assertEqual(self.runtime.state_summary("child")["localIdentity"]["parentCount"], 1)
+
     def test_provider_contract_is_durable_idempotent_and_cursor_bounded(self):
         provider = self.runtime.provider
         self.assertIsInstance(provider, Provider)

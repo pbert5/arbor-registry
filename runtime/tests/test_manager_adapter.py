@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from arbor_registry_runtime.daemon import RegistryServer
 from arbor_registry_runtime.manager_adapter import run
@@ -139,10 +140,53 @@ class ManagerAdapterTests(unittest.TestCase):
         self.assertEqual(self.request("identity/init-self", data)["status"], "unavailable")
         private = Path(self.config["keyDir"]) / "node-a.private"
         before = private.read_bytes()
+        self.server.runtime.close()
+        self.server = RegistryServer(self.config)
+        self.server.runtime.provider = provider
+        inspect = self.request("identity/inspect", {})
+        self.assertEqual(inspect["status"], "accepted")
+        self.assertFalse(inspect["initialized"])
+        self.assertFalse(inspect["localGenesis"])
+        self.assertFalse(inspect["selfRooted"])
+        self.assertIsNone(inspect["generation"])
+        self.assertEqual(inspect["records"]["accepted"], 0)
         provider.unavailable = False
-        self.assertEqual(self.request("identity/init-self", data)["status"], "accepted")
+        result = self.request("identity/init-self", data)
+        self.assertEqual(result["status"], "accepted")
+        self.assertTrue(result["initialized"])
+        self.assertTrue(result["localGenesis"])
+        self.assertTrue(result["selfRooted"])
+        self.assertEqual(result["generation"], 1)
         self.assertEqual(private.read_bytes(), before)
         self.assertEqual(self.server.runtime.status()["accepted"], 1)
+
+    def test_restart_before_materialization_preserves_retryable_genesis(self):
+        data = {"nodeId": "node-a", "domain": "domain-a"}
+        with patch.object(self.server.runtime, "_materialize", side_effect=RuntimeError("interrupted")):
+            self.assertEqual(self.request("identity/init-self", data)["status"], "unavailable")
+        private = Path(self.config["keyDir"]) / "node-a.private"
+        before = private.read_bytes()
+        self.server.runtime.close()
+        self.server = RegistryServer(self.config)
+        self.server.runtime.provider = FileProvider(self.root / "raw" / "history.jsonl")
+
+        inspect = self.request("identity/inspect", {})
+        self.assertEqual(inspect["status"], "accepted")
+        self.assertEqual(inspect["records"]["accepted"], 1)
+        self.assertEqual(inspect["projection"]["total"], 0)
+        self.assertFalse(inspect["initialized"])
+        self.assertFalse(inspect["localGenesis"])
+        self.assertFalse(inspect["selfRooted"])
+
+        result = self.request("identity/init-self", data)
+        self.assertEqual(result["status"], "accepted")
+        self.assertTrue(result["initialized"])
+        self.assertTrue(result["localGenesis"])
+        self.assertTrue(result["selfRooted"])
+        self.assertEqual(result["generation"], 1)
+        self.assertEqual(result["records"]["accepted"], 1)
+        self.assertEqual(result["projection"]["total"], 1)
+        self.assertEqual(private.read_bytes(), before)
 
     def test_key_loading_rejects_dangling_symlinks_and_insecure_files(self):
         key_dir = Path(self.config["keyDir"])

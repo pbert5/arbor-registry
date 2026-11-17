@@ -2048,6 +2048,24 @@ class Runtime:
             "FROM records GROUP BY schema ORDER BY schema"
         ).fetchall())
         local = self.local_authorities.get(node_id)
+        # The local authority row reserves the identity before provider append,
+        # so it is not by itself evidence that genesis completed. Require the
+        # exact signed assertion to be accepted and present in the projection.
+        genesis_complete = False
+        if local is not None:
+            projected = self.db.execute(
+                "SELECT schema, payload, generation FROM projection WHERE record_id = ?", (node_id,)
+            ).fetchone()
+            for (raw,) in self.db.execute(
+                "SELECT envelope FROM records WHERE record_id = ? AND status = 'accepted'", (node_id,)
+            ):
+                record = json.loads(raw)
+                if (self._is_exact_local_genesis(record) and projected is not None
+                        and projected[0] == record['schema']
+                        and json.loads(projected[1]) == record['payload']
+                        and projected[2] == record['generation']):
+                    genesis_complete = True
+                    break
         rows = self.db.execute(
             "SELECT generation, status, reason FROM records WHERE record_id = ? "
             "OR json_extract(envelope, '$.payload.identity') = ? ORDER BY generation",
@@ -2056,21 +2074,24 @@ class Runtime:
         accepted = [row for row in rows if row[1] == "accepted"]
         generations = sorted({row[0] for row in accepted if isinstance(row[0], int)})
         conflict = any(row[2] in {"conflicting-record-key", "unauthorized-local-authority-scope"} for row in rows)
-        accepted_records = self.accepted(0, 1000)
-        parents = sum(1 for record in accepted_records if record.get("schema") == "relationship"
-                      and record.get("payload", {}).get("to") == node_id
-                      and record.get("payload", {}).get("kind") == "parent")
-        peers = sum(1 for record in accepted_records if record.get("schema") == "peer-relationship"
-                    and node_id in {record.get("payload", {}).get("from"), record.get("payload", {}).get("to")})
+        # Projection contains the current accepted, lineage-valid generation of
+        # each record. Count active incoming parents and incident peers there.
+        edges = [json.loads(payload) for (payload,) in self.db.execute(
+            "SELECT payload FROM projection WHERE schema = 'relationship'"
+        )]
+        parents = sum(1 for edge in edges if edge.get("status") == "active"
+                      and edge.get("kind") == "parent" and edge.get("to") == node_id)
+        peers = sum(1 for edge in edges if edge.get("status") == "active"
+                    and edge.get("kind") == "peer" and node_id in {edge.get("from"), edge.get("to")})
         return {
             "records": {key: totals[key] for key in ("records", "accepted", "quarantined")},
             "projection": {"total": totals["projected"]},
             "schemas": schemas,
             "localIdentity": {
-                "nodeId": node_id, "initialized": local is not None,
+                "nodeId": node_id, "initialized": genesis_complete,
                 "generation": generations[-1] if generations else None,
-                "selfRooted": local is not None and node_id in self.authority_issuers,
-                "localGenesis": local is not None, "conflict": conflict,
+                "selfRooted": genesis_complete and node_id in self.authority_issuers,
+                "localGenesis": genesis_complete, "conflict": conflict,
                 "parentCount": parents, "peerCount": peers,
             },
         }
