@@ -211,7 +211,11 @@ export class TransportDaemon {
         await this.refreshIndex(stream)
         const key = digest(event); const entries = this.index.streams[stream] ??= []
         const existing = entries.find(item => item.key === key)
-        if (existing) return { hash: existing.hash, cursor: `v2:${existing.hash}`, duplicate: true }
+        if (existing) {
+          // An earlier append may have reached the database without syncing the index.
+          await this.saveIndex(assertOwned)
+          return { hash: existing.hash, cursor: `v2:${existing.hash}`, duplicate: true }
+        }
         const hash = String(await (await this.open(stream)).add(event))
         await this.refreshIndex(stream)
         const refreshed = this.index.streams[stream] ??= []

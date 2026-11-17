@@ -603,6 +603,35 @@ test('index sync failures withhold continuations and retry preserves observation
   }
 })
 
+test('append retry withholds its cursor until the index is synced', async () => {
+  for (const failure of ['file', 'directory']) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-append-sync-'))
+    const daemon = new TransportDaemon({ stateDir: root })
+    const event = { recordId: 'node-a', recordVersion: 1 }
+    const originalOpen = fs.open
+    try {
+      await daemon.start()
+      fs.open = async (...args) => {
+        const file = await originalOpen(...args)
+        const isTarget = failure === 'file' ? String(args[0]).endsWith('.tmp') : args[0] === root
+        if (isTarget) file.sync = async () => { throw new Error('injected sync failure') }
+        return file
+      }
+      await assert.rejects(daemon.append('registry', event), /injected sync failure/)
+      await assert.rejects(daemon.append('registry', event), /injected sync failure/)
+      fs.open = originalOpen
+      const retry = await daemon.append('registry', event)
+      assert.equal(retry.duplicate, true)
+      const index = JSON.parse(await fs.readFile(path.join(root, 'transport-index.json'), 'utf8'))
+      assert.deepEqual(index.streams.registry.map(item => item.hash), [retry.hash])
+    } finally {
+      fs.open = originalOpen
+      await daemon.stop()
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  }
+})
+
 test('heartbeat keeps owner readable and maintains a live lease', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-lock-heartbeat-'))
   const daemon = new TransportDaemon({ stateDir: root })
