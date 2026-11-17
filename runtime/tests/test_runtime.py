@@ -123,6 +123,15 @@ class RuntimeTests(unittest.TestCase):
         identity = self.runtime.state_summary("child")["localIdentity"]
         self.assertEqual((identity["parentCount"], identity["peerCount"]), (0, 0))
 
+    def test_summary_counts_active_relationship_without_kind_as_peer(self):
+        record = self.envelope("peer", schema="relationship", payload={
+            "relationshipId": "peer", "from": "root", "to": "child",
+            "status": "active", "authorityRoot": "root",
+        })
+        self.assertEqual(self.runtime.ingest([record])[0]["status"], "accepted")
+        identity = self.runtime.state_summary("child")["localIdentity"]
+        self.assertEqual((identity["parentCount"], identity["peerCount"]), (0, 1))
+
     def test_provider_contract_is_durable_idempotent_and_cursor_bounded(self):
         provider = self.runtime.provider
         self.assertIsInstance(provider, Provider)

@@ -2084,7 +2084,7 @@ class Runtime:
         parents = sum(1 for edge in edges if edge.get("status") == "active"
                       and edge.get("kind") == "parent" and edge.get("to") == node_id)
         peers = sum(1 for edge in edges if edge.get("status") == "active"
-                    and edge.get("kind") == "peer"
+                    and edge.get("kind", "peer") == "peer"
                     and (edge.get("from") == node_id or edge.get("to") == node_id))
         return {
             "records": {key: totals[key] for key in ("records", "accepted", "quarantined")},
