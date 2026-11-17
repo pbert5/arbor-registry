@@ -1059,12 +1059,15 @@ class Runtime:
                         raise ValueError("cannot import SQLite into nonempty PostgreSQL storage")
                 with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as legacy:
                     legacy.execute("BEGIN")
+                    legacy_tables = {row[0] for row in legacy.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
                     for table, columns, order in (
                         ("records", "record_key, record_id, generation, predecessor, status, reason, envelope", " ORDER BY rowid"),
                         ("projection", "record_id, schema, payload, generation", ""),
                         ("local_genesis", "identity, domain, public_key, record_digest", ""),
                         ("provider_cursors", "stream, cursor", ""),
                     ):
+                        if table in {"local_genesis", "provider_cursors"} and table not in legacy_tables:
+                            continue
                         rows = legacy.execute(f"SELECT {columns} FROM {table}{order}")
                         if table == "records":
                             rows = ((row[0], row[1], self._stored_generation(row[2]), *row[3:]) for row in rows)

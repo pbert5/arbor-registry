@@ -55,3 +55,72 @@ class PostgreSQLMigrationTests(unittest.TestCase):
                 else:
                     os.environ['PGOPTIONS'] = old_options
                 admin.execute(f'DROP SCHEMA {schema} CASCADE')
+
+    def test_older_two_table_snapshot_imports(self):
+        schema = 'migration_' + uuid.uuid4().hex
+        with psycopg.connect(autocommit=True) as admin:
+            admin.execute(f'CREATE SCHEMA {schema}')
+            old_options = os.environ.get('PGOPTIONS')
+            os.environ['PGOPTIONS'] = f'-c search_path={schema}'
+            try:
+                with tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    state = root / 'state'
+                    state.mkdir(mode=0o700)
+                    path = state / 'registry.sqlite3'
+                    with sqlite3.connect(path) as legacy:
+                        legacy.executescript('''
+                            CREATE TABLE records (record_key TEXT PRIMARY KEY, record_id TEXT, generation INTEGER, predecessor TEXT, status TEXT NOT NULL, reason TEXT, envelope TEXT NOT NULL);
+                            CREATE TABLE projection (record_id TEXT PRIMARY KEY, schema TEXT NOT NULL, payload TEXT NOT NULL, generation INTEGER NOT NULL);
+                            INSERT INTO records VALUES ('a', 'a', 1, NULL, 'quarantined', 'bad', '{}');
+                            INSERT INTO projection VALUES ('a', 'node-identity', '{}', 1);
+                        ''')
+                    path.chmod(0o600)
+                    runtime = Runtime(state, FileProvider(root / 'history'), {})
+                    self.assertEqual(runtime.status()['records'], 1)
+                    self.assertEqual(runtime.projection()['a']['generation'], 1)
+                    self.assertEqual(runtime._provider_cursor(), 0)
+                    self.assertEqual(runtime.local_authorities, {})
+                    runtime.close()
+            finally:
+                if old_options is None:
+                    os.environ.pop('PGOPTIONS', None)
+                else:
+                    os.environ['PGOPTIONS'] = old_options
+                admin.execute(f'DROP SCHEMA {schema} CASCADE')
+
+    def test_failed_migration_rolls_back_and_can_retry(self):
+        schema = 'migration_' + uuid.uuid4().hex
+        with psycopg.connect(autocommit=True) as admin:
+            admin.execute(f'CREATE SCHEMA {schema}')
+            old_options = os.environ.get('PGOPTIONS')
+            os.environ['PGOPTIONS'] = f'-c search_path={schema}'
+            try:
+                with tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    state = root / 'state'
+                    state.mkdir(mode=0o700)
+                    path = state / 'registry.sqlite3'
+                    with sqlite3.connect(path) as legacy:
+                        legacy.executescript('''
+                            CREATE TABLE records (record_key TEXT PRIMARY KEY, record_id TEXT, generation INTEGER, predecessor TEXT, status TEXT NOT NULL, reason TEXT, envelope TEXT NOT NULL);
+                            CREATE TABLE projection (record_id TEXT PRIMARY KEY, schema TEXT, payload TEXT, generation INTEGER);
+                            INSERT INTO records VALUES ('a', 'a', 1, NULL, 'quarantined', 'bad', '{}');
+                            INSERT INTO projection VALUES ('a', NULL, '{}', 1);
+                        ''')
+                    path.chmod(0o600)
+                    with self.assertRaises(psycopg.errors.NotNullViolation):
+                        Runtime(state, FileProvider(root / 'history'), {})
+                    self.assertIsNone(admin.execute('SELECT to_regclass(%s)', (schema + '.records',)).fetchone()[0])
+                    with sqlite3.connect(path) as legacy:
+                        legacy.execute("UPDATE projection SET schema = 'node-identity'")
+                    runtime = Runtime(state, FileProvider(root / 'history'), {})
+                    self.assertEqual(runtime.status()['records'], 1)
+                    self.assertEqual(runtime.projection()['a']['schema'], 'node-identity')
+                    runtime.close()
+            finally:
+                if old_options is None:
+                    os.environ.pop('PGOPTIONS', None)
+                else:
+                    os.environ['PGOPTIONS'] = old_options
+                admin.execute(f'DROP SCHEMA {schema} CASCADE')
