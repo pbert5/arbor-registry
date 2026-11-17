@@ -3,6 +3,7 @@ import net from 'node:net'
 import path from 'node:path'
 import process from 'node:process'
 import { createHash, randomUUID } from 'node:crypto'
+import { spawn } from 'node:child_process'
 import { Helia } from '@helia/core'
 import { bitswap } from '@helia/block-brokers'
 import { createOrbitDB, IPFSAccessController } from '@orbitdb/core'
@@ -114,6 +115,12 @@ export class TransportDaemon {
 
   async start() {
     await fs.mkdir(this.stateDir, { recursive: true, mode: 0o700 })
+    // Persist newly created ancestors too, before any cursor can escape.
+    for (let parent = path.dirname(path.resolve(this.stateDir)); ; parent = path.dirname(parent)) {
+      const directory = await fs.open(parent, 'r')
+      try { await directory.sync() } finally { await directory.close() }
+      if (parent === path.dirname(parent)) break
+    }
     if (this.realmId) {
       try {
         const persisted = JSON.parse(await fs.readFile(this.bootstrapStatePath, 'utf8'))
@@ -295,6 +302,20 @@ export class TransportDaemon {
   }
 
   async withIndexLock(operation) {
+    // flock locks the shared open file description; keeping this descriptor
+    // open fences even an expired lease until this process releases it or dies.
+    const guard = await fs.open(path.join(this.stateDir, 'transport-index.guard'), 'a', 0o600)
+    try {
+      await new Promise((resolve, reject) => {
+        const child = spawn('flock', ['-x', '-w', '30', '3'], { stdio: ['ignore', 'ignore', 'ignore', guard.fd] })
+        child.once('error', reject)
+        child.once('exit', code => code === 0 ? resolve() : reject(new Error('transport index guard lock failed')))
+      })
+      return await this.withIndexLease(operation)
+    } finally { await guard.close() }
+  }
+
+  async withIndexLease(operation) {
     const deadline = Date.now() + LOCK_RETRY_TIMEOUT_MS
     const token = randomUUID()
     const ownerFile = `owner-${token}.json`

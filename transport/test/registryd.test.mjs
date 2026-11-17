@@ -386,30 +386,24 @@ test('append cursor is inclusive and stale lock leases are recovered', async () 
 test('an old owner release cannot remove a successor lock after takeover', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-registryd-'))
   const first = new TransportDaemon({ stateDir: root })
-  const second = new TransportDaemon({ stateDir: root })
   let releaseFirst
-  let releaseSecond
-  let enteredSecond
   const firstHeld = new Promise(resolve => { releaseFirst = resolve })
-  const secondHeld = new Promise(resolve => { releaseSecond = resolve })
-  const secondEntered = new Promise(resolve => { enteredSecond = resolve })
+  let enteredFirst
+  const firstEntered = new Promise(resolve => { enteredFirst = resolve })
   const firstLock = first.withIndexLock(async () => {
-    const owner = (await fs.readdir(first.lockPath)).find(file => file.startsWith('owner-'))
-    await fs.writeFile(path.join(first.lockPath, owner), JSON.stringify({ token: owner.slice(6, -5), owner: 'dead-host', pid: 999999, acquiredAt: 0, leaseAt: 0 }))
-    await fs.utimes(path.join(first.lockPath, owner), 0, 0)
+    enteredFirst()
     await firstHeld
   })
   try {
-    const secondLock = second.withIndexLock(async () => { enteredSecond(); await secondHeld })
-    await new Promise(resolve => setTimeout(resolve, 20))
+    await firstEntered
+    await fs.rename(first.lockPath, `${first.lockPath}.old`)
+    await fs.mkdir(first.lockPath)
+    await fs.writeFile(path.join(first.lockPath, 'owner-successor.json'), '{}')
     releaseFirst()
-    await secondEntered
-    const successor = (await fs.readdir(root + '/transport-index.lock')).find(file => file.startsWith('owner-'))
-    assert.ok(successor, 'successor lock should remain while its owner is active')
-    releaseSecond()
-    await Promise.all([firstLock, secondLock])
+    await firstLock
+    assert.ok((await fs.readdir(first.lockPath)).includes('owner-successor.json'))
   } finally {
-    releaseFirst(); releaseSecond()
+    releaseFirst()
     await fs.rm(root, { recursive: true, force: true })
   }
 })
@@ -622,4 +616,43 @@ test('heartbeat keeps owner readable and maintains a live lease', async () => {
       assert.equal(await daemon.lockIsStale(), false)
     })
   } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+test('a paused lock holder cannot be overtaken before publishing its index', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-lock-fence-'))
+  const first = new TransportDaemon({ stateDir: root })
+  const second = new TransportDaemon({ stateDir: root })
+  let release, entered
+  const held = new Promise(resolve => { release = resolve })
+  const ready = new Promise(resolve => { entered = resolve })
+  let secondEntered = false
+  const firstLock = first.withIndexLock(async () => {
+    const owner = (await fs.readdir(first.lockPath)).find(file => file.startsWith('owner-'))
+    await fs.utimes(path.join(first.lockPath, owner), 0, 0)
+    entered()
+    await held
+  })
+  try {
+    await ready
+    const secondLock = second.withIndexLock(async () => { secondEntered = true })
+    await new Promise(resolve => setTimeout(resolve, 100))
+    assert.equal(secondEntered, false, 'a live owner must fence stale takeover')
+    release()
+    await Promise.all([firstLock, secondLock])
+    assert.equal(secondEntered, true)
+  } finally { release(); await firstLock.catch(() => {}); await fs.rm(root, { recursive: true, force: true }) }
+})
+
+test('startup fails closed if the state directory parent cannot be synced', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-parent-sync-'))
+  const daemon = new TransportDaemon({ stateDir: path.join(root, 'new', 'state') })
+  const originalOpen = fs.open
+  try {
+    fs.open = async (...args) => {
+      const file = await originalOpen(...args)
+      if (args[0] === root) file.sync = async () => { throw new Error('injected parent sync failure') }
+      return file
+    }
+    await assert.rejects(daemon.start(), /injected parent sync failure/)
+  } finally { fs.open = originalOpen; await fs.rm(root, { recursive: true, force: true }) }
 })
