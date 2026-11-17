@@ -2079,10 +2079,13 @@ class Runtime:
         edges = [json.loads(payload) for (payload,) in self.db.execute(
             "SELECT payload FROM projection WHERE schema = 'relationship'"
         )]
+        edges = [edge for edge in edges if isinstance(edge.get("from"), str)
+                 and isinstance(edge.get("to"), str)]
         parents = sum(1 for edge in edges if edge.get("status") == "active"
                       and edge.get("kind") == "parent" and edge.get("to") == node_id)
         peers = sum(1 for edge in edges if edge.get("status") == "active"
-                    and edge.get("kind") == "peer" and node_id in {edge.get("from"), edge.get("to")})
+                    and edge.get("kind") == "peer"
+                    and (edge.get("from") == node_id or edge.get("to") == node_id))
         return {
             "records": {key: totals[key] for key in ("records", "accepted", "quarantined")},
             "projection": {"total": totals["projected"]},

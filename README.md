@@ -41,7 +41,8 @@ suspended, severed, and standby states; standby edges are retained but are not
 included in active parent traversal. Multiple parents are valid. Parent cycles
 are reported by `validateGraph`; peer relationships are not parent cycles.
 Runtime summaries count active incoming parent records and active peer records
-incident to the requested node in the current materialized projection. Each
+incident to the requested node in the current materialized projection, with
+string endpoints as required by the runtime graph. Each
 projected relationship record contributes once; suspended, severed, standby,
 and superseded generations do not contribute. Local genesis is reported as
 complete only when its exact signed assertion is accepted and materialized;

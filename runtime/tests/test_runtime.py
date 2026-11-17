@@ -108,6 +108,21 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual({r["status"] for r in self.runtime.ingest(records)}, {"accepted"})
         self.assertEqual(self.runtime.state_summary("child")["localIdentity"]["parentCount"], 1)
 
+    def test_summary_ignores_relationships_with_non_string_endpoints(self):
+        self.runtime.node_key = self.key
+        self.assertEqual(self.runtime.local_genesis("root", "example.internal")["status"], "accepted")
+        records = [self.envelope(record_id, schema="relationship", payload={
+            "relationshipId": record_id, "from": source, "to": target,
+            "kind": kind, "status": "active", "authorityRoot": "root", "domain": "example.internal",
+        }) for record_id, kind, source, target in (
+            ("bad-parent", "parent", ["root"], "child"),
+            ("bad-peer-from", "peer", ["root"], "child"),
+            ("bad-peer-to", "peer", "child", ["root"]),
+        )]
+        self.assertEqual({r["status"] for r in self.runtime.ingest(records)}, {"accepted"})
+        identity = self.runtime.state_summary("child")["localIdentity"]
+        self.assertEqual((identity["parentCount"], identity["peerCount"]), (0, 0))
+
     def test_provider_contract_is_durable_idempotent_and_cursor_bounded(self):
         provider = self.runtime.provider
         self.assertIsInstance(provider, Provider)
