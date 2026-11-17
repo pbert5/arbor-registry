@@ -1,4 +1,9 @@
-{ buildNpmPackage, nodejs_22, util-linux }:
+{
+  buildNpmPackage,
+  coreutils,
+  nodejs_22,
+  util-linux,
+}:
 buildNpmPackage {
   pname = "arbor-registry-transport";
   version = "0.1.0";
@@ -11,7 +16,7 @@ buildNpmPackage {
     mkdir -p "$out/lib/arbor-registry-transport" "$out/bin"
     cp -R . "$out/lib/arbor-registry-transport/source"
     makeWrapper ${nodejs_22}/bin/node "$out/bin/arbor-registry-transport" \
-      --prefix PATH : ${util-linux}/bin \
+      --prefix PATH : ${coreutils}/bin:${util-linux}/bin \
       --add-flags "$out/lib/arbor-registry-transport/source/registryd.mjs"
     runHook postInstall
   '';

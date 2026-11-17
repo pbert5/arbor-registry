@@ -3,7 +3,8 @@ import net from 'node:net'
 import path from 'node:path'
 import process from 'node:process'
 import { createHash, randomUUID } from 'node:crypto'
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
+import { promisify } from 'node:util'
 import { Helia } from '@helia/core'
 import { bitswap } from '@helia/block-brokers'
 import { createOrbitDB, IPFSAccessController } from '@orbitdb/core'
@@ -28,6 +29,7 @@ const LOCK_RETRY_TIMEOUT_MS = 30_000
 const LOCK_RETRY_MS = 10
 const SOCKET_MODE = 0o660
 const MAX_QUARANTINE_ENTRIES = 10_000
+const execFileAsync = promisify(execFile)
 const canonical = value => JSON.stringify(value, (_, v) => v && typeof v === 'object' && !Array.isArray(v)
   ? Object.fromEntries(Object.keys(v).sort().map(k => [k, v[k]])) : v)
 const digest = value => createHash('sha256').update(canonical(value)).digest('hex')
@@ -63,6 +65,34 @@ async function assertPrivatePath(file, { directory = false } = {}) {
   if ((directory && !info.isDirectory()) || (!directory && !info.isFile()) || mode & 0o077) throw new Error('insecure transport state permissions')
   if (typeof process.getuid === 'function' && info.uid !== process.getuid()) throw new Error('transport state has unexpected owner')
   return info
+}
+
+async function syncStateAncestors(stateDir) {
+  const readable = [stateDir]
+  const inaccessible = new Map()
+  for (let parent = path.dirname(path.resolve(stateDir)); ; parent = path.dirname(parent)) {
+    const directory = await fs.open(parent, 'r').catch(async cause => {
+      if (cause.code !== 'EACCES') throw cause
+      inaccessible.set((await fs.stat(parent)).dev, cause)
+    })
+    if (directory) {
+      try { await directory.sync() } finally { await directory.close() }
+      readable.push(parent)
+    }
+    if (parent === path.dirname(parent)) break
+  }
+  if (!inaccessible.size) return
+
+  // A search-only directory cannot be opened for fsync. On Linux, sync -f
+  // uses syncfs to flush its directory entries through another path on the
+  // same filesystem. Require a matching device for every inaccessible parent.
+  const filesystems = []
+  for (const directory of readable) {
+    if (inaccessible.delete((await fs.stat(directory)).dev)) filesystems.push(directory)
+    if (!inaccessible.size) break
+  }
+  if (inaccessible.size) throw inaccessible.values().next().value
+  await execFileAsync('sync', ['-f', '--', ...filesystems])
 }
 
 // OrbitDB 4 expects the pre-1.x libp2p stream shape; this is the only
@@ -115,12 +145,9 @@ export class TransportDaemon {
 
   async start() {
     await fs.mkdir(this.stateDir, { recursive: true, mode: 0o700 })
+    await assertPrivatePath(this.stateDir, { directory: true })
     // Persist newly created ancestors too, before any cursor can escape.
-    for (let parent = path.dirname(path.resolve(this.stateDir)); ; parent = path.dirname(parent)) {
-      const directory = await fs.open(parent, 'r')
-      try { await directory.sync() } finally { await directory.close() }
-      if (parent === path.dirname(parent)) break
-    }
+    await syncStateAncestors(this.stateDir)
     if (this.realmId) {
       try {
         const persisted = JSON.parse(await fs.readFile(this.bootstrapStatePath, 'utf8'))
@@ -133,7 +160,6 @@ export class TransportDaemon {
         if (cause.code !== 'ENOENT') throw cause
       }
     }
-    await assertPrivatePath(this.stateDir, { directory: true })
     this.quarantineMarkers = new Set()
     try {
       const lines = (await fs.readFile(this.quarantinePath, 'utf8')).split('\n').filter(Boolean).slice(-10000)

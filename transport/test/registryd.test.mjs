@@ -690,3 +690,71 @@ test('startup fails closed if the state directory parent cannot be synced', asyn
     await assert.rejects(daemon.start(), /injected parent sync failure/)
   } finally { fs.open = originalOpen; await fs.rm(root, { recursive: true, force: true }) }
 })
+
+test('startup reopens state beneath a search-only ancestor', { skip: process.getuid?.() === 0 }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-search-only-'))
+  const ancestor = path.join(root, 'search-only')
+  const stateDir = path.join(ancestor, 'state')
+  await fs.mkdir(ancestor, { mode: 0o700 })
+  t.after(async () => {
+    await fs.chmod(ancestor, 0o700)
+    await fs.rm(root, { recursive: true, force: true })
+  })
+
+  const event = { recordId: 'retained' }
+  const initial = new TransportDaemon({ stateDir })
+  await initial.start()
+  try { await initial.append('registry', event) } finally { await initial.stop() }
+
+  await fs.chmod(ancestor, 0o100)
+  await assert.rejects(fs.readdir(ancestor), { code: 'EACCES' })
+  assert.ok((await fs.stat(path.join(stateDir, 'transport-index.json'))).isFile())
+
+  const restarted = new TransportDaemon({ stateDir })
+  await restarted.start()
+  try {
+    const page = await restarted.list('registry')
+    assert.deepEqual(page.records.map(record => record.event), [event])
+    assert.match(page.nextCursor, /^v3-after:/)
+  } finally { await restarted.stop() }
+})
+
+test('startup keeps retrying the filesystem sync for a search-only parent', { skip: process.getuid?.() === 0 }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-filesystem-sync-'))
+  const ancestor = path.join(root, 'search-only')
+  const stateDir = path.join(ancestor, 'state')
+  await fs.mkdir(ancestor, { mode: 0o300 })
+  t.after(async () => {
+    await fs.chmod(ancestor, 0o700)
+    await fs.rm(root, { recursive: true, force: true })
+  })
+
+  const bin = path.join(root, 'bin')
+  await fs.mkdir(bin)
+  await fs.writeFile(path.join(bin, 'sync'), `#!${process.execPath}\nprocess.exit(73)\n`, { mode: 0o700 })
+  const originalPath = process.env.PATH
+  try {
+    process.env.PATH = `${bin}${path.delimiter}${originalPath}`
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await assert.rejects(new TransportDaemon({ stateDir }).start(), { code: 73 })
+      assert.ok((await fs.stat(stateDir)).isDirectory())
+      await assert.rejects(fs.stat(path.join(stateDir, 'transport-index.json')), { code: 'ENOENT' })
+    }
+  } finally { process.env.PATH = originalPath }
+
+  const stat = fs.stat
+  const mock = t.mock.method(fs, 'stat', async file => {
+    const info = await stat(file)
+    // Simulate a filesystem for which there is no readable path to sync.
+    if (file === ancestor) info.dev = -1
+    return info
+  })
+  await assert.rejects(new TransportDaemon({ stateDir }).start(), { code: 'EACCES', path: ancestor })
+  mock.mock.restore()
+
+  const recovered = new TransportDaemon({ stateDir })
+  await recovered.start()
+  try {
+    assert.match((await recovered.append('registry', { recordId: 'recovered' })).cursor, /^v2:/)
+  } finally { await recovered.stop() }
+})
