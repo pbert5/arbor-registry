@@ -3,6 +3,7 @@ import net from 'node:net'
 import path from 'node:path'
 import process from 'node:process'
 import { createHash, randomUUID } from 'node:crypto'
+import { spawn } from 'node:child_process'
 import { Helia } from '@helia/core'
 import { bitswap } from '@helia/block-brokers'
 import { createOrbitDB, IPFSAccessController } from '@orbitdb/core'
@@ -114,6 +115,12 @@ export class TransportDaemon {
 
   async start() {
     await fs.mkdir(this.stateDir, { recursive: true, mode: 0o700 })
+    // Persist newly created ancestors too, before any cursor can escape.
+    for (let parent = path.dirname(path.resolve(this.stateDir)); ; parent = path.dirname(parent)) {
+      const directory = await fs.open(parent, 'r')
+      try { await directory.sync() } finally { await directory.close() }
+      if (parent === path.dirname(parent)) break
+    }
     if (this.realmId) {
       try {
         const persisted = JSON.parse(await fs.readFile(this.bootstrapStatePath, 'utf8'))
@@ -204,7 +211,11 @@ export class TransportDaemon {
         await this.refreshIndex(stream)
         const key = digest(event); const entries = this.index.streams[stream] ??= []
         const existing = entries.find(item => item.key === key)
-        if (existing) return { hash: existing.hash, cursor: `v2:${existing.hash}`, duplicate: true }
+        if (existing) {
+          // An earlier append may have reached the database without syncing the index.
+          await this.saveIndex(assertOwned)
+          return { hash: existing.hash, cursor: `v2:${existing.hash}`, duplicate: true }
+        }
         const hash = String(await (await this.open(stream)).add(event))
         await this.refreshIndex(stream)
         const refreshed = this.index.streams[stream] ??= []
@@ -274,9 +285,15 @@ export class TransportDaemon {
       await assertOwned()
       const indexFile = path.join(this.stateDir, 'transport-index.json')
       const temporary = `${indexFile}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
-      await fs.writeFile(temporary, `${JSON.stringify(validateIndex(this.index, this.streams))}\n`, { mode: 0o600, flag: 'wx' })
-      await assertOwned()
-      await fs.rename(temporary, indexFile)
+      try {
+        const file = await fs.open(temporary, 'wx', 0o600)
+        try { await file.writeFile(`${JSON.stringify(validateIndex(this.index, this.streams))}\n`); await file.sync() } finally { await file.close() }
+        await assertOwned()
+        await fs.rename(temporary, indexFile)
+        const directory = await fs.open(this.stateDir, 'r')
+        try { await directory.sync() } finally { await directory.close() }
+        await assertOwned()
+      } finally { await fs.rm(temporary, { force: true }) }
     })
     this.indexQueue = write.catch(() => {})
     return write
@@ -289,6 +306,20 @@ export class TransportDaemon {
   }
 
   async withIndexLock(operation) {
+    // flock locks the shared open file description; keeping this descriptor
+    // open fences even an expired lease until this process releases it or dies.
+    const guard = await fs.open(path.join(this.stateDir, 'transport-index.guard'), 'a', 0o600)
+    try {
+      await new Promise((resolve, reject) => {
+        const child = spawn('flock', ['-x', '-w', '30', '3'], { stdio: ['ignore', 'ignore', 'ignore', guard.fd] })
+        child.once('error', reject)
+        child.once('exit', code => code === 0 ? resolve() : reject(new Error('transport index guard lock failed')))
+      })
+      return await this.withIndexLease(operation)
+    } finally { await guard.close() }
+  }
+
+  async withIndexLease(operation) {
     const deadline = Date.now() + LOCK_RETRY_TIMEOUT_MS
     const token = randomUUID()
     const ownerFile = `owner-${token}.json`
@@ -309,7 +340,8 @@ export class TransportDaemon {
             try {
               const owner = JSON.parse(await file.readFile('utf8'))
               if (owner.token !== token) throw new Error('transport index lock ownership lost')
-              await file.truncate(0); await file.writeFile(JSON.stringify({ ...owner, leaseAt: Date.now() }))
+              const now = new Date()
+              await file.utimes(now, now)
             } finally { await file.close() }
           } catch { lost = true }
         }, LOCK_HEARTBEAT_MS)
@@ -357,8 +389,9 @@ export class TransportDaemon {
         const stat = await fs.stat(this.lockPath)
         return Date.now() - stat.mtimeMs > LOCK_LEASE_MS
       }
-      const owner = JSON.parse(await fs.readFile(path.join(this.lockPath, files[0]), 'utf8'))
-      const leaseAt = Number.isFinite(owner.leaseAt) ? owner.leaseAt : owner.acquiredAt
+      const ownerPath = path.join(this.lockPath, files[0])
+      const owner = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
+      const leaseAt = files[0] === 'owner.json' ? (Number.isFinite(owner.leaseAt) ? owner.leaseAt : owner.acquiredAt) : (await fs.stat(ownerPath)).mtimeMs
       const age = Date.now() - leaseAt
       if (owner.owner !== os.hostname() || !Number.isInteger(owner.pid) || !Number.isFinite(leaseAt)) return age > LOCK_LEASE_MS
       try { process.kill(owner.pid, 0); return age > LOCK_LEASE_MS } catch (cause) { return cause.code === 'ESRCH' || age > LOCK_LEASE_MS }
