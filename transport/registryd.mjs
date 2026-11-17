@@ -274,9 +274,15 @@ export class TransportDaemon {
       await assertOwned()
       const indexFile = path.join(this.stateDir, 'transport-index.json')
       const temporary = `${indexFile}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
-      await fs.writeFile(temporary, `${JSON.stringify(validateIndex(this.index, this.streams))}\n`, { mode: 0o600, flag: 'wx' })
-      await assertOwned()
-      await fs.rename(temporary, indexFile)
+      try {
+        const file = await fs.open(temporary, 'wx', 0o600)
+        try { await file.writeFile(`${JSON.stringify(validateIndex(this.index, this.streams))}\n`); await file.sync() } finally { await file.close() }
+        await assertOwned()
+        await fs.rename(temporary, indexFile)
+        const directory = await fs.open(this.stateDir, 'r')
+        try { await directory.sync() } finally { await directory.close() }
+        await assertOwned()
+      } finally { await fs.rm(temporary, { force: true }) }
     })
     this.indexQueue = write.catch(() => {})
     return write
@@ -309,7 +315,8 @@ export class TransportDaemon {
             try {
               const owner = JSON.parse(await file.readFile('utf8'))
               if (owner.token !== token) throw new Error('transport index lock ownership lost')
-              await file.truncate(0); await file.writeFile(JSON.stringify({ ...owner, leaseAt: Date.now() }))
+              const now = new Date()
+              await file.utimes(now, now)
             } finally { await file.close() }
           } catch { lost = true }
         }, LOCK_HEARTBEAT_MS)
@@ -357,8 +364,9 @@ export class TransportDaemon {
         const stat = await fs.stat(this.lockPath)
         return Date.now() - stat.mtimeMs > LOCK_LEASE_MS
       }
-      const owner = JSON.parse(await fs.readFile(path.join(this.lockPath, files[0]), 'utf8'))
-      const leaseAt = Number.isFinite(owner.leaseAt) ? owner.leaseAt : owner.acquiredAt
+      const ownerPath = path.join(this.lockPath, files[0])
+      const owner = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
+      const leaseAt = files[0] === 'owner.json' ? (Number.isFinite(owner.leaseAt) ? owner.leaseAt : owner.acquiredAt) : (await fs.stat(ownerPath)).mtimeMs
       const age = Date.now() - leaseAt
       if (owner.owner !== os.hostname() || !Number.isInteger(owner.pid) || !Number.isFinite(leaseAt)) return age > LOCK_LEASE_MS
       try { process.kill(owner.pid, 0); return age > LOCK_LEASE_MS } catch (cause) { return cause.code === 'ESRCH' || age > LOCK_LEASE_MS }
