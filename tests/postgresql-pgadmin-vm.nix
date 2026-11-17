@@ -29,7 +29,7 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("arbor-registry.service")
     machine.wait_for_unit("pgadmin.service")
     machine.wait_until_succeeds("curl -fsS http://127.0.0.1:5050/login >/dev/null")
-    machine.succeed("""python3 - <<'PY'
+    machine.succeed(r"""python3 - <<'PY'
     import http.cookiejar, json, re, urllib.parse, urllib.request
     base = "http://127.0.0.1:5050"
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -56,7 +56,7 @@ pkgs.testers.nixosTest {
     machine.succeed("systemctl restart postgresql.service")
     machine.wait_for_unit("arbor-registry.service")
     machine.wait_until_succeeds("runuser -u arbor-registry -- psql -h /run/postgresql -p 5544 -U arbor-registry -d arbor_registry -c 'SELECT 1'")
-    status_request = "import json, socket; s = socket.socket(socket.AF_UNIX); s.connect('/run/arbor-registry/registry.sock'); token = open('/run/arbor-registry/socket-token').read().strip(); s.sendall((json.dumps({'token': token, 'operation': 'status'}) + chr(10)).encode()); assert json.loads(s.recv(65536))['ok'] is True"
+    status_request = "import json, socket; s = socket.socket(socket.AF_UNIX); s.connect('/run/arbor-registry/registry.sock'); token = open('/run/arbor-registry/socket-token').read().strip(); s.sendall((json.dumps({'token': token, 'operation': 'status'}) + chr(10)).encode()); assert json.loads(s.makefile('rb').readline())['ok'] is True"
     machine.wait_until_succeeds("python3 -c " + shlex.quote(status_request))
     machine.succeed("test $(stat -c %a /run/pgadmin-test-password) = 600")
   '';
