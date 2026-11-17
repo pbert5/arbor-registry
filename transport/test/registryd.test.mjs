@@ -396,6 +396,7 @@ test('an old owner release cannot remove a successor lock after takeover', async
   const firstLock = first.withIndexLock(async () => {
     const owner = (await fs.readdir(first.lockPath)).find(file => file.startsWith('owner-'))
     await fs.writeFile(path.join(first.lockPath, owner), JSON.stringify({ token: owner.slice(6, -5), owner: 'dead-host', pid: 999999, acquiredAt: 0, leaseAt: 0 }))
+    await fs.utimes(path.join(first.lockPath, owner), 0, 0)
     await firstHeld
   })
   try {
@@ -576,5 +577,49 @@ test('replay preserves progress on unavailable records and rejects invalid v3 po
     for (const cursor of ['v3-after:1', 'v3-after:-1', 'v3-after:01', 'v3-after:9007199254740992', 'v1:9007199254740992']) {
       await assert.rejects(() => daemon.list('registry', cursor, 1), /invalid cursor/)
     }
+  } finally { await fs.rm(root, { recursive: true, force: true }) }
+})
+
+test('index sync failures withhold continuations and retry preserves observations', async () => {
+  for (const failure of ['file', 'directory']) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-index-sync-'))
+    const entries = [{ hash: 'a', value: { id: 'a' }, clock: { time: 1 } }]
+    const open = async () => ({ iterator: async function * () { yield * entries }, get: async hash => entries.find(entry => entry.hash === hash).value })
+    const daemon = new TransportDaemon({ stateDir: root }); daemon.open = open
+    const originalOpen = fs.open
+    try {
+      fs.open = async (...args) => {
+        const file = await originalOpen(...args)
+        const isTarget = failure === 'file' ? String(args[0]).endsWith('.tmp') : args[0] === root
+        if (isTarget) file.sync = async () => { throw new Error('injected sync failure') }
+        return file
+      }
+      await assert.rejects(daemon.list('registry', 'v2:begin', 1), /injected sync failure/)
+      fs.open = originalOpen
+      const first = await daemon.list('registry', 'v2:begin', 1)
+      entries.push({ hash: 'b', value: { id: 'b' }, clock: { time: 0 } })
+      const restarted = new TransportDaemon({ stateDir: root }); restarted.open = open
+      assert.deepEqual((await restarted.list('registry', first.nextCursor, 10)).records.map(item => item.hash), ['b'])
+    } finally { fs.open = originalOpen; await fs.rm(root, { recursive: true, force: true }) }
+  }
+})
+
+test('heartbeat keeps owner readable and maintains a live lease', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'arbor-lock-heartbeat-'))
+  const daemon = new TransportDaemon({ stateDir: root })
+  try {
+    await daemon.withIndexLock(async assertOwned => {
+      const owner = (await fs.readdir(daemon.lockPath)).find(file => file.startsWith('owner-'))
+      const ownerPath = path.join(daemon.lockPath, owner)
+      const initial = await fs.stat(ownerPath)
+      const until = Date.now() + 11000
+      while (Date.now() < until) {
+        JSON.parse(await fs.readFile(ownerPath, 'utf8'))
+        await new Promise(resolve => setTimeout(resolve, 5))
+      }
+      assert.ok((await fs.stat(ownerPath)).mtimeMs > initial.mtimeMs)
+      await assertOwned()
+      assert.equal(await daemon.lockIsStale(), false)
+    })
   } finally { await fs.rm(root, { recursive: true, force: true }) }
 })
