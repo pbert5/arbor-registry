@@ -45,6 +45,8 @@ pkgs.testers.nixosTest {
     except urllib.error.HTTPError as error:
         raise RuntimeError(error.read().decode()) from error
     assert result.get("success") == 1, result
+    databases = json.load(opener.open(urllib.request.Request(base + "/browser/database/nodes/1/1", headers={"X-pgA-CSRFToken": token})))
+    assert "arbor_registry" in json.dumps(databases), databases
     PY""")
     machine.succeed("ss -ltn | grep '127.0.0.1:5050'")
     machine.fail("ss -ltn | grep -E '(0.0.0.0|\\[::\\]):5050'")
