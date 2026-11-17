@@ -1,0 +1,6 @@
+# Project-local CI discrepancy consultant. Other settings remain personal.
+
+# Narrow CI/local discrepancy escalation; see AGENTS.md.
+[agents.ci-discrepancy-consultant]
+description = "Read-only GPT-6.1 Sol consultant for unexplained CI/local test discrepancies."
+config_file = "./agents/ci-discrepancy-consultant.toml"
