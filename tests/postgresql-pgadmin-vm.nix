@@ -17,6 +17,7 @@ pkgs.testers.nixosTest {
     };
     systemd.tmpfiles.rules = [ "f /run/pgadmin-test-password 0600 root root - testpassword" ];
     environment.systemPackages = [
+      pkgs.python3
       pkgs.curl
       pkgs.jq
       pkgs.python3
@@ -29,6 +30,23 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("arbor-registry.service")
     machine.wait_for_unit("pgadmin.service")
     machine.wait_until_succeeds("curl -fsS http://127.0.0.1:5050/login >/dev/null")
+    machine.succeed("""python3 - <<'PY'
+    import http.cookiejar, json, re, urllib.parse, urllib.request
+    base = "http://127.0.0.1:5050"
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    page = opener.open(base + "/login").read().decode()
+    token = json.loads(re.search(r'"csrfToken":\s*("[^"]+")', page).group(1))
+    form = urllib.parse.urlencode({"email": "admin@example.com", "password": "testpassword", "csrf_token": token}).encode()
+    login_url = json.loads(re.search(r'"loginUrl":\s*("[^"]+")', page).group(1))
+    response = opener.open(base + login_url, form)
+    assert "/login" not in response.url, response.url
+    request = urllib.request.Request(base + "/browser/server/connect/1/1", data=b"{}", headers={"Content-Type": "application/json", "X-pgA-CSRFToken": token})
+    try:
+        result = json.load(opener.open(request))
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(error.read().decode()) from error
+    assert result.get("success") == 1, result
+    PY""")
     machine.succeed("ss -ltn | grep '127.0.0.1:5050'")
     machine.fail("ss -ltn | grep -E '(0.0.0.0|\\[::\\]):5050'")
     machine.succeed("runuser -u arbor-registry -- psql -h /run/postgresql -p 5544 -U arbor-registry -d arbor_registry -v ON_ERROR_STOP=1 -c 'CREATE TABLE readonly_test (value integer); INSERT INTO readonly_test VALUES (1)'")
