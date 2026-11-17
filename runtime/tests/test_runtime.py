@@ -54,6 +54,46 @@ class RuntimeTests(PostgresFixture, unittest.TestCase):
         record["signature"] = self.key.sign({k: v for k, v in record.items() if k != "signature"})
         return record
 
+    def test_identifiers_with_nul_and_large_values_survive_storage(self):
+        record_id = "node\x00" + "".join(f"{i:04x}" for i in range(1000))
+        record = self.envelope(record_id)
+        self.assertEqual(self.runtime.ingest([record])[0]["status"], "accepted")
+        self.assertEqual(self.runtime.projection()[record_id]["payload"]["id"], record_id)
+        self.assertEqual(self.runtime.state_summary(record_id)["records"]["records"], 1)
+
+    def test_server_recovers_after_postgresql_connection_is_terminated(self):
+        from arbor_registry_runtime.daemon import RegistryServer
+        from psycopg import Error
+        from psycopg.pq import TransactionStatus
+
+        server = RegistryServer.__new__(RegistryServer)
+        server.runtime = self.runtime
+        server._runtime_lock = threading.RLock()
+        pid = self.runtime.db.info.backend_pid
+        self._admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
+        with self.assertRaises(Error):
+            server._runtime_call(self.runtime.status)
+        self.assertEqual(server._runtime_call(self.runtime.status)["records"], 0)
+        self.assertEqual(self.runtime.db.info.transaction_status, TransactionStatus.IDLE)
+
+    def test_database_outage_returns_unavailable_and_recovers(self):
+        from arbor_registry_runtime.daemon import RegistryServer
+
+        server = RegistryServer.__new__(RegistryServer)
+        server.runtime = self.runtime
+        server.token = "test-token"
+        server._runtime_lock = threading.RLock()
+        self._admin.execute("SELECT pg_terminate_backend(%s)", (self.runtime.db.info.backend_pid,))
+        request = {"token": server.token, "operation": "projection"}
+        self.assertEqual(server.handle(request), {"ok": False, "code": "unavailable"})
+        self.assertEqual(server.handle(request), {"ok": True, "records": {}})
+
+    def test_out_of_range_generation_is_quarantined(self):
+        record = self.envelope("large-generation", generation=2**63)
+        self.assertEqual(self.runtime._validate(record), ("quarantined", "malformed-record"))
+        self.assertEqual(self.runtime.ingest([record])[0]["reason"], "malformed-record")
+        self.assertEqual(self.runtime.quarantine()[0]["record"], record)
+
     def test_partition_reorder_and_materialization(self):
         parent = self.envelope("node", payload={"id": "node", "aliases": ["old"]})
         child = self.envelope("node", 2, "node", payload={"id": "node", "aliases": ["new"]}, record_version=2)

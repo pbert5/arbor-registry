@@ -1,4 +1,5 @@
 import os
+from contextlib import closing
 import sqlite3
 import tempfile
 import unittest
@@ -22,7 +23,7 @@ class PostgreSQLMigrationTests(unittest.TestCase):
                     root = Path(temp)
                     state = root / 'state'
                     state.mkdir(mode=0o700)
-                    with sqlite3.connect(state / 'registry.sqlite3') as legacy:
+                    with closing(sqlite3.connect(state / 'registry.sqlite3')) as legacy, legacy:
                         legacy.executescript('''
                             CREATE TABLE records (record_key TEXT PRIMARY KEY, record_id TEXT, generation INTEGER, predecessor TEXT, status TEXT NOT NULL, reason TEXT, envelope TEXT NOT NULL);
                             CREATE TABLE projection (record_id TEXT PRIMARY KEY, schema TEXT NOT NULL, payload TEXT NOT NULL, generation INTEGER NOT NULL);
@@ -38,16 +39,16 @@ class PostgreSQLMigrationTests(unittest.TestCase):
                     (state / 'registry.sqlite3').chmod(0o600)
                     provider = FileProvider(root / 'history')
                     runtime = Runtime(state, provider, {})
-                    self.assertEqual([r[0] for r in runtime.db.execute('SELECT record_key FROM records ORDER BY rowid')], ['a', 'b', 'c'])
+                    self.assertEqual([bytes(r[0]).decode() for r in runtime.db.execute('SELECT record_key FROM records ORDER BY rowid')], ['a', 'b', 'c'])
                     self.assertEqual(runtime.projection()['a']['generation'], 1)
                     self.assertEqual(runtime._provider_cursor(), 7)
                     self.assertEqual(admin.execute(f"SELECT count(*) FROM {schema}.records").fetchone()[0], 3)
                     self.assertEqual(runtime.local_authorities['node'], ('example', 'key'))
-                    runtime.db.execute("DELETE FROM records WHERE record_key = 'a'")
+                    runtime.db.execute("DELETE FROM records WHERE record_key = decode('61', 'hex')")
                     runtime.db.commit()
                     runtime.close()
                     runtime = Runtime(state, provider, {})
-                    self.assertEqual([r[0] for r in runtime.db.execute('SELECT record_key FROM records ORDER BY rowid')], ['b', 'c'])
+                    self.assertEqual([bytes(r[0]).decode() for r in runtime.db.execute('SELECT record_key FROM records ORDER BY rowid')], ['b', 'c'])
                     runtime.close()
             finally:
                 if old_options is None:
@@ -68,7 +69,7 @@ class PostgreSQLMigrationTests(unittest.TestCase):
                     state = root / 'state'
                     state.mkdir(mode=0o700)
                     path = state / 'registry.sqlite3'
-                    with sqlite3.connect(path) as legacy:
+                    with closing(sqlite3.connect(path)) as legacy, legacy:
                         legacy.executescript('''
                             CREATE TABLE records (record_key TEXT PRIMARY KEY, record_id TEXT, generation INTEGER, predecessor TEXT, status TEXT NOT NULL, reason TEXT, envelope TEXT NOT NULL);
                             CREATE TABLE projection (record_id TEXT PRIMARY KEY, schema TEXT NOT NULL, payload TEXT NOT NULL, generation INTEGER NOT NULL);
@@ -101,7 +102,7 @@ class PostgreSQLMigrationTests(unittest.TestCase):
                     state = root / 'state'
                     state.mkdir(mode=0o700)
                     path = state / 'registry.sqlite3'
-                    with sqlite3.connect(path) as legacy:
+                    with closing(sqlite3.connect(path)) as legacy, legacy:
                         legacy.executescript('''
                             CREATE TABLE records (record_key TEXT PRIMARY KEY, record_id TEXT, generation INTEGER, predecessor TEXT, status TEXT NOT NULL, reason TEXT, envelope TEXT NOT NULL);
                             CREATE TABLE projection (record_id TEXT PRIMARY KEY, schema TEXT, payload TEXT, generation INTEGER);
@@ -112,7 +113,7 @@ class PostgreSQLMigrationTests(unittest.TestCase):
                     with self.assertRaises(psycopg.errors.NotNullViolation):
                         Runtime(state, FileProvider(root / 'history'), {})
                     self.assertIsNone(admin.execute('SELECT to_regclass(%s)', (schema + '.records',)).fetchone()[0])
-                    with sqlite3.connect(path) as legacy:
+                    with closing(sqlite3.connect(path)) as legacy, legacy:
                         legacy.execute("UPDATE projection SET schema = 'node-identity'")
                     runtime = Runtime(state, FileProvider(root / 'history'), {})
                     self.assertEqual(runtime.status()['records'], 1)
