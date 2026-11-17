@@ -20,7 +20,6 @@ pkgs.testers.nixosTest {
       pkgs.python3
       pkgs.curl
       pkgs.jq
-      pkgs.python3
     ];
   };
   testScript = ''
