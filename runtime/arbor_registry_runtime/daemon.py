@@ -9,11 +9,13 @@ import os
 import re
 import signal
 import socket
+import struct
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
+from .pairing import Pairing
 from .runtime import OrbitDBProvider, Runtime, generate_keypair, load_keypair
 
 
@@ -132,10 +134,22 @@ class RegistryServer:
         with lock:
             return operation(*args, **kwargs)
 
-    def handle(self, request: Any) -> dict[str, Any]:
+    def handle(self, request: Any, *, peer_uid: int | None = None) -> dict[str, Any]:
         if not isinstance(request, dict) or request.get("token") != self.token:
             return {"ok": False, "code": "authentication_failed"}
         operation = request.get("operation")
+        if isinstance(operation, str) and operation.startswith("pair/"):
+            # The transport shares the socket token. Pairing additionally requires
+            # a local administrator or the daemon uid, checked by the kernel.
+            if peer_uid not in {0, os.geteuid()}:
+                return {"ok": False, "code": "operator_required"}
+            fields = {k: v for k, v in request.items() if k not in {"operation", "token"}}
+            try:
+                pairing = Pairing(self.runtime, self.key_dir)
+                result = self._runtime_call(pairing.handle, operation[5:], fields)
+                return {"ok": True, "result": result}
+            except (OSError, TypeError, ValueError):
+                return {"ok": False, "code": "pairing_rejected"}
         if operation in {"identity/inspect", "identity/init-self", "registry/summary"}:
             try:
                 return self._runtime_call(self._manager_request, request)
@@ -245,13 +259,21 @@ class RegistryServer:
                 except TimeoutError:
                     continue
                 with connection:
-                    raw = connection.recv(1024 * 1024)
                     try:
-                        request = json.loads(raw.split(b"\n", 1)[0])
-                        reply = self.handle(request)
+                        connection.settimeout(3)
+                        with connection.makefile("rb") as stream:
+                            raw = stream.readline(1024 * 1024 + 1)
+                        if len(raw) > 1024 * 1024:
+                            raise ValueError("oversized Registry request")
+                        request = json.loads(raw)
+                        peer = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+                        reply = self.handle(request, peer_uid=struct.unpack("3i", peer)[1])
                     except (OSError, ValueError, TypeError, json.JSONDecodeError):
                         reply = {"ok": False, "code": "invalid_request"}
-                    connection.sendall(json.dumps(reply, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+                    try:
+                        connection.sendall(json.dumps(reply, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+                    except OSError:
+                        pass  # The operator may interrupt after the durable commit.
         finally:
             self.sync_worker.stop()
 

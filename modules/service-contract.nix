@@ -6,23 +6,65 @@
 }:
 let
   cfg = config.cluster.registry.runtime;
+  validStateDirectory =
+    name:
+    builtins.match "[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*" name != null
+    && lib.all (part: part != "." && part != "..") (lib.splitString "/" name);
+  separateStateDirectories =
+    cfg.stateDirectory != cfg.transportStateDirectory
+    && !(lib.hasPrefix "${cfg.stateDirectory}/" cfg.transportStateDirectory)
+    && !(lib.hasPrefix "${cfg.transportStateDirectory}/" cfg.stateDirectory);
+  trustedAncestors = ''
+    cursor="$parent"
+    while :; do
+      owner=$(${pkgs.coreutils}/bin/stat -c %u "$cursor")
+      [ "$owner" = 0 ] || [ "$owner" = "$EUID" ]
+      [ -z "$(${pkgs.findutils}/bin/find "$cursor" -maxdepth 0 -perm /022 -print)" ]
+      [ "$cursor" = / ] && break
+      cursor=$(${pkgs.coreutils}/bin/dirname "$cursor")
+    done
+  '';
   tokenInit = pkgs.writeShellScript "arbor-registry-token-init" ''
-    if [ ! -s ${lib.escapeShellArg cfg.tokenFile} ]; then
+    set -eu
+    token=${lib.escapeShellArg cfg.tokenFile}
+    parent=$(${pkgs.coreutils}/bin/dirname "$token")
+    [ "$(${pkgs.coreutils}/bin/realpath -e "$parent")" = "$parent" ]
+    [ -d "$parent" ] && [ -O "$parent" ]
+    ${trustedAncestors}
+    if [ -L "$token" ]; then exit 1; fi
+    created=0
+    if [ ! -e "$token" ]; then
       umask 077
-      ${pkgs.coreutils}/bin/head -c 48 /dev/urandom | ${pkgs.coreutils}/bin/base64 -w0 > ${lib.escapeShellArg cfg.tokenFile}
-      ${pkgs.coreutils}/bin/chmod 0600 ${lib.escapeShellArg cfg.tokenFile}
+      ${pkgs.coreutils}/bin/head -c 48 /dev/urandom | ${pkgs.coreutils}/bin/base64 -w0 > "$token"
+      created=1
+    fi
+    [ -f "$token" ] && [ -O "$token" ] && [ -s "$token" ]
+    # Only migrate the known default token; do not broaden an arbitrary existing file.
+    if [ "$created" = 1 ] || [ "$token" = /run/arbor-registry/socket-token ]; then
+      ${pkgs.coreutils}/bin/chgrp arbor-registry "$token"
+      ${pkgs.coreutils}/bin/chmod 0640 "$token"
+    else
+      [ "$(${pkgs.coreutils}/bin/stat -c '%G:%a' "$token")" = arbor-registry:640 ]
     fi
   '';
+  socketParentCheck =
+    socket:
+    pkgs.writeShellScript "arbor-registry-socket-parent-check" ''
+      set -eu
+      parent=$(${pkgs.coreutils}/bin/dirname ${lib.escapeShellArg socket})
+      [ "$(${pkgs.coreutils}/bin/realpath -e "$parent")" = "$parent" ]
+      [ -d "$parent" ] && [ -O "$parent" ]
+      ${trustedAncestors}
+    '';
   readyProbe = pkgs.writeShellScript "arbor-registry-ready" ''
         set -eu
-        token=$(${pkgs.coreutils}/bin/cat ${lib.escapeShellArg cfg.tokenFile})
         ${pkgs.python3}/bin/python3 -c '
     import json, socket, sys
     s = socket.socket(socket.AF_UNIX); s.settimeout(1); s.connect(sys.argv[1])
-    s.sendall((json.dumps({"operation":"health","token":sys.argv[2]}) + "\n").encode())
+    s.sendall((json.dumps({"operation":"health","token":open(sys.argv[2]).read().strip()}) + "\n").encode())
     v = json.loads(s.recv(65536)); s.close()
     raise SystemExit(0 if v.get("ok") is True and v.get("status") == "ok" else 1)
-    ' ${lib.escapeShellArg cfg.socket} "$token"
+    ' ${lib.escapeShellArg cfg.socket} ${lib.escapeShellArg cfg.tokenFile}
   '';
   serviceState = name: ''
     enabled=0; running=0
@@ -138,10 +180,35 @@ in
     };
   };
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion =
+          validStateDirectory cfg.stateDirectory
+          && validStateDirectory cfg.transportStateDirectory
+          && separateStateDirectories;
+        message = "Registry and transport state directories must be valid, distinct, and non-overlapping";
+      }
+    ];
     users.groups.arbor-registry = { };
     users.users.arbor-registry = {
       isSystemUser = true;
       group = "arbor-registry";
+    };
+    users.users.arbor-registry-transport = {
+      isSystemUser = true;
+      group = "arbor-registry";
+    };
+    systemd.services.arbor-registry-token = {
+      serviceConfig = {
+        Type = "oneshot";
+        User = "arbor-registry";
+        Group = "arbor-registry";
+        RuntimeDirectory = "arbor-registry";
+        RuntimeDirectoryMode = "0750";
+        RuntimeDirectoryPreserve = true;
+        RemainAfterExit = true;
+        ExecStart = tokenInit;
+      };
     };
     systemd.targets.arbor-participant = {
       description = "Arbor participant runtime services";
@@ -153,22 +220,21 @@ in
     };
     systemd.services.arbor-registry-transport = {
       wantedBy = [ "arbor-participant.target" ];
+      after = [ "arbor-registry-token.service" ];
+      requires = [ "arbor-registry-token.service" ];
       serviceConfig = {
         Type = "simple";
-        User = "arbor-registry";
+        User = "arbor-registry-transport";
         Group = "arbor-registry";
         StateDirectory = cfg.transportStateDirectory;
         StateDirectoryMode = "0700";
-        RuntimeDirectory = [
-          "arbor-registry-transport"
-          "arbor-registry"
-        ];
-        # Both daemons cache this shared token; keep it across individual stops.
-        # /run remains ephemeral across boots.
+        RuntimeDirectory = "arbor-registry-transport";
+        RuntimeDirectoryMode = "0750";
+        # The token service preserves the shared runtime directory across stops.
         RuntimeDirectoryPreserve = true;
         Restart = "on-failure";
         RestartSec = 2;
-        ExecStartPre = tokenInit;
+        ExecStartPre = socketParentCheck cfg.transportSocket;
         ExecStart = "${cfg.transportPackage}/bin/arbor-registry-transport";
         Environment = [
           "ARBOR_REGISTRY_STATE_DIR=/var/lib/${cfg.transportStateDirectory}"
@@ -184,8 +250,14 @@ in
     };
     systemd.services.arbor-registry = {
       wantedBy = [ "arbor-participant.target" ];
-      after = [ "arbor-registry-transport.service" ];
-      requires = [ "arbor-registry-transport.service" ];
+      after = [
+        "arbor-registry-token.service"
+        "arbor-registry-transport.service"
+      ];
+      requires = [
+        "arbor-registry-token.service"
+        "arbor-registry-transport.service"
+      ];
       serviceConfig = {
         Type = "simple";
         User = "arbor-registry";
@@ -193,10 +265,11 @@ in
         StateDirectory = cfg.stateDirectory;
         StateDirectoryMode = "0700";
         RuntimeDirectory = "arbor-registry";
+        RuntimeDirectoryMode = "0750";
         RuntimeDirectoryPreserve = true;
         Restart = "on-failure";
         RestartSec = 2;
-        ExecStartPre = tokenInit;
+        ExecStartPre = socketParentCheck cfg.socket;
         ExecStart = "${cfg.runtimePackage}/bin/arbor-registryd --config=/etc/arbor-registry/config.json";
         Environment = [ "ARBOR_REGISTRY_CONFIG=/etc/arbor-registry/config.json" ];
       };

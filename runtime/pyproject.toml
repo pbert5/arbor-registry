@@ -7,8 +7,10 @@ name = "arbor-registry-runtime"
 version = "0.1.0"
 description = "Local durable runtime for signed Arbor Registry records"
 requires-python = ">=3.11"
+dependencies = ["magic-wormhole", "PyNaCl", "Twisted"]
 
 [project.scripts]
+arbor-registry-pair = "arbor_registry_runtime.pair_cli:main"
 arbor-openbao-provider = "arbor_registry_runtime.openbao_provider:main"
 arbor-systemd-vaultd-bridge = "arbor_registry_runtime.vaultd_bridge:main"
 arbor-registryd = "arbor_registry_runtime.daemon:main"
