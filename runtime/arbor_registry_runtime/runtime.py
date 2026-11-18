@@ -29,6 +29,8 @@ SCHEMAS = frozenset({
     "node-identity", "identity-generation", "relationship", "capability", "service", "endpoint",
     "enrollment", "revocation", "recovery-authorization", "receipt",
 })
+PAIR_PROTOCOL = "arbor-registry/existing-root-parent/v1/"
+PAIR_ACCEPTANCE = PAIR_PROTOCOL + "accept"
 ProviderCursor: TypeAlias = int | str
 _SECRET_NAMES = {"secret", "clientsecret", "password", "passphrase", "token", "authtoken", "credential", "authorization", "private", "privatekey", "signingkey", "apikey", "accesskey", "accesstoken", "seed"}
 
@@ -1023,6 +1025,11 @@ class Runtime:
             identity TEXT PRIMARY KEY, domain TEXT NOT NULL, public_key TEXT NOT NULL,
             record_digest TEXT NOT NULL
           );
+          CREATE TABLE IF NOT EXISTS parent_pairs (
+            parent_name TEXT NOT NULL, child_name TEXT NOT NULL,
+            parent TEXT NOT NULL, child TEXT NOT NULL, record_id TEXT NOT NULL UNIQUE,
+            digest TEXT, PRIMARY KEY(parent_name, child_name)
+          );
           CREATE TABLE IF NOT EXISTS provider_cursors (
             stream TEXT PRIMARY KEY, cursor TEXT NOT NULL
           );
@@ -1161,6 +1168,10 @@ class Runtime:
 
     @staticmethod
     def _edge(record: dict[str, Any]) -> tuple[str, str, str, str] | None:
+        # A paired edge is bilateral identity evidence. Exclude it from the
+        # delegation and recovery-authority graph even if a key is configured later.
+        if record.get("type") == PAIR_ACCEPTANCE:
+            return None
         payload = record.get("payload", {})
         if (record.get("schema") not in {"relationship", "peer-relationship"}
                 or not isinstance(payload, dict)
@@ -1208,6 +1219,9 @@ class Runtime:
 
         def authorized(record: dict[str, Any]) -> bool:
             issuer = record.get("issuer")
+            if record.get("type") == PAIR_ACCEPTANCE:
+                # _validate already required the exact, locally admitted digest.
+                return True
             if record.get("schema") not in self._SENSITIVE_SCHEMAS:
                 return True
             if not isinstance(issuer, str):
@@ -1383,6 +1397,15 @@ class Runtime:
             return "quarantined", "framing-limit"
         if _unsafe_value(_without_signature(record)):
             return "quarantined", "unsafe-value"
+        if record["recordId"].startswith("existing-root-parent:") or record.get("type") == PAIR_ACCEPTANCE:
+            pin = self.db.execute(
+                "SELECT digest FROM parent_pairs WHERE record_id=?", (record["recordId"],)
+            ).fetchone()
+            if pin or record.get("type") == PAIR_ACCEPTANCE:
+                if (record.get("type") == PAIR_ACCEPTANCE and pin and pin[0]
+                        and _digest(record) == pin[0]):
+                    return "accepted", None
+                return "quarantined", "unapproved-parent-pair"
         try:
             verify = VerifyKey(_unb64(self.public_keys[record["issuer"]]))
             verify.verify(unsigned, _unb64(record["signature"]))
@@ -1594,7 +1617,9 @@ class Runtime:
             else:
                 if existing:
                     record_key = f"{record_key}#conflict:{hashlib.sha256(envelope.encode()).hexdigest()}"
-                if retain and not unsafe:
+                protocol_type = record.get("type") if isinstance(record, dict) else None
+                private_exchange = isinstance(protocol_type, str) and protocol_type.startswith(PAIR_PROTOCOL)
+                if retain and not unsafe and not private_exchange:
                     self.provider.append(record)
                 self.db.execute("INSERT INTO records VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (record_key, record.get("recordId"), record.get("generation"), record.get("predecessor"),
